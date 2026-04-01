@@ -851,82 +851,218 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_PUT_VR
 #undef GEN_SET_VR
 
-        /* ---- Arithmetic (binary) ---- */
-#define GEN_BINOP(fname) \
+        /* ---- Arithmetic (binary) with inline integer fast paths ----
+         *
+         * For int+int operations the common case is that both operands are
+         * JS_TAG_INT immediates.  We inline that check so TCC emits a simple
+         * compare + two-instruction arithmetic sequence, avoiding the vtable
+         * call entirely.  The slow path (strings, floats, BigInt) falls back
+         * to the vtable wrapper which handles all cases.
+         *
+         * Integer values have no refcount — JS_FreeValue on TAG_INT is a
+         * no-op, so we skip _FREE for the int fast path.
+         * ---------------------------------------------------------------- */
+
+        /* add: int overflow check using 64-bit arithmetic */
+        case OP_add:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
+                "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                "      } }\n");
+            break;
+
+        /* sub: int fast path */
+        case OP_sub:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
+                "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->sub(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                "      } }\n");
+            break;
+
+        /* mul: int fast path, overflow via int64 */
+        case OP_mul:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
+                "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
+                "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
+                "        else\n"
+                "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->mul(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                "      } }\n");
+            break;
+
+        /* div: always float result; only skip vtable for int/int */
+        case OP_div:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
+                "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
+                "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->div(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                "      } }\n");
+            break;
+
+        /* mod: int fast path */
+        case OP_mod:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
+                "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
+                "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->mod(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                "      } }\n");
+            break;
+
+        /* Bitwise: ToInt32 already guaranteed by semantics; fast path for int */
+#define GEN_BITOP_INT(op_str, rt_name) \
     jit_buf_printf(cb, \
-        "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->%s(ctx,_a,_b);\n" \
-        "      _CHK(_r); _s[_sp++]=_r; }\n", fname)
+        "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
+        "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
+        "        _s[_sp++]=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b));\n" \
+        "      else { JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n", \
+        op_str, rt_name)
 
-        case OP_add:  GEN_BINOP("add");  break;
-        case OP_sub:  GEN_BINOP("sub");  break;
-        case OP_mul:  GEN_BINOP("mul");  break;
-        case OP_div:  GEN_BINOP("div");  break;
-        case OP_mod:  GEN_BINOP("mod");  break;
-        case OP_pow:  GEN_BINOP("pow");  break;
-        case OP_shl:  GEN_BINOP("shl");  break;
-        case OP_sar:  GEN_BINOP("sar");  break;
-        case OP_shr:  GEN_BINOP("shr");  break;
-        case OP_and:  GEN_BINOP("band"); break;
-        case OP_or:   GEN_BINOP("bor");  break;
-        case OP_xor:  GEN_BINOP("bxor"); break;
+        case OP_shl: GEN_BITOP_INT("<<", "shl"); break;
+        case OP_sar: GEN_BITOP_INT(">>", "sar"); break;
+        case OP_and: GEN_BITOP_INT("&",  "band"); break;
+        case OP_or:  GEN_BITOP_INT("|",  "bor");  break;
+        case OP_xor: GEN_BITOP_INT("^",  "bxor"); break;
 
-#undef GEN_BINOP
+        /* shr is unsigned right shift — result may exceed INT32_MAX */
+        case OP_shr:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        uint32_t _r=(uint32_t)JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31);\n"
+                "        _s[_sp++]=(_r<=(uint32_t)INT32_MAX)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                "                                           :JS_NewFloat64(ctx,(double)_r);\n"
+                "      } else { JSValue _r=_RT->shr(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
 
-        /* ---- Arithmetic (unary) ---- */
-#define GEN_UNOP(fname) \
-    jit_buf_printf(cb, \
-        "    { JSValue _a=_s[--_sp],_r=_RT->%s(ctx,_a);\n" \
-        "      _CHK(_r); _s[_sp++]=_r; }\n", fname)
+#undef GEN_BITOP_INT
 
-        case OP_neg:     GEN_UNOP("neg");    break;
-        case OP_plus:    GEN_UNOP("plus");   break;
-        case OP_not:     GEN_UNOP("bnot");   break;
-        case OP_typeof:  GEN_UNOP("type_of"); break;
+        /* pow and remaining ops: full vtable (rare) */
+        case OP_pow:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],"
+                " _r=_RT->pow(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; }\n");
+            break;
+
+        /* ---- Arithmetic (unary) with int fast paths ---- */
+        case OP_neg:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
+                "                                 :JS_NewInt32(ctx,-ia);\n"
+                "      } else { JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        case OP_plus:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                "        _s[_sp++]=_a; /* int is already a number */\n"
+                "      else { JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        case OP_not: /* bitwise ~ */
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewInt32(ctx,~JS_VALUE_GET_INT(_a));\n"
+                "      else { JSValue _r=_RT->bnot(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        case OP_typeof:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp],"
+                " _r=_RT->type_of(ctx,_a); _CHK(_r); _s[_sp++]=_r; }\n");
+            break;
         case OP_lnot:
             jit_buf_str(cb,
                 "    { JSValue _a=_s[--_sp];\n"
-                "      _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_a));\n"
-                "      _FREE(_a); }\n");
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==0);\n"
+                "      else if(JS_VALUE_GET_TAG(_a)==JS_TAG_BOOL)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_a));\n"
+                "      else { _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_a)); _FREE(_a); } }\n");
             break;
 
-#undef GEN_UNOP
-
-        /* ---- Comparisons ---- */
-#define GEN_CMP(fname) \
+        /* ---- Comparisons with inline int fast paths ---- */
+#define GEN_CMP_INT(int_op, rt_name) \
     jit_buf_printf(cb, \
-        "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->%s(ctx,_a,_b);\n" \
-        "      _CHK(_r); _s[_sp++]=_r; }\n", fname)
+        "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
+        "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
+        "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b));\n" \
+        "      else { JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n", \
+        int_op, rt_name)
 
-        case OP_lt:         GEN_CMP("lt");        break;
-        case OP_lte:        GEN_CMP("lte");       break;
-        case OP_gt:         /* reuse lte(b,a) */
+        case OP_lt:  GEN_CMP_INT("<",  "lt");  break;
+        case OP_lte: GEN_CMP_INT("<=", "lte"); break;
+
+#undef GEN_CMP_INT
+
+        case OP_gt:
             jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->lte(ctx,_b,_a);\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n");
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
-        case OP_gte:        /* reuse lt(b,a) */
+        case OP_gte:
             jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->lt(ctx,_b,_a);\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n");
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>=JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
-        case OP_eq:         GEN_CMP("eq");        break;
+
+        case OP_eq:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
         case OP_neq:
             jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->eq(ctx,_a,_b);\n"
-                "      _CHK(_r);\n"
-                "      _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_r));\n"
-                "      _FREE(_r); }\n");
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
+                "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
             break;
-        case OP_strict_eq:  GEN_CMP("strict_eq"); break;
+        case OP_strict_eq:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
         case OP_strict_neq:
             jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],_r=_RT->strict_eq(ctx,_a,_b);\n"
-                "      _CHK(_r);\n"
-                "      _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_r));\n"
-                "      _FREE(_r); }\n");
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
+                "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
             break;
-
-#undef GEN_CMP
 
         /* ---- instanceof / in ---- */
         case OP_instanceof:
