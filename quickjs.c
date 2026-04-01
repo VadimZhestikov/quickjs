@@ -15660,6 +15660,15 @@ int      js_jit_fb_get_var_count(JSFunctionBytecode *b) { return b->var_count; }
 int      js_jit_fb_get_stack_size(JSFunctionBytecode *b) { return b->stack_size; }
 int      js_jit_fb_get_closure_var_count(JSFunctionBytecode *b) { return b->closure_var_count; }
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
+/* Returns function name as a C string (caller must NOT free - static buffer). */
+const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    if (b->func_name == JS_ATOM_NULL) return "<anonymous>";
+    /* Use a static buffer - good enough for debug use in the JIT codegen path */
+    static char buf[256];
+    const char *s = JS_AtomGetStrRT(rt, buf, sizeof(buf), b->func_name);
+    return s ? s : "<unknown>";
+}
 /* Opcode size table — built from quickjs-opcode.h so the JIT scan pass
  * can iterate bytecode without seeing the static opcode_info[] array.  */
 const uint8_t *js_jit_get_opcode_size_table(int *count)

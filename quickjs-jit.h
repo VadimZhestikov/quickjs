@@ -184,6 +184,8 @@ int            js_jit_fb_get_closure_var_count(JSFunctionBytecode *b);
 int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
 /* Opcode size table: opcode_size[opcode] = instruction length in bytes */
 const uint8_t *js_jit_get_opcode_size_table(int *count);
+/* Function name as a C string (static buf — for debug/logging only) */
+const char    *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b);
 #endif
 
 /* ======================================================================= */

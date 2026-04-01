@@ -839,7 +839,8 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
 
 /* Forward declaration: js_jit_gen_c is defined in the Phase 2 section below */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
-                         char *fname_out, size_t fname_sz, int *unsupported);
+                         char *fname_out, size_t fname_sz, int *unsupported,
+                         const char *js_func_name);
 
 typedef struct JITGCCJob {
     JSFunctionBytecode *b;
@@ -911,7 +912,7 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     int status = 0;
     waitpid(pid, &status, 0);
     int gcc_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (gcc_ok) unlink(c_path); /* keep .c on failure for debugging */
+    if (gcc_ok) unlink(c_path);
     free(c_path);
     if (!gcc_ok) { unlink(so_path); goto fail; }
 
@@ -990,7 +991,6 @@ void js_jit_free(void)
 
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
 {
-    (void)ctx;
     if (js_jit_fb_jit_no_compile(b)) return;
     if (js_jit_fb_get_func(b) != NULL) return;
     /* Claim the slot: no other thread or call will enqueue this function */
@@ -1000,7 +1000,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     JSJITCodeBuf cb;
     char fname[64];
     int unsupported = 0;
-    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported) < 0) {
+    const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
+    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported, js_name) < 0) {
         return;
     }
 
@@ -1049,12 +1050,16 @@ static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
                          int var_count, int arg_count, int stack_size,
                          int closure_var_count, int cpool_count,
                          char *fname_out, size_t fname_sz,
-                         const uint8_t *local_type)
+                         const uint8_t *local_type,
+                         const char *js_func_name)
 {
     /* Unique function name based on pointer value */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
              (unsigned long long)(uintptr_t)b);
 
+    /* Debug: identify the JS source function */
+    jit_buf_printf(cb, "/* JS function: %s */\n",
+                   js_func_name ? js_func_name : "<unknown>");
     jit_buf_str(cb,
         "#include <stdint.h>\n"
         "#include \"quickjs.h\"\n"
@@ -1248,9 +1253,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "    _s[_sp]=_DUP(_s[_sp-2]);"
                 " _s[_sp+1]=_DUP(_s[_sp-1]); _sp+=2;\n");
             break;
-        case OP_insert2: /* obj a -> a obj a */
+        case OP_insert2: /* obj a -> a obj a (dup_x1): a is duplicated */
+            /* Interpreter: sp[-2]=JS_DupValue(sp[0]) after moving.
+             * Must dup 'a' since it appears in both new sp[-3] and sp[-1]. */
             jit_buf_str(cb,
-                "    { JSValue _t=_s[_sp-1];"
+                "    { JSValue _t=_DUP(_s[_sp-1]);"
                 " _s[_sp]=_s[_sp-1]; _s[_sp-1]=_s[_sp-2];"
                 " _s[_sp-2]=_t; _sp++; }\n");
             break;
@@ -1709,18 +1716,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_CMP_INT
 
         case OP_gt:
+            /* a > b  ≡  b < a  (strict):  use lt(b,a) */
             jit_buf_str(cb,
                 "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
                 "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "      else { JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
         case OP_gte:
+            /* a >= b  ≡  b <= a  (inclusive): use lte(b,a) */
             jit_buf_str(cb,
                 "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
                 "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>=JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "      else { JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
 
         case OP_eq:
@@ -1891,8 +1900,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 nargs);
             break;
         }
-        case OP_call_method:
-        case OP_tail_call_method: {
+        case OP_call_method: {
             int nargs = (int)bc_u16(&bc[pc+1]);
             /* stack: this func arg0 ... argN-1 */
             jit_buf_printf(cb,
@@ -1904,6 +1912,27 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _sp -= _n+2; _FREE(_f); _FREE(_t);\n"
                 "      _CHK(_r); _s[_sp++]=_r; }\n",
                 nargs);
+            break;
+        }
+        case OP_tail_call_method: {
+            int nargs = (int)bc_u16(&bc[pc+1]);
+            /* tail call: perform the call and return the result directly
+             * (no OP_return follows in the bytecode stream) */
+            jit_buf_printf(cb,
+                "    { int _n=%d;\n"
+                "      JSValue _f=_s[_sp-1-_n];\n"
+                "      JSValue _t=_s[_sp-2-_n];\n"
+                "      JSValue _r=_RT->call(ctx,_f,_t,_n,&_s[_sp-_n]);\n"
+                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
+                "      _sp -= _n+2; _FREE(_f); _FREE(_t);\n"
+                "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                nargs);
+            if (var_count > 0)
+                jit_buf_printf(cb,
+                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            jit_buf_str(cb,
+                "      while(_sp>0) _FREE(_s[--_sp]);\n"
+                "      return _r; }\n");
             break;
         }
         case OP_tail_call: {
@@ -2020,7 +2049,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  * Returns -1 on failure; if *unsupported!=0 the function is ineligible.
  */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
-                        char *fname_out, size_t fname_sz, int *unsupported)
+                        char *fname_out, size_t fname_sz, int *unsupported,
+                        const char *js_func_name)
 {
     *unsupported = 0;
 
@@ -2054,7 +2084,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     gen_preamble(cb, b, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
-                 local_type);
+                 local_type, js_func_name);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
