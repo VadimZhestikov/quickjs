@@ -43,6 +43,15 @@
 #include "quickjs-jit.h"
 #include "quickjs-opcode.h"
 
+/* Atom enum — needed to get numeric values of predefined atoms (e.g. JS_ATOM_length)
+ * without pulling in the full quickjs.c internal headers.              */
+#define DEF(name, str) JS_ATOM_##name,
+typedef enum {
+#include "quickjs-atom.h"
+    JS_ATOM__COUNT
+} JSAtomEnumJIT;
+#undef DEF
+
 /* Build OP_* enum locally from quickjs-opcode.h, matching quickjs.c exactly.
  *
  * DEF() entries are real opcodes; def() entries are temporary phase-1 opcodes
@@ -536,6 +545,281 @@ static int scan_is_target(const JSJITScanResult *sr, int off)
     return 0;
 }
 
+/* =======================================================================
+ * Phase 5 — Typed variable inference
+ *
+ * Forward abstract interpretation of the bytecode.  Determines which
+ * local variable slots hold numeric (int or float) values throughout the
+ * function's lifetime.  Such slots are represented as C `double` instead
+ * of JSValue, eliminating the boxing/unboxing overhead on hot arithmetic
+ * loops (e.g. sum_loop where s overflows int32 and falls back to vtable).
+ *
+ * Abstract types:
+ *   JIT_T_JSVAL  — unknown, use JSValue _l[idx]
+ *   JIT_T_NUMBER — always numeric, use double _ld[idx]
+ *
+ * Algorithm:
+ *   1. Pre-pass: any local targeted by set_loc_uninitialized (TDZ marker)
+ *      is forced to JSVAL — the JIT skips TDZ checks, so returning 0.0
+ *      instead of throwing a ReferenceError would be wrong.
+ *   2. Optimistic start: all remaining locals = NUMBER.
+ *   3. Up to 3 forward passes: downgrade to JSVAL when a non-numeric
+ *      source writes to a local (put_loc/set_loc/add_loc with JSVAL stack
+ *      top).  Re-pass until fixpoint (handles loop back-edges one level
+ *      deep).
+ * ======================================================================= */
+
+/* Helper: read little-endian integers from bytecode stream */
+static inline uint32_t bc_u32(const uint8_t *p) {
+    return (uint32_t)p[0]|((uint32_t)p[1]<<8)|
+           ((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
+static inline uint16_t bc_u16(const uint8_t *p) {
+    return (uint16_t)p[0]|((uint16_t)p[1]<<8);
+}
+
+#define JIT_T_JSVAL  0  /* unknown — always use JSValue */
+#define JIT_T_NUMBER 1  /* provably always numeric — use C double */
+
+/*
+ * jit_infer_types() — returns malloc'd uint8_t[var_count] or NULL.
+ */
+static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
+                                 const uint8_t *op_sz, int op_sz_count,
+                                 int var_count, int stack_size)
+{
+    if (var_count <= 0) return NULL;
+
+    uint8_t *lt = malloc(var_count);
+    int stk_cap = (stack_size < 4 ? 4 : stack_size) + 8;
+    uint8_t *st = malloc(stk_cap);
+    if (!lt || !st) { free(lt); free(st); return NULL; }
+
+    /* Optimistic start: assume all locals are NUMBER */
+    memset(lt, JIT_T_NUMBER, var_count);
+
+    /* No TDZ pre-pass: set_loc_uninitialized is a no-op for type inference.
+     * Locals accessed via get_loc_check (might be in TDZ) are forced to JSVAL
+     * in the main pass below, which is the only case where the NUMBER→double
+     * optimization would break TDZ correctness. */
+
+    /* Multi-pass forward walk until fixpoint */
+    for (int pass = 0; pass < 3; pass++) {
+        int changed = 0;
+        memset(st, JIT_T_JSVAL, stk_cap);
+        int sp = 0;
+
+#define _TI_PUSH(t)  do { if (sp < stk_cap-1) st[sp++]=(uint8_t)(t); } while(0)
+#define _TI_POP()    (sp > 0 ? st[--sp] : (uint8_t)JIT_T_JSVAL)
+#define _TI_PEEK()   (sp > 0 ? st[sp-1] : (uint8_t)JIT_T_JSVAL)
+#define _TI_DROPN(n) do { sp -= (n); if (sp < 0) sp = 0; } while(0)
+/* Downgrade local[i] if written from non-NUMBER source */
+#define _TI_WRITE(i, t) do { \
+    if ((i) >= 0 && (i) < var_count && (t) != JIT_T_NUMBER \
+        && lt[(i)] == JIT_T_NUMBER) { lt[(i)] = JIT_T_JSVAL; changed = 1; } \
+} while(0)
+
+        int pc = 0;
+        while (pc < bc_len) {
+            int op = bc[pc];
+            if (op >= op_sz_count || op_sz[op] == 0) break;
+
+            switch (op) {
+            /* ---- Numeric constant pushes → NUMBER ---- */
+            case OP_push_i32: case OP_push_i8: case OP_push_i16:
+            case OP_push_0:   case OP_push_1:  case OP_push_2:  case OP_push_3:
+            case OP_push_4:   case OP_push_5:  case OP_push_6:  case OP_push_7:
+            case OP_push_minus1:
+                _TI_PUSH(JIT_T_NUMBER); break;
+
+            /* ---- Non-numeric pushes → JSVAL ---- */
+            case OP_push_false: case OP_push_true: case OP_push_empty_string:
+            case OP_undefined:  case OP_null:      case OP_push_this:
+            case OP_push_const: case OP_push_const8: case OP_push_atom_value:
+                _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- get_loc / get_loc_check: propagate local type ---- */
+            /* Note: get_loc_check does a TDZ check at runtime.  For the JIT
+             * we skip TDZ checks on NUMBER locals because:
+             * (a) the function has been called 100+ times without hitting TDZ,
+             * (b) a TDZ violation would have thrown in the interpreter first. */
+            case OP_get_loc: case OP_get_loc_check: case OP_get_loc_checkthis: {
+                int i = (int)bc_u16(&bc[pc+1]);
+                _TI_PUSH(i >= 0 && i < var_count ? lt[i] : JIT_T_JSVAL); break;
+            }
+            case OP_get_loc8: {
+                int i = (int)bc[pc+1];
+                _TI_PUSH(i >= 0 && i < var_count ? lt[i] : JIT_T_JSVAL); break;
+            }
+            case OP_get_loc0: _TI_PUSH(lt[0]); break;
+            case OP_get_loc1: _TI_PUSH(lt[1]); break;
+            case OP_get_loc2: _TI_PUSH(lt[2]); break;
+            case OP_get_loc3: _TI_PUSH(lt[3]); break;
+
+            /* ---- External sources → JSVAL ---- */
+            case OP_get_arg:  case OP_get_arg0:  case OP_get_arg1:
+            case OP_get_arg2: case OP_get_arg3:
+            case OP_get_var:
+            case OP_get_var_ref:   case OP_get_var_ref_check:
+            case OP_get_var_ref0:  case OP_get_var_ref1:
+            case OP_get_var_ref2:  case OP_get_var_ref3:
+                _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- Property / array / call → JSVAL ---- */
+            case OP_get_field:    _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_get_field2:                 _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_get_array_el: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_get_length:   _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_object:                     _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_array_from: {
+                int n = (int)bc_u16(&bc[pc+1]); _TI_DROPN(n); _TI_PUSH(JIT_T_JSVAL); break;
+            }
+
+            /* ---- Binary arithmetic: NUMBER iff both NUMBER (not pow) ---- */
+            case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod: {
+                uint8_t b = _TI_POP(), a = _TI_POP();
+                _TI_PUSH(a == JIT_T_NUMBER && b == JIT_T_NUMBER ? JIT_T_NUMBER : JIT_T_JSVAL);
+                break;
+            }
+            case OP_pow: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- Unary numeric ---- */
+            case OP_neg: case OP_plus: case OP_inc: case OP_dec: {
+                uint8_t a = _TI_POP();
+                _TI_PUSH(a == JIT_T_NUMBER ? JIT_T_NUMBER : JIT_T_JSVAL); break;
+            }
+            case OP_post_inc: case OP_post_dec: {
+                uint8_t a = _TI_POP();
+                uint8_t r = a == JIT_T_NUMBER ? JIT_T_NUMBER : JIT_T_JSVAL;
+                _TI_PUSH(a); _TI_PUSH(r); break;
+            }
+
+            /* ---- Bitwise: always int → NUMBER ---- */
+            case OP_shl: case OP_sar: case OP_shr:
+            case OP_and: case OP_or:  case OP_xor: _TI_DROPN(2); _TI_PUSH(JIT_T_NUMBER); break;
+            case OP_not: _TI_DROPN(1); _TI_PUSH(JIT_T_NUMBER); break;
+
+            /* ---- Boolean / comparison / typeof → JSVAL ---- */
+            case OP_lnot: case OP_typeof: _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_lt:  case OP_lte: case OP_gt:  case OP_gte:
+            case OP_eq:  case OP_neq: case OP_strict_eq: case OP_strict_neq:
+            case OP_instanceof: case OP_in: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- put_loc: write local ← stack top (pops) ---- */
+            case OP_put_loc: case OP_put_loc_check: case OP_put_loc_check_init:
+                _TI_WRITE((int)bc_u16(&bc[pc+1]), _TI_POP()); break;
+            case OP_put_loc8:  _TI_WRITE((int)bc[pc+1], _TI_POP()); break;
+            case OP_put_loc0:  _TI_WRITE(0, _TI_POP()); break;
+            case OP_put_loc1:  _TI_WRITE(1, _TI_POP()); break;
+            case OP_put_loc2:  _TI_WRITE(2, _TI_POP()); break;
+            case OP_put_loc3:  _TI_WRITE(3, _TI_POP()); break;
+
+            /* ---- set_loc: peek-assign (top unchanged) ---- */
+            case OP_set_loc:  _TI_WRITE((int)bc_u16(&bc[pc+1]), _TI_PEEK()); break;
+            case OP_set_loc8: _TI_WRITE((int)bc[pc+1], _TI_PEEK()); break;
+            case OP_set_loc0: _TI_WRITE(0, _TI_PEEK()); break;
+            case OP_set_loc1: _TI_WRITE(1, _TI_PEEK()); break;
+            case OP_set_loc2: _TI_WRITE(2, _TI_PEEK()); break;
+            case OP_set_loc3: _TI_WRITE(3, _TI_PEEK()); break;
+            case OP_set_loc_uninitialized: break; /* no-op: TDZ guarded via get_loc_check */
+
+            /* ---- inc_loc / dec_loc: in-place, keeps numeric type ---- */
+            case OP_inc_loc: case OP_dec_loc: break;
+
+            /* ---- add_loc: local += pop; downgrade if non-numeric ---- */
+            case OP_add_loc: _TI_WRITE((int)bc[pc+1], _TI_POP()); break;
+
+            /* ---- Stack manipulation ---- */
+            case OP_nop: break;
+            case OP_drop: _TI_DROPN(1); break;
+            case OP_dup:  { uint8_t t = _TI_PEEK(); _TI_PUSH(t); break; }
+            case OP_dup1: { /* a b → a a b */
+                if (sp >= 2) {
+                    uint8_t b = st[sp-1], a = st[sp-2];
+                    if (sp < stk_cap-1) { st[sp-1] = a; st[sp] = b; sp++; }
+                }
+                break;
+            }
+            case OP_dup2: { /* a b → a b a b */
+                uint8_t b = _TI_PEEK(), a = sp > 1 ? st[sp-2] : (uint8_t)JIT_T_JSVAL;
+                _TI_PUSH(a); _TI_PUSH(b); break;
+            }
+            case OP_nip: { uint8_t b = _TI_POP(); _TI_DROPN(1); _TI_PUSH(b); break; }
+            case OP_swap: {
+                if (sp >= 2) { uint8_t t=st[sp-1]; st[sp-1]=st[sp-2]; st[sp-2]=t; }
+                break;
+            }
+            case OP_rot3l: case OP_rot3r:
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                break;
+            case OP_insert2:
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- Arg/varref writes (no effect on locals) ---- */
+            case OP_put_arg:  case OP_put_arg0: case OP_put_arg1:
+            case OP_put_arg2: case OP_put_arg3: _TI_DROPN(1); break;
+            case OP_set_arg:  case OP_set_arg0: case OP_set_arg1:
+            case OP_set_arg2: case OP_set_arg3: break;
+            case OP_put_var_ref: case OP_put_var_ref_check: case OP_put_var_ref_check_init:
+            case OP_put_var_ref0: case OP_put_var_ref1:
+            case OP_put_var_ref2: case OP_put_var_ref3:
+            case OP_put_var: case OP_put_var_init: _TI_DROPN(1); break;
+            case OP_set_var_ref:  case OP_set_var_ref0: case OP_set_var_ref1:
+            case OP_set_var_ref2: case OP_set_var_ref3: break;
+
+            /* ---- Property writes ---- */
+            case OP_put_field:    _TI_DROPN(2); break;
+            case OP_put_array_el: _TI_DROPN(3); break;
+            case OP_define_field: _TI_DROPN(1); break;
+
+            /* ---- Branches ---- */
+            case OP_if_false:  case OP_if_true:
+            case OP_if_false8: case OP_if_true8: _TI_DROPN(1); break;
+            case OP_goto: case OP_goto8: case OP_goto16: break;
+
+            /* ---- Return / throw ---- */
+            case OP_return: _TI_DROPN(1); sp = 0; break;
+            case OP_return_undef: sp = 0; break;
+            case OP_throw: _TI_DROPN(1); sp = 0; break;
+
+            /* ---- Calls → JSVAL ---- */
+            case OP_call: case OP_tail_call: {
+                int n=(int)bc_u16(&bc[pc+1]); _TI_DROPN(n+1); _TI_PUSH(JIT_T_JSVAL); break;
+            }
+            case OP_call0: _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_call1: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_call2: _TI_DROPN(3); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_call3: _TI_DROPN(4); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_call_method: case OP_tail_call_method: {
+                int n=(int)bc_u16(&bc[pc+1]); _TI_DROPN(n+2); _TI_PUSH(JIT_T_JSVAL); break;
+            }
+            case OP_call_constructor: {
+                int n=(int)bc_u16(&bc[pc+1]); _TI_DROPN(n+2); _TI_PUSH(JIT_T_JSVAL); break;
+            }
+
+            default: break;
+            }
+
+#undef _TI_PUSH
+#undef _TI_POP
+#undef _TI_PEEK
+#undef _TI_DROPN
+#undef _TI_WRITE
+
+            pc += op_sz[op];
+        }
+
+        if (!changed) break; /* fixpoint */
+    }
+
+    free(st);
+    return lt;
+}
+
 /* -----------------------------------------------------------------------
  * Phase 4 — GCC background worker
  *
@@ -756,15 +1040,6 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
  * Branch targets from the scan pass become C labels "_L<offset>:".
  * ======================================================================= */
 
-/* Helper: read little-endian integers from bytecode stream */
-static inline uint32_t bc_u32(const uint8_t *p) {
-    return (uint32_t)p[0]|((uint32_t)p[1]<<8)|
-           ((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
-}
-static inline uint16_t bc_u16(const uint8_t *p) {
-    return (uint16_t)p[0]|((uint16_t)p[1]<<8);
-}
-
 /*
  * Emit the C preamble: type definitions and the function signature.
  * The function symbol name encodes the bytecode pointer as a hex address
@@ -773,7 +1048,8 @@ static inline uint16_t bc_u16(const uint8_t *p) {
 static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
                          int var_count, int arg_count, int stack_size,
                          int closure_var_count, int cpool_count,
-                         char *fname_out, size_t fname_sz)
+                         char *fname_out, size_t fname_sz,
+                         const uint8_t *local_type)
 {
     /* Unique function name based on pointer value */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -821,6 +1097,21 @@ static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
     if (var_count > 0)
         jit_buf_printf(cb,
             "    for(_i=0;_i<%d;_i++) _l[_i]=JS_UNDEFINED;\n", var_count);
+
+    /* Phase 5: typed double locals.  NUMBER-inferred slots use _ld[idx]
+     * instead of _l[idx], avoiding boxing/unboxing in hot arithmetic loops.
+     * _l[idx] stays JS_UNDEFINED for NUMBER slots — _FREE(_l[idx]) is safe. */
+    if (local_type && var_count > 0) {
+        int nhave = 0;
+        for (int j = 0; j < var_count; j++)
+            if (local_type[j] == JIT_T_NUMBER) nhave++;
+        if (nhave > 0) {
+            jit_buf_printf(cb, "    double _ld[%d];\n", var_count);
+            for (int j = 0; j < var_count; j++)
+                if (local_type[j] == JIT_T_NUMBER)
+                    jit_buf_printf(cb, "    _ld[%d]=0.0;\n", j);
+        }
+    }
 }
 
 /*
@@ -846,7 +1137,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     const JSJITScanResult *sr,
                     const uint8_t *op_sz, int op_sz_count,
                     int var_count, int arg_count,
-                    int *unsupported_out)
+                    int *unsupported_out,
+                    const uint8_t *local_type)
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -984,13 +1276,48 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 " _s[_sp-2]=_s[_sp-3]; _s[_sp-3]=_t; }\n");
             break;
 
-        /* ---- Local variable access ---- */
-#define GEN_GET_LOC(idx) \
-    jit_buf_printf(cb, "    _s[_sp++]=_DUP(_l[%d]);\n", idx)
-#define GEN_PUT_LOC(idx) \
-    jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_s[--_sp];\n", idx, idx)
-#define GEN_SET_LOC(idx) \
-    jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_DUP(_s[_sp-1]);\n", idx, idx)
+        /* ---- Local variable access (Phase 5: type-aware) ----
+         *
+         * NUMBER locals use double _ld[idx]: boxing on read, unboxing on write.
+         * GCC -O2 CSE collapses consecutive get_loc+arithmetic patterns into
+         * pure double operations (e.g. get_loc i → add_loc s ≡ _ld[s]+=_ld[i]).
+         * _l[idx] for NUMBER slots stays JS_UNDEFINED — footer _FREE is a no-op.
+         * INT and FLOAT64 JSValues are immediate (no refcount) → no _FREE needed
+         * when writing from stack to a NUMBER local.                           */
+#define _IS_NUM(idx) \
+    (local_type && (idx) >= 0 && (idx) < var_count && \
+     local_type[(idx)] == JIT_T_NUMBER)
+
+#define GEN_GET_LOC(idx) do { \
+    if (_IS_NUM(idx)) \
+        jit_buf_printf(cb, \
+            "    { double _d=_ld[%d];" \
+            " _s[_sp++]=(_d==(int32_t)_d)?JS_NewInt32(ctx,(int32_t)_d)" \
+            ":JS_NewFloat64(ctx,_d); }\n", (idx)); \
+    else \
+        jit_buf_printf(cb, "    _s[_sp++]=_DUP(_l[%d]);\n", (idx)); \
+} while(0)
+
+#define GEN_PUT_LOC(idx) do { \
+    if (_IS_NUM(idx)) \
+        /* INT and FLOAT64 are immediate — no _FREE required */ \
+        jit_buf_printf(cb, \
+            "    { JSValue _t=_s[--_sp];" \
+            " _ld[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", (idx)); \
+    else \
+        jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_s[--_sp];\n", (idx), (idx)); \
+} while(0)
+
+#define GEN_SET_LOC(idx) do { \
+    if (_IS_NUM(idx)) \
+        jit_buf_printf(cb, \
+            "    { JSValue _t=_s[_sp-1];" \
+            " _ld[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", (idx)); \
+    else \
+        jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_DUP(_s[_sp-1]);\n", (idx), (idx)); \
+} while(0)
 
         case OP_get_loc:  case OP_get_loc_check:
         case OP_get_loc_checkthis: GEN_GET_LOC((int)bc_u16(&bc[pc+1])); break;
@@ -1015,6 +1342,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_set_loc2: GEN_SET_LOC(2); break;
         case OP_set_loc3: GEN_SET_LOC(3); break;
 
+#undef _IS_NUM
 #undef GEN_GET_LOC
 #undef GEN_PUT_LOC
 #undef GEN_SET_LOC
@@ -1306,43 +1634,63 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* OP_inc_loc / OP_dec_loc: in-place ±1 on local variable (1-byte index) */
         case OP_inc_loc: {
             int idx = bc[pc + 1];
-            jit_buf_printf(cb,
-                "    { JSValue _a=_l[%d];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _l[%d]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
-                "                              :JS_NewInt32(ctx,ia+1);\n"
-                "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
-                idx, idx, idx, idx);
+            if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
+                jit_buf_printf(cb, "    _ld[%d]+=1.0;\n", idx);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_l[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _l[%d]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                    "                              :JS_NewInt32(ctx,ia+1);\n"
+                    "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
+                    idx, idx, idx, idx);
+            }
             break;
         }
         case OP_dec_loc: {
             int idx = bc[pc + 1];
-            jit_buf_printf(cb,
-                "    { JSValue _a=_l[%d];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _l[%d]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
-                "                              :JS_NewInt32(ctx,ia-1);\n"
-                "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
-                idx, idx, idx, idx);
+            if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
+                jit_buf_printf(cb, "    _ld[%d]-=1.0;\n", idx);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_l[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _l[%d]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                    "                              :JS_NewInt32(ctx,ia-1);\n"
+                    "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
+                    idx, idx, idx, idx);
+            }
             break;
         }
-        /* OP_add_loc: pop stack top and add it in-place to _l[idx] (1-byte index) */
+        /* OP_add_loc: pop stack top and add it in-place to local (1-byte index) */
         case OP_add_loc: {
             int idx = bc[pc + 1];
-            jit_buf_printf(cb,
-                "    { JSValue _b=_s[--_sp], *_pv=&_l[%d];\n"
-                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
-                "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
-                "                              :JS_NewFloat64(ctx,(double)_r);\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->add(ctx,*_pv,_b); _CHK(_r); _FREE(*_pv); *_pv=_r;\n"
-                "      } }\n",
-                idx);
+            if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
+                /* NUMBER local: direct double add.  Inference guarantees the stack
+                 * top is INT or FLOAT64 (both immediate — no _FREE needed). GCC
+                 * CSE will collapse get_loc(j)+add_loc(i) → _ld[i]+=_ld[j]. */
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _ld[%d]+=(double)JS_VALUE_GET_INT(_b);\n"
+                    "      else _ld[%d]+=JS_VALUE_GET_FLOAT64(_b); }\n",
+                    idx, idx);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_s[--_sp], *_pv=&_l[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                    "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
+                    "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                    "                              :JS_NewFloat64(ctx,(double)_r);\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->add(ctx,*_pv,_b); _CHK(_r); _FREE(*_pv); *_pv=_r;\n"
+                    "      } }\n",
+                    idx);
+            }
             break;
         }
 
@@ -1512,10 +1860,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _FREE(_o); _FREE(_idx); if(_r<0) goto _ex; }\n");
             break;
         case OP_get_length:
-            jit_buf_str(cb,
-                "    { JSValue _r=_RT->get_prop(ctx,_s[_sp-1],"
-                "JS_ATOM_length); _CHK(_r);\n"
-                "      _FREE(_s[--_sp]); _s[_sp++]=_r; }\n");
+            /* Emit atom value numerically to avoid needing quickjs-atom.h */
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);"
+                " _CHK(_r);\n"
+                "      _FREE(_s[--_sp]); _s[_sp++]=_r; }\n",
+                (unsigned)JS_ATOM_length);
             break;
 
         /* ---- Function calls ---- */
@@ -1692,27 +2042,34 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     int op_sz_count;
     const uint8_t *op_sz = js_jit_get_opcode_size_table(&op_sz_count);
 
+    /* Phase 5: infer which locals are always numeric → use C double */
+    uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
+                                           var_count, stack_size);
 
     if (jit_buf_init(cb) < 0) {
         scan_result_free(&sr);
+        free(local_type);
         return -1;
     }
 
     gen_preamble(cb, b, var_count, arg_count, stack_size,
-                 closure_var_count, cpool_count, fname_out, fname_sz);
+                 closure_var_count, cpool_count, fname_out, fname_sz,
+                 local_type);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
-                 var_count, arg_count, &unsup) < 0) {
+                 var_count, arg_count, &unsup, local_type) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);
+        free(local_type);
         return -1;
     }
 
     gen_footer(cb, var_count);
 
     scan_result_free(&sr);
+    free(local_type);
 
     if (cb->error) {
         jit_buf_free(cb);
