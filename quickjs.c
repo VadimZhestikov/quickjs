@@ -15642,6 +15642,39 @@ void     js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f, void *handle, in
 }
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
 
+/* Bytecode/metadata accessors for the code generator (Phase 2+) */
+const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len)
+{
+    *len = b->byte_code_len;
+    return b->byte_code_buf;
+}
+int      js_jit_fb_get_arg_count(JSFunctionBytecode *b) { return b->arg_count; }
+int      js_jit_fb_get_var_count(JSFunctionBytecode *b) { return b->var_count; }
+int      js_jit_fb_get_stack_size(JSFunctionBytecode *b) { return b->stack_size; }
+int      js_jit_fb_get_closure_var_count(JSFunctionBytecode *b) { return b->closure_var_count; }
+int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
+/* Opcode size table — built from quickjs-opcode.h so the JIT scan pass
+ * can iterate bytecode without seeing the static opcode_info[] array.  */
+const uint8_t *js_jit_get_opcode_size_table(int *count)
+{
+    /* Use the DEF macro to populate a static local table.
+     * 'size' is in bytes including the opcode byte itself.              */
+    static uint8_t tbl[OP_COUNT];
+    static int     tbl_ready;
+    if (!tbl_ready) {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) tbl[OP_##id] = size;
+#define def(id, size, n_pop, n_push, f) /* short opcode, keep as 0 */
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+        tbl_ready = 1;
+    }
+    *count = OP_COUNT;
+    return tbl;
+}
+
 /* -----------------------------------------------------------------------
  * Non-static arithmetic/comparison wrappers for the JIT vtable.
  *

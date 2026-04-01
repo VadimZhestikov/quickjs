@@ -168,6 +168,16 @@ JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b);
 void      js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f,
                               void *handle, int tier);
 int       js_jit_fb_inc_count(JSFunctionBytecode *b);
+
+/* Bytecode / metadata accessors for the code generator */
+const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len);
+int            js_jit_fb_get_arg_count(JSFunctionBytecode *b);
+int            js_jit_fb_get_var_count(JSFunctionBytecode *b);
+int            js_jit_fb_get_stack_size(JSFunctionBytecode *b);
+int            js_jit_fb_get_closure_var_count(JSFunctionBytecode *b);
+int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
+/* Opcode size table: opcode_size[opcode] = instruction length in bytes */
+const uint8_t *js_jit_get_opcode_size_table(int *count);
 #endif
 
 /* ======================================================================= */
