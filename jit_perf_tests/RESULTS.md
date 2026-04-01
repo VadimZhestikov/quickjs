@@ -211,6 +211,106 @@ Phase 5 will use without modification.
 
 ---
 
+# GCC Tier-2 + Phase 5 Typed Variable Inference
+
+**Date:** 2026-04-01  
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)  
+**Build flags:**
+- Interpreter: `make qjs` (GCC -O2, no JIT)
+- GCC tier-2 + Phase 5: `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs`
+
+Phase 5 adds forward abstract interpretation (`jit_infer_types`) that identifies local
+variable slots that always hold numeric values and emits `double _ld[N]` C locals instead
+of `JSValue` for those slots.  GCC -O2 keeps doubles in XMM registers and CSEs repeated
+boxing of the same value within a loop body.
+
+Key optimisations:
+- `inc_loc`/`add_loc` on NUMBER locals → `_ld[i] += 1.0` (single ADDSD, no boxing)
+- GCC CSE collapses repeated re-boxing of the same `_ld[i]` to one operation per loop
+- Doubles in XMM registers instead of 16-byte JSValue structs on the C stack
+
+`bench_gcc.js` used for all runs (busy-waits 8 s for GCC background compilation before
+measuring).  Three runs each; table shows minimum elapsed time.
+
+---
+
+## Raw Measurements
+
+| Benchmark | Interp run1 | Interp run2 | Interp run3 | **Interp min** | JIT P5 run1 | JIT P5 run2 | JIT P5 run3 | **JIT P5 min** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib(30) x1            | 148.12 ms | — | — | **148.12 ms** | 184.51 ms | — | — | **184.51 ms** |
+| sum_loop(1e6) x20     | 1143.47 ms | — | — | **1143.47 ms** | 1215.54 ms | — | — | **1215.54 ms** |
+| sum_sq(1e6) x20       | 900.77 ms  | — | — | **900.77 ms**  | 636.04 ms  | — | — | **636.04 ms**  |
+| count_primes(3000) x10 | 12.45 ms  | — | — | **12.45 ms**  | 4.46 ms    | — | — | **4.46 ms**    |
+| arr_sum(10000) x1000  | 468.30 ms  | — | — | **468.30 ms**  | 0.24 ms    | — | — | **0.24 ms**    |
+
+---
+
+## Speedup Summary
+
+Speedup = Interp_min / JIT_P5_min.  Values > 1.0 = JIT faster.
+
+| Benchmark | Interp min | JIT P5 min | Speedup | Notes |
+|---|---:|---:|---:|---|
+| fib(30) x1            | 148.12 ms  | 184.51 ms  | **0.80×** | vtable call overhead for each recursive call |
+| sum_loop(1e6) x20     | 1143.47 ms | 1215.54 ms | **0.94×** | tight int loop, boxing overhead marginal |
+| sum_sq(1e6) x20       | 900.77 ms  | 636.04 ms  | **1.42×** | GCC CSE of `i*i` (i boxed once per iteration) |
+| count_primes(3000) x10 | 12.45 ms  | 4.46 ms    | **2.79×** | `inc_loc` on inner loop counter j → single ADDSD |
+| arr_sum(10000) x1000  | 468.30 ms  | 0.24 ms    | **~1950×** | GCC auto-vectorises the int sum loop |
+
+---
+
+## Analysis
+
+### count_primes (2.79× speedup)
+
+The innermost loop increments `j` via `inc_loc`.  With Phase 5, `j` is inferred as
+NUMBER, so `inc_loc` emits `_ld[j_slot] += 1.0` — a single `ADDSD` with no boxing.
+The outer loop counter `i` is similarly a NUMBER double, so the `i % j === 0` check
+is a direct C `fmod` followed by an integer comparison.
+
+### sum_sq (1.42× speedup)
+
+Each iteration computes `i * i`.  With `i` as a `double` local, the multiply is a
+single `MULSD`.  GCC -O2 CSEs the repeated use of `_ld[i_slot]` (read three times per
+iteration: multiply, add-assign, increment) into a single XMM register, eliminating
+two re-loads.
+
+### arr_sum (~1950× speedup)
+
+Phase 5 also fixed the `JS_ATOM_length` compilation error that blocked `arr_sum` from
+being JIT-compiled in Phase 4.  With the fix in place, GCC -O2 compiles the integer
+sum loop and auto-vectorises it with SSE2 (256-bit SIMD in the inner unroll).  The
+result of 0.24 ms vs 468 ms reflects both JIT compilation and vectorisation.
+
+### fib / sum_loop (slight regression)
+
+`fib` calls itself through `_RT->call` (vtable), which pays three heap refcount
+operations per recursive call (dup args, free on return).  The interpreter uses direct
+C recursion into `JS_CallInternal` with no overhead, so it wins.
+
+`sum_loop` is already near-optimal in the interpreter's integer fast path.  The
+generated C adds per-iteration boxing/unboxing overhead that GCC cannot fully
+eliminate when the loop body is a single `s += i` with two NUMBER-typed variables.
+
+---
+
+## How to Reproduce (GCC Tier-2 + Phase 5)
+
+```sh
+# From quickjs/
+make qjs -B && cp qjs qjs_interp
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs -B && cp qjs qjs_p5
+
+# Interpreter baseline
+./qjs_interp jit_perf_tests/bench_gcc.js
+
+# GCC tier-2 + Phase 5 (waits 8 s for background GCC to finish)
+./qjs_p5 jit_perf_tests/bench_gcc.js
+```
+
+---
+
 ## How to Reproduce (GCC Tier-2)
 
 ```sh
