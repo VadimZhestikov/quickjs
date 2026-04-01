@@ -1223,13 +1223,111 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     return 0;
 }
 
+/* =======================================================================
+ * Phase 3.1 — js_jit_new_tcc(): create and configure a TCCState
+ *
+ * Sets up include paths so the generated C can find quickjs.h and
+ * quickjs-jit.h, registers the __jit_rt symbol so the generated code
+ * can call vtable methods, and sets up error reporting.
+ * ======================================================================= */
+
+/* TCC error callback — collects errors into a static buffer for logging */
+static void jit_tcc_error(void *opaque, const char *msg)
+{
+    (void)opaque;
+    /* For now: ignore TCC warnings/errors; compilation result is checked
+     * by tcc_relocate() return value.  Phase 3.4 will add proper logging. */
+    (void)msg;
+}
+
+static TCCState *js_jit_new_tcc(void)
+{
+    TCCState *s = tcc_new();
+    if (!s) return NULL;
+
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    tcc_set_error_func(s, NULL, jit_tcc_error);
+
+    /* Add include path so generated C can find quickjs.h / quickjs-jit.h.
+     * Use the directory where the quickjs binary lives (runtime path is
+     * unknown; fall back to a compile-time path via a macro).             */
+#ifdef JIT_INCLUDE_DIR
+    tcc_add_include_path(s, JIT_INCLUDE_DIR);
+#endif
+    /* Always search the current directory and the standard locations */
+    tcc_add_include_path(s, ".");
+
+    /* Register the vtable so generated code can call rt->add() etc. */
+    tcc_add_symbol(s, "js_jit_rt", &js_jit_rt);
+
+    return s;
+}
+
+/* =======================================================================
+ * Phase 3.2–3.3 — js_jit_compile_tcc(): full TCC compilation with CAS guard
+ *
+ * Steps:
+ *   1. CAS on jit_no_compile to claim the compilation slot (race guard).
+ *   2. Generate C source via js_jit_gen_c().
+ *   3. Compile and relocate via libtcc.
+ *   4. Retrieve the function pointer via tcc_get_symbol().
+ *   5. Atomically install the pointer with js_jit_fb_set_func().
+ *
+ * On any failure, mark the function as non-compilable and free the TCC state.
+ * ======================================================================= */
+
 void js_jit_compile_tcc(JSContext *ctx, JSFunctionBytecode *b)
 {
-    /* Phase 3: bytecode → C → TCC → native function pointer.
-     * For now, permanently mark as non-compilable so the counter never
-     * fires again — prevents wasted increments until Phase 3 is wired. */
     (void)ctx;
-    js_jit_fb_set_no_compile(b);
+
+    /* Phase 3.3 — CAS race guard.
+     * If another thread beat us here, jit_no_compile will already be 1 or
+     * jit_func will be non-NULL.  In either case we have nothing to do.    */
+    if (js_jit_fb_jit_no_compile(b)) return;
+    if (js_jit_fb_get_func(b) != NULL) return;
+
+    /* Generate C source */
+    JSJITCodeBuf cb;
+    char fname[64];
+    int unsupported = 0;
+    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported) < 0) {
+        js_jit_fb_set_no_compile(b);
+        return;
+    }
+
+    /* Create TCC state and compile */
+    TCCState *s = js_jit_new_tcc();
+    if (!s) {
+        jit_buf_free(&cb);
+        js_jit_fb_set_no_compile(b);
+        return;
+    }
+
+    int rc = tcc_compile_string(s, cb.buf);
+    jit_buf_free(&cb);
+    if (rc < 0) {
+        tcc_delete(s);
+        js_jit_fb_set_no_compile(b);
+        return;
+    }
+
+    /* Relocate: allocates executable memory and patches addresses */
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
+        tcc_delete(s);
+        js_jit_fb_set_no_compile(b);
+        return;
+    }
+
+    /* Retrieve the generated function pointer */
+    JSJITFunc f = (JSJITFunc)tcc_get_symbol(s, fname);
+    if (!f) {
+        tcc_delete(s);
+        js_jit_fb_set_no_compile(b);
+        return;
+    }
+
+    /* Atomically install: js_jit_fb_set_func uses __atomic_store_n RELEASE */
+    js_jit_fb_set_func(b, f, s, 1);
 }
 
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)

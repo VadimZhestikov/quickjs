@@ -249,10 +249,14 @@ QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR
 # Usage: make CONFIG_JIT=y [JIT_THRESHOLD_TCC=100] [JIT_THRESHOLD_GCC=5000]
 ifdef CONFIG_JIT
   TCC_DIR ?= ../tcc-0.9.27
+  # JIT_INCLUDE_DIR: directory TCC searches for quickjs.h / quickjs-jit.h.
+  # Defaults to the current (quickjs) source directory.
+  JIT_INCLUDE_DIR ?= $(shell pwd)
   CFLAGS  += -DCONFIG_JIT
   CFLAGS  += -DJIT_THRESHOLD_TCC=$(or $(JIT_THRESHOLD_TCC),100)
   CFLAGS  += -DJIT_THRESHOLD_GCC=$(or $(JIT_THRESHOLD_GCC),5000)
   CFLAGS  += -I$(TCC_DIR)
+  CFLAGS  += -DJIT_INCLUDE_DIR='"$(JIT_INCLUDE_DIR)"'
   QJS_LIB_OBJS += $(OBJDIR)/quickjs-jit.o
   # libtcc.a shares pstrcpy/pstrcat with cutils.o; allow duplicates at link time.
   EXTRA_LIBS += -Wl,--allow-multiple-definition $(TCC_DIR)/libtcc.a -lpthread
