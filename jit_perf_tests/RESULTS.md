@@ -238,11 +238,11 @@ measuring).  Three runs each; table shows minimum elapsed time.
 
 | Benchmark | Interp run1 | Interp run2 | Interp run3 | **Interp min** | JIT P5 run1 | JIT P5 run2 | JIT P5 run3 | **JIT P5 min** |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| fib(30) x1            | 148.12 ms | — | — | **148.12 ms** | 184.51 ms | — | — | **184.51 ms** |
-| sum_loop(1e6) x20     | 1143.47 ms | — | — | **1143.47 ms** | 1215.54 ms | — | — | **1215.54 ms** |
-| sum_sq(1e6) x20       | 900.77 ms  | — | — | **900.77 ms**  | 636.04 ms  | — | — | **636.04 ms**  |
-| count_primes(3000) x10 | 12.45 ms  | — | — | **12.45 ms**  | 4.46 ms    | — | — | **4.46 ms**    |
-| arr_sum(10000) x1000  | 468.30 ms  | — | — | **468.30 ms**  | 0.24 ms    | — | — | **0.24 ms**    |
+| fib(30) x1             |  95.91 ms |  105.38 ms |  91.90 ms | **91.90 ms**  |  86.58 ms |  91.60 ms | 113.82 ms | **86.58 ms** |
+| sum_loop(1e6) x20      | 670.57 ms |  699.31 ms | 675.92 ms | **670.57 ms** | 764.06 ms | 762.51 ms | 944.09 ms | **762.51 ms** |
+| sum_sq(1e6) x20        | 558.21 ms |  529.33 ms | 531.46 ms | **529.33 ms** | 272.66 ms | 280.40 ms | 314.04 ms | **272.66 ms** |
+| count_primes(3000) x10 |   7.04 ms |    7.47 ms |   6.97 ms | **6.97 ms**   |   2.16 ms |   2.11 ms |   2.40 ms | **2.11 ms**  |
+| arr_sum(10000) x1000   | 308.34 ms |  306.61 ms | 296.18 ms | **296.18 ms** |   0.09 ms |   0.09 ms |   0.11 ms | **0.09 ms**  |
 
 ---
 
@@ -252,11 +252,11 @@ Speedup = Interp_min / JIT_P5_min.  Values > 1.0 = JIT faster.
 
 | Benchmark | Interp min | JIT P5 min | Speedup | Notes |
 |---|---:|---:|---:|---|
-| fib(30) x1            | 148.12 ms  | 184.51 ms  | **0.80×** | vtable call overhead for each recursive call |
-| sum_loop(1e6) x20     | 1143.47 ms | 1215.54 ms | **0.94×** | tight int loop, boxing overhead marginal |
-| sum_sq(1e6) x20       | 900.77 ms  | 636.04 ms  | **1.42×** | GCC CSE of `i*i` (i boxed once per iteration) |
-| count_primes(3000) x10 | 12.45 ms  | 4.46 ms    | **2.79×** | `inc_loc` on inner loop counter j → single ADDSD |
-| arr_sum(10000) x1000  | 468.30 ms  | 0.24 ms    | **~1950×** | GCC auto-vectorises the int sum loop |
+| fib(30) x1             | 91.90 ms  |  86.58 ms  | **1.06×** | marginal; vtable call overhead for recursion |
+| sum_loop(1e6) x20      | 670.57 ms | 762.51 ms  | **0.88×** | tight int loop, boxing overhead outweighs gain |
+| sum_sq(1e6) x20        | 529.33 ms | 272.66 ms  | **1.94×** | GCC CSE + vectorisation of `i*i` loop |
+| count_primes(3000) x10 | 6.97 ms   |   2.11 ms  | **3.30×** | `inc_loc` on inner loop counter → single ADDSD |
+| arr_sum(10000) x1000   | 296.18 ms |   0.09 ms  | **~3290×** | GCC auto-vectorises; JS_ATOM_length fix unblocked JIT |
 
 ---
 
