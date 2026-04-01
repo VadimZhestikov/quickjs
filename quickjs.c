@@ -46,6 +46,9 @@
 #include "libregexp.h"
 #include "libunicode.h"
 #include "dtoa.h"
+#ifdef CONFIG_JIT
+#include "quickjs-jit.h"
+#endif
 
 #define OPTIMIZE         1
 #define SHORT_OPCODES    1
@@ -641,6 +644,11 @@ typedef struct JSFunctionBytecode {
     uint8_t read_only_bytecode : 1;
     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
     /* XXX: 10 bits available */
+#ifdef CONFIG_JIT
+    /* JIT state — 2 bits consumed from the 10 available */
+    uint8_t jit_no_compile : 1; /* permanently excluded from JIT */
+    uint8_t jit_tier : 2;       /* 0=interp, 1=TCC compiled, 2=GCC compiled */
+#endif
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -655,10 +663,25 @@ typedef struct JSFunctionBytecode {
     JSValue *cpool; /* constant pool (self pointer) */
     int cpool_count;
     int closure_var_count;
+#ifdef CONFIG_JIT
+    /* JIT hotness counter and compiled function pointer.
+     * Placed before `debug` so that the !has_debug allocation
+     * (offsetof(JSFunctionBytecode, debug)) still covers these fields.
+     * jit_func is written once (atomically) after compilation and read on
+     * every call thereafter — no lock required on x86-64 (TSO) but we use
+     * __atomic builtins for portability.
+     * jit_handle owns the compiled code memory:
+     *   tier 1 (TCC): TCCState* — tcc_delete() frees the mmap'd code
+     *   tier 2 (GCC): dlopen handle — dlclose() when bytecode is freed   */
+    int               jit_call_count; /* incremented on every JS_CallInternal */
+    JSJITFunc         jit_func;       /* NULL → interpreter, else JIT entry  */
+    void             *jit_handle;     /* TCCState* or dlopen handle          */
+    void             *jit_old_handle; /* tier-1 TCCState kept until b freed  */
+#endif
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
-        int source_len; 
+        int source_len;
         int pc2line_len;
         uint8_t *pc2line_buf;
         char *source;
@@ -15576,6 +15599,161 @@ static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+#ifdef CONFIG_JIT
+/* -----------------------------------------------------------------------
+ * Accessor functions for JSFunctionBytecode fields.
+ *
+ * JSFunctionBytecode is defined entirely inside quickjs.c.  quickjs-jit.c
+ * is a separate translation unit and cannot see the struct layout.  These
+ * thin accessors provide the field values needed by the JIT without
+ * exposing the full internal struct.
+ *
+ * Phase 3 (code generator) will need direct struct access for bulk field
+ * reads; at that point the struct definition will be moved to a shared
+ * internal header.  For Phase 1 these accessors are sufficient.
+ * ----------------------------------------------------------------------- */
+
+/* js_jit_fb_free() is defined in quickjs-jit.c where libtcc.h is available.
+ * Its declaration is in quickjs-jit.h and it is called from
+ * free_function_bytecode() via the accessor below.                       */
+
+/* Accessor pair: read tier/handle/old_handle, clear them after use */
+uint8_t  js_jit_fb_get_tier(JSFunctionBytecode *b) { return b->jit_tier; }
+void    *js_jit_fb_get_handle(JSFunctionBytecode *b) { return b->jit_handle; }
+void    *js_jit_fb_get_old_handle(JSFunctionBytecode *b) { return b->jit_old_handle; }
+void     js_jit_fb_clear_handles(JSFunctionBytecode *b) {
+    b->jit_handle = b->jit_old_handle = NULL;
+    b->jit_func   = NULL;
+}
+
+uint8_t  js_jit_fb_func_kind(JSFunctionBytecode *b) { return b->func_kind; }
+uint8_t  js_jit_fb_has_simple_params(JSFunctionBytecode *b) { return b->has_simple_parameter_list; }
+uint8_t  js_jit_fb_need_home_object(JSFunctionBytecode *b) { return b->need_home_object; }
+uint8_t  js_jit_fb_is_derived_ctor(JSFunctionBytecode *b) { return b->is_derived_class_constructor; }
+uint8_t  js_jit_fb_is_eval(JSFunctionBytecode *b) { return b->is_direct_or_indirect_eval; }
+uint8_t  js_jit_fb_jit_no_compile(JSFunctionBytecode *b) { return b->jit_no_compile; }
+void     js_jit_fb_set_no_compile(JSFunctionBytecode *b) { b->jit_no_compile = 1; }
+JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b) { return b->jit_func; }
+void     js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f, void *handle, int tier)
+{
+    b->jit_handle = handle;
+    b->jit_tier   = (uint8_t)tier;
+    __atomic_store_n(&b->jit_func, f, __ATOMIC_RELEASE);
+}
+int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
+
+/* -----------------------------------------------------------------------
+ * Non-static arithmetic/comparison wrappers for the JIT vtable.
+ *
+ * Internal helpers work on a JSValue stack pointer (sp[-2], sp[-1]).
+ * These wrappers adapt them to the (ctx, a, b) → JSValue calling
+ * convention the JSJITRuntime vtable needs.
+ *
+ * Ownership: a and b are CONSUMED by the callee (freed on both success
+ * and error paths — matching what the internal slow helpers already do).
+ * The return value is a new reference owned by the caller.
+ * ----------------------------------------------------------------------- */
+
+/* Binary arithmetic: dedicated fast-add helper */
+JSValue js_jit_op_add(JSContext *ctx, JSValue a, JSValue b)
+{
+    JSValue sp[2] = { a, b };
+    if (js_add_slow(ctx, &sp[2]) < 0)
+        return JS_EXCEPTION;
+    return sp[0]; /* result stored in sp[-2] = sp[0]; inputs already freed */
+}
+
+/* Binary arithmetic routed through opcode-generic slow path */
+#define DEF_JIT_ARITH(name, op)                                          \
+JSValue js_jit_op_##name(JSContext *ctx, JSValue a, JSValue b)           \
+{                                                                         \
+    JSValue sp[2] = { a, b };                                            \
+    if (js_binary_arith_slow(ctx, &sp[2], op) < 0)                      \
+        return JS_EXCEPTION;                                              \
+    return sp[0];                                                         \
+}
+DEF_JIT_ARITH(sub, OP_sub)
+DEF_JIT_ARITH(mul, OP_mul)
+DEF_JIT_ARITH(div, OP_div)
+DEF_JIT_ARITH(mod, OP_mod)
+#undef DEF_JIT_ARITH
+
+/* Bitwise — all route through js_binary_logic_slow */
+#define DEF_JIT_LOGIC(name, op)                                          \
+JSValue js_jit_op_##name(JSContext *ctx, JSValue a, JSValue b)           \
+{                                                                         \
+    JSValue sp[2] = { a, b };                                            \
+    if (js_binary_logic_slow(ctx, &sp[2], op) < 0)                      \
+        return JS_EXCEPTION;                                              \
+    return sp[0];                                                         \
+}
+DEF_JIT_LOGIC(shl,  OP_shl)
+DEF_JIT_LOGIC(sar,  OP_sar)
+DEF_JIT_LOGIC(shr,  OP_shr)
+DEF_JIT_LOGIC(band, OP_and)
+DEF_JIT_LOGIC(bor,  OP_or)
+DEF_JIT_LOGIC(bxor, OP_xor)
+#undef DEF_JIT_LOGIC
+
+/* Unary arithmetic */
+#define DEF_JIT_UNARY(name, op)                                          \
+JSValue js_jit_op_##name(JSContext *ctx, JSValue a)                      \
+{                                                                        \
+    JSValue sp[1] = { a };                                               \
+    if (js_unary_arith_slow(ctx, &sp[1], op) < 0)                       \
+        return JS_EXCEPTION;                                              \
+    return sp[0];                                                        \
+}
+DEF_JIT_UNARY(neg,  OP_neg)
+DEF_JIT_UNARY(plus, OP_plus)
+DEF_JIT_UNARY(bnot, OP_not)
+#undef DEF_JIT_UNARY
+
+/* Comparisons: relational (lt, lte, gt, gte) */
+#define DEF_JIT_RELATIONAL(name, op)                                     \
+JSValue js_jit_op_##name(JSContext *ctx, JSValue a, JSValue b)           \
+{                                                                         \
+    JSValue sp[2] = { a, b };                                            \
+    if (js_relational_slow(ctx, &sp[2], op) < 0)                        \
+        return JS_EXCEPTION;                                              \
+    return sp[0];                                                         \
+}
+DEF_JIT_RELATIONAL(lt,  OP_lt)
+DEF_JIT_RELATIONAL(lte, OP_lte)
+DEF_JIT_RELATIONAL(gt,  OP_gt)
+DEF_JIT_RELATIONAL(gte, OP_gte)
+#undef DEF_JIT_RELATIONAL
+
+/* Abstract equality == */
+JSValue js_jit_op_eq(JSContext *ctx, JSValue a, JSValue b)
+{
+    JSValue sp[2] = { a, b };
+    if (js_eq_slow(ctx, &sp[2], 0) < 0)
+        return JS_EXCEPTION;
+    return sp[0];
+}
+
+/* Strict equality === */
+JSValue js_jit_op_strict_eq(JSContext *ctx, JSValue a, JSValue b)
+{
+    BOOL res = js_strict_eq(ctx, a, b);
+    JS_FreeValue(ctx, a);
+    JS_FreeValue(ctx, b);
+    return JS_NewBool(ctx, res);
+}
+
+/* typeof — returns a JS string value.
+ * js_operator_typeof() returns a JSAtom (uint32_t) disguised as int.   */
+static int js_operator_typeof(JSContext *ctx, JSValueConst op1); /* fwd */
+JSValue js_jit_op_type_of(JSContext *ctx, JSValue a)
+{
+    JSAtom atom = (JSAtom)js_operator_typeof(ctx, a);
+    JS_FreeValue(ctx, a);
+    return JS_AtomToString(ctx, atom);
+}
+
+#endif /* CONFIG_JIT */
+
 static __exception int js_has_unscopable(JSContext *ctx, JSValueConst obj,
                                          JSAtom atom)
 {
@@ -17464,6 +17642,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
+
+#ifdef CONFIG_JIT
+    /* ----------------------------------------------------------------
+     * JIT hot-path probe.
+     *
+     * Check the compiled function pointer first (fast path — no atomic
+     * needed because we only care about seeing a non-NULL value; the
+     * RELEASE store in js_jit_fb_set_func guarantees visibility).
+     * If a JIT function is already installed, call it and return.
+     *
+     * Otherwise increment the call counter and trigger compilation
+     * when the appropriate threshold is crossed.  Compilation itself
+     * is idempotent (guarded by CAS); parallel calls just increment
+     * the counter redundantly which is harmless.
+     * ---------------------------------------------------------------- */
+    if (!b->jit_no_compile && js_jit_is_eligible(b)) {
+        JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+        if (unlikely(jf != NULL)) {
+            /* Already compiled — call the native function directly. */
+            rt->current_stack_frame = sf->prev_frame;
+            return jf(ctx, (JSValue)this_obj, argc, argv,
+                      b->cpool, var_refs);
+        }
+        int cnt = js_jit_fb_inc_count(b);
+        if (unlikely(cnt == JIT_THRESHOLD_TCC)) {
+            js_jit_compile_tcc(caller_ctx, b);
+        } else if (unlikely(cnt == JIT_THRESHOLD_GCC)) {
+            js_jit_queue_gcc(caller_ctx, b);
+        }
+    }
+#endif
 
  restart:
     for(;;) {
@@ -35692,6 +35901,9 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     }
 
     remove_gc_object(&b->header);
+#ifdef CONFIG_JIT
+    js_jit_free_bytecode(b);
+#endif
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
         list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);
     } else {

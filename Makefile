@@ -245,6 +245,19 @@ all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
 
 QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
 
+# JIT support (TCC tier-1 + optional GCC tier-2 background compilation)
+# Usage: make CONFIG_JIT=y [JIT_THRESHOLD_TCC=100] [JIT_THRESHOLD_GCC=5000]
+ifdef CONFIG_JIT
+  TCC_DIR ?= ../tcc-0.9.27
+  CFLAGS  += -DCONFIG_JIT
+  CFLAGS  += -DJIT_THRESHOLD_TCC=$(or $(JIT_THRESHOLD_TCC),100)
+  CFLAGS  += -DJIT_THRESHOLD_GCC=$(or $(JIT_THRESHOLD_GCC),5000)
+  CFLAGS  += -I$(TCC_DIR)
+  QJS_LIB_OBJS += $(OBJDIR)/quickjs-jit.o
+  # libtcc.a shares pstrcpy/pstrcat with cutils.o; allow duplicates at link time.
+  EXTRA_LIBS += -Wl,--allow-multiple-definition $(TCC_DIR)/libtcc.a -lpthread
+endif
+
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 
 HOST_LIBS=-lm -ldl -lpthread
