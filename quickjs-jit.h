@@ -61,11 +61,10 @@ typedef JSValue (*JSJITFunc)(JSContext    *ctx,
 /*
  * JSJITRuntime — vtable of QuickJS runtime helpers callable from JIT code.
  *
- * Generated C code (compiled by TCC or GCC) cannot call static-inline
- * functions directly (JS_DupValue, JS_FreeValue) nor internal QuickJS
- * symbols without linker visibility.  Every runtime operation goes through
- * this single struct, registered as one symbol ("__jit_rt") with each
- * TCCState / dlopen'd .so.
+ * Generated C code (compiled by GCC) cannot call static-inline functions
+ * directly (JS_DupValue, JS_FreeValue) nor internal QuickJS symbols without
+ * linker visibility.  Every runtime operation goes through this single struct,
+ * registered as one symbol ("js_jit_rt") visible to each dlopen'd .so.
  *
  * All functions follow QuickJS ownership conventions:
  *   - "consuming" arguments: the callee frees them
@@ -111,6 +110,14 @@ typedef struct JSJITRuntime {
     void    (*free)(JSContext *, JSValue v);   /* JS_FreeValue */
 
     /* ------------------------------------------------------------------ */
+    /* Variable reference access (JSVarRef is opaque to generated code)   */
+    /* ------------------------------------------------------------------ */
+    /* Returns pointer to the stored JSValue inside a JSVarRef object.
+     * Generated C uses this instead of accessing ->pvalue directly since
+     * JSVarRef is defined in quickjs.c (not public).                     */
+    JSValue *(*var_ref_value)(JSVarRef *ref);
+
+    /* ------------------------------------------------------------------ */
     /* Property access                                                     */
     /* ------------------------------------------------------------------ */
     JSValue (*get_prop)(JSContext *, JSValue obj, JSAtom atom);
@@ -154,7 +161,6 @@ extern const JSJITRuntime js_jit_rt;
 /* Read handle/tier for cleanup, then clear all JIT pointers */
 uint8_t   js_jit_fb_get_tier(JSFunctionBytecode *b);
 void     *js_jit_fb_get_handle(JSFunctionBytecode *b);
-void     *js_jit_fb_get_old_handle(JSFunctionBytecode *b);
 void      js_jit_fb_clear_handles(JSFunctionBytecode *b);
 
 uint8_t   js_jit_fb_func_kind(JSFunctionBytecode *b);
@@ -178,6 +184,16 @@ int            js_jit_fb_get_closure_var_count(JSFunctionBytecode *b);
 int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
 /* Opcode size table: opcode_size[opcode] = instruction length in bytes */
 const uint8_t *js_jit_get_opcode_size_table(int *count);
+#endif
+
+/* ======================================================================= */
+/* Variable reference accessor (defined in quickjs.c)                     */
+/* ======================================================================= */
+#ifdef CONFIG_JIT
+/* Returns the address of the JSValue stored inside a JSVarRef.
+ * Generated C cannot access JSVarRef->pvalue directly since JSVarRef is
+ * defined in quickjs.c (not a public header). */
+JSValue *js_jit_var_ref_value(JSVarRef *ref);
 #endif
 
 /* ======================================================================= */
@@ -219,34 +235,21 @@ JSValue js_jit_op_type_of(JSContext *, JSValue);
 int js_jit_is_eligible(JSFunctionBytecode *b);
 
 /*
- * js_jit_init() — must be called once before any JIT compilation, typically
- * inside JS_NewRuntime().  Fills js_jit_rt and starts the GCC background
- * thread pool (Phase 4).
+ * js_jit_init() — starts the GCC background worker thread.
+ * Called once from JS_NewRuntime() before any JS execution.
  */
 void js_jit_init(void);
 
 /*
- * js_jit_free() — called inside JS_FreeRuntime().  Shuts down the GCC
- * background thread and waits for all pending compilations to finish.
+ * js_jit_free() — drains the job queue and shuts down the worker thread.
+ * Called from JS_FreeRuntime() before GC begins freeing bytecodes.
  */
 void js_jit_free(void);
 
 /*
- * js_jit_compile_tcc() — Tier-1 compilation.  Translates b's bytecode to C,
- * compiles with libtcc, and atomically installs the resulting function pointer
- * in b->jit_func.  If compilation fails for any reason (unsupported opcodes,
- * TCC error) b->jit_no_compile is set so the function is never retried.
- *
- * Called from JS_CallInternal when b->jit_call_count reaches JIT_THRESHOLD_TCC.
- * May be called from any thread; uses a CAS to guard against races.
- */
-void js_jit_compile_tcc(JSContext *ctx, JSFunctionBytecode *b);
-
-/*
- * js_jit_queue_gcc() — Tier-2 upgrade.  Enqueues b for recompilation with
- * GCC -O2 on the background worker thread.  The TCC-compiled version
- * continues running while GCC compiles; on completion the pointer is swapped
- * atomically.
+ * js_jit_queue_gcc() — enqueue b for GCC -O2 background compilation.
+ * Generates C source synchronously, then hands the job to the worker thread.
+ * Returns immediately; jit_func is installed atomically when GCC finishes.
  *
  * Called from JS_CallInternal when b->jit_call_count reaches JIT_THRESHOLD_GCC.
  */
@@ -254,7 +257,7 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b);
 
 /*
  * js_jit_free_bytecode() — cleanup hook, called from free_function_bytecode().
- * Frees the TCCState (tier-1) or dlclose's the .so handle (tier-2).
+ * dlclose()s the compiled .so handle if present.
  */
 void js_jit_free_bytecode(JSFunctionBytecode *b);
 

@@ -670,13 +670,10 @@ typedef struct JSFunctionBytecode {
      * jit_func is written once (atomically) after compilation and read on
      * every call thereafter — no lock required on x86-64 (TSO) but we use
      * __atomic builtins for portability.
-     * jit_handle owns the compiled code memory:
-     *   tier 1 (TCC): TCCState* — tcc_delete() frees the mmap'd code
-     *   tier 2 (GCC): dlopen handle — dlclose() when bytecode is freed   */
+     * jit_handle: dlopen handle for the compiled .so; dlclose()'d on free. */
     int               jit_call_count; /* incremented on every JS_CallInternal */
     JSJITFunc         jit_func;       /* NULL → interpreter, else JIT entry  */
-    void             *jit_handle;     /* TCCState* or dlopen handle          */
-    void             *jit_old_handle; /* tier-1 TCCState kept until b freed  */
+    void             *jit_handle;     /* dlopen handle for compiled .so      */
 #endif
     struct {
         /* debug info, move to separate structure to save memory? */
@@ -1722,6 +1719,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     rt->current_exception = JS_UNINITIALIZED;
 
+#ifdef CONFIG_JIT
+    js_jit_init();
+#endif
     return rt;
  fail:
     JS_FreeRuntime(rt);
@@ -2000,6 +2000,10 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
 
 void JS_FreeRuntime(JSRuntime *rt)
 {
+#ifdef CONFIG_JIT
+    /* Drain the GCC worker queue before GC frees any bytecodes. */
+    js_jit_free();
+#endif
     struct list_head *el, *el1;
     int i;
 
@@ -15620,9 +15624,8 @@ static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
 /* Accessor pair: read tier/handle/old_handle, clear them after use */
 uint8_t  js_jit_fb_get_tier(JSFunctionBytecode *b) { return b->jit_tier; }
 void    *js_jit_fb_get_handle(JSFunctionBytecode *b) { return b->jit_handle; }
-void    *js_jit_fb_get_old_handle(JSFunctionBytecode *b) { return b->jit_old_handle; }
 void     js_jit_fb_clear_handles(JSFunctionBytecode *b) {
-    b->jit_handle = b->jit_old_handle = NULL;
+    b->jit_handle = NULL;
     b->jit_func   = NULL;
 }
 
@@ -15641,6 +15644,10 @@ void     js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f, void *handle, in
     __atomic_store_n(&b->jit_func, f, __ATOMIC_RELEASE);
 }
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
+
+/* Return pointer to the JSValue inside a JSVarRef.  Used by generated C code
+ * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
+JSValue *js_jit_var_ref_value(JSVarRef *ref) { return ref->pvalue; }
 
 /* Bytecode/metadata accessors for the code generator (Phase 2+) */
 const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len)
@@ -17690,19 +17697,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      * is idempotent (guarded by CAS); parallel calls just increment
      * the counter redundantly which is harmless.
      * ---------------------------------------------------------------- */
-    if (!b->jit_no_compile && js_jit_is_eligible(b)) {
+    if (js_jit_is_eligible(b)) {
         JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
         if (unlikely(jf != NULL)) {
-            /* Already compiled — call the native function directly. */
+            /* Already compiled — call the native function directly.
+             * Use arg_buf (not argv) so the JIT gets a properly-sized
+             * array even when JS_CALL_FLAG_COPY_ARGV was set.
+             * If we made copies (arg_allocated_size > 0), free them
+             * after the call — mirroring what the interpreter's done:
+             * path does via the local_buf..sp loop.              */
             rt->current_stack_frame = sf->prev_frame;
-            return jf(ctx, (JSValue)this_obj, argc, argv,
-                      b->cpool, var_refs);
+            JSValue jit_ret = jf(ctx, (JSValue)this_obj, sf->arg_count,
+                                 arg_buf, b->cpool, var_refs);
+            if (unlikely(arg_allocated_size)) {
+                for (i = 0; i < arg_allocated_size; i++)
+                    JS_FreeValue(ctx, arg_buf[i]);
+            }
+            return jit_ret;
         }
-        int cnt = js_jit_fb_inc_count(b);
-        if (unlikely(cnt == JIT_THRESHOLD_TCC)) {
-            js_jit_compile_tcc(caller_ctx, b);
-        } else if (unlikely(cnt == JIT_THRESHOLD_GCC)) {
-            js_jit_queue_gcc(caller_ctx, b);
+        /* jit_no_compile=1 means GCC compilation is queued or permanently
+         * disabled; don't enqueue again, but do check jit_func above in
+         * case GCC finished and installed the pointer since last call. */
+        if (!b->jit_no_compile) {
+            int cnt = js_jit_fb_inc_count(b);
+            if (unlikely(cnt == JIT_THRESHOLD_GCC)) {
+                js_jit_queue_gcc(caller_ctx, b);
+            }
         }
     }
 #endif

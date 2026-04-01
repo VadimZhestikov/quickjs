@@ -33,14 +33,27 @@
 #include <assert.h>
 #include <dlfcn.h>
 
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <dlfcn.h>
+
 #include "quickjs.h"
 #include "quickjs-jit.h"
 #include "quickjs-opcode.h"
-#include "libtcc.h"
 
-/* Build OP_* enum locally from quickjs-opcode.h.
- * SHORT_OPCODES must be defined so that the short-form opcodes (goto8,
- * if_false8, etc.) that appear in final bytecode are included.           */
+/* Build OP_* enum locally from quickjs-opcode.h, matching quickjs.c exactly.
+ *
+ * DEF() entries are real opcodes; def() entries are temporary phase-1 opcodes
+ * that never appear in final bytecode.  We must keep def() BLANK here so the
+ * enum values for SHORT_OPCODES entries (push_0, push_1, if_false8, …) match
+ * the byte values that appear in the bytecode the JIT receives.
+ *
+ * The TEMP opcodes (enter_scope, leave_scope, label, scope_*, line_num) are
+ * only present in intermediate bytecode and are removed before the final
+ * JSFunctionBytecode is created — the JIT never sees them.
+ */
 #ifndef SHORT_OPCODES
 #define SHORT_OPCODES 1
 #define JIT_DEFINED_SHORT_OPCODES
@@ -48,7 +61,7 @@
 typedef enum {
 #define FMT(f)
 #define DEF(id, size, n_pop, n_push, f) OP_##id,
-#define def(id, size, n_pop, n_push, f) OP_##id,
+#define def(id, size, n_pop, n_push, f) /* temp — not in final bytecode */
 #include "quickjs-opcode.h"
 #undef def
 #undef DEF
@@ -180,6 +193,8 @@ const JSJITRuntime js_jit_rt = {
     /* ref counting */
     .dup              = jit_rt_dup,
     .free             = jit_rt_free,
+    /* var ref accessor */
+    .var_ref_value    = js_jit_var_ref_value,
     /* property access */
     .get_prop         = jit_rt_get_prop,
     .set_prop         = jit_rt_set_prop,
@@ -397,6 +412,9 @@ static inline int16_t bc_get_i16(const uint8_t *pc) {
 static int scan_is_unsupported(int op)
 {
     switch (op) {
+    /* closure creation: needs stack-frame access not available in JIT */
+    case OP_fclosure:
+    case OP_fclosure8:
     /* try/finally frame management */
     case OP_catch:
     case OP_gosub:
@@ -462,15 +480,20 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
         }
 
         int sz = op_sz[op];
-        /* Extract branch target offsets. The offset field is relative to the
-         * byte immediately after the full instruction (pc + sz). */
+        /* Extract branch target offsets.
+         * QuickJS stores the offset relative to the FIRST OPERAND BYTE
+         * (pc + 1), not the end of the instruction.  The interpreter
+         * dispatches with opcode = *pc++ so pc is already at pc+1 when
+         * the case body executes, and then does: pc += delta.
+         * Therefore: target = (pc + 1) + delta.
+         */
         switch (op) {
         case OP_if_false:
         case OP_if_true:
         case OP_goto:
         case OP_gosub: {
             int32_t delta = bc_get_i32(&bc[pc + 1]);
-            int target = pc + sz + delta;
+            int target = pc + 1 + delta;
             if (scan_add_target(sr, target, &cap) < 0) {
                 scan_result_free(sr); return -1;
             }
@@ -479,14 +502,14 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
         case OP_if_false8:
         case OP_if_true8:
         case OP_goto8: {
-            int target = pc + sz + (int)bc_get_i8(&bc[pc + 1]);
+            int target = pc + 1 + (int)bc_get_i8(&bc[pc + 1]);
             if (scan_add_target(sr, target, &cap) < 0) {
                 scan_result_free(sr); return -1;
             }
             break;
         }
         case OP_goto16: {
-            int target = pc + sz + (int)bc_get_i16(&bc[pc + 1]);
+            int target = pc + 1 + (int)bc_get_i16(&bc[pc + 1]);
             if (scan_add_target(sr, target, &cap) < 0) {
                 scan_result_free(sr); return -1;
             }
@@ -514,22 +537,204 @@ static int scan_is_target(const JSJITScanResult *sr, int off)
 }
 
 /* -----------------------------------------------------------------------
- * Lifecycle
+ * Phase 4 — GCC background worker
+ *
+ * Architecture:
+ *   Main thread:   js_jit_queue_gcc() generates C source synchronously,
+ *                  enqueues a JITGCCJob, and returns immediately.
+ *   Worker thread: dequeues jobs, writes .c to /tmp, fork+execs gcc -O2,
+ *                  dlopen()s the .so, atomically installs jit_func.
+ *
+ * Thread safety:
+ *   jit_worker.lock protects the queue and stop flag.
+ *   jit_func is stored with __ATOMIC_RELEASE / loaded with __ATOMIC_ACQUIRE.
+ *   jit_no_compile is set before enqueueing — prevents duplicate jobs.
+ *   js_jit_free() joins the worker, guaranteeing it is fully done before
+ *   GC starts freeing JSFunctionBytecode objects.
  * ----------------------------------------------------------------------- */
+
+/* Forward declaration: js_jit_gen_c is defined in the Phase 2 section below */
+static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
+                         char *fname_out, size_t fname_sz, int *unsupported);
+
+typedef struct JITGCCJob {
+    JSFunctionBytecode *b;
+    char               *c_src;     /* malloc'd C source; freed after gcc    */
+    char                fname[64]; /* symbol name to look up via dlsym      */
+    struct JITGCCJob   *next;
+} JITGCCJob;
+
+static struct {
+    pthread_t       thread;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    JITGCCJob      *head;
+    JITGCCJob      *tail;
+    int             stop;
+    int             started;
+    int             ref_count; /* how many JSRuntime instances share this thread */
+} jit_worker;
+
+/* Write src to a temp file with the given suffix; return malloc'd path. */
+static char *jit_write_tmp(const char *src, const char *suffix)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/qjs_jit_XXXXXX%s", suffix);
+    int fd = mkstemps(path, (int)strlen(suffix));
+    if (fd < 0) return NULL;
+    size_t len = strlen(src);
+    ssize_t written = write(fd, src, len);
+    close(fd);
+    if (written != (ssize_t)len) { unlink(path); return NULL; }
+    return strdup(path);
+}
+
+/* Execute one GCC job: compile C to .so, dlopen, install jit_func. */
+static void jit_compile_gcc_job(JITGCCJob *job)
+{
+    char *c_path = jit_write_tmp(job->c_src, ".c");
+    free(job->c_src);
+    job->c_src = NULL;
+    if (!c_path) goto fail;
+
+    /* Build .so path next to the .c file */
+    char so_path[256];
+    snprintf(so_path, sizeof(so_path), "%s", c_path);
+    char *dot = strrchr(so_path, '.');
+    if (dot) strcpy(dot, ".so");
+
+    /* Fork + exec gcc */
+    pid_t pid = fork();
+    if (pid < 0) { unlink(c_path); free(c_path); goto fail; }
+    if (pid == 0) {
+        /* Redirect gcc stdout/stderr to /tmp/qjs_jit_gcc.log for debugging */
+        int logfd = open("/tmp/qjs_jit_gcc.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (logfd >= 0) { dup2(logfd, 1); dup2(logfd, 2); close(logfd); }
+        execl("/usr/bin/gcc", "gcc", "-O2", "-shared", "-fPIC",
+              "-DCONFIG_JIT",
+#ifdef JIT_INCLUDE_DIR
+              "-I", JIT_INCLUDE_DIR,
+#endif
+              "-o", so_path, c_path, (char *)NULL);
+        execlp("gcc", "gcc", "-O2", "-shared", "-fPIC",
+               "-DCONFIG_JIT",
+#ifdef JIT_INCLUDE_DIR
+               "-I", JIT_INCLUDE_DIR,
+#endif
+               "-o", so_path, c_path, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int gcc_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (gcc_ok) unlink(c_path); /* keep .c on failure for debugging */
+    free(c_path);
+    if (!gcc_ok) { unlink(so_path); goto fail; }
+
+    /* Load the compiled .so; unlink immediately (kernel keeps it mapped) */
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    unlink(so_path);
+    if (!handle) goto fail;
+
+    JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, job->fname);
+    if (!f) { dlclose(handle); goto fail; }
+
+    js_jit_fb_set_func(job->b, f, handle, 2);
+    return;
+fail:
+    js_jit_fb_set_no_compile(job->b);
+}
+
+static void *jit_worker_thread(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&jit_worker.lock);
+    for (;;) {
+        while (!jit_worker.stop && !jit_worker.head)
+            pthread_cond_wait(&jit_worker.cond, &jit_worker.lock);
+        if (jit_worker.stop && !jit_worker.head) break;
+        JITGCCJob *job = jit_worker.head;
+        jit_worker.head = job->next;
+        if (!jit_worker.head) jit_worker.tail = NULL;
+        pthread_mutex_unlock(&jit_worker.lock);
+        jit_compile_gcc_job(job);
+        free(job);
+
+        pthread_mutex_lock(&jit_worker.lock);
+    }
+    pthread_mutex_unlock(&jit_worker.lock);
+    return NULL;
+}
 
 void js_jit_init(void)
 {
-    /* Phase 4: initialise GCC background thread here */
+    if (jit_worker.started) {
+        jit_worker.ref_count++;
+        return;
+    }
+    pthread_mutex_init(&jit_worker.lock, NULL);
+    pthread_cond_init(&jit_worker.cond, NULL);
+    jit_worker.head = jit_worker.tail = NULL;
+    jit_worker.stop = 0;
+    jit_worker.ref_count = 1;
+    if (pthread_create(&jit_worker.thread, NULL, jit_worker_thread, NULL) == 0)
+        jit_worker.started = 1;
 }
 
 void js_jit_free(void)
 {
-    /* Phase 4: join GCC background thread here */
+    if (!jit_worker.started) return;
+    if (--jit_worker.ref_count > 0) return;
+    pthread_mutex_lock(&jit_worker.lock);
+    jit_worker.stop = 1;
+    pthread_cond_signal(&jit_worker.cond);
+    pthread_mutex_unlock(&jit_worker.lock);
+    pthread_join(jit_worker.thread, NULL);
+    jit_worker.started = 0;
+    /* Discard any jobs that were never processed (shouldn't occur) */
+    JITGCCJob *job = jit_worker.head;
+    while (job) {
+        JITGCCJob *next = job->next;
+        free(job->c_src);
+        free(job);
+        job = next;
+    }
+    jit_worker.head = jit_worker.tail = NULL;
+    pthread_mutex_destroy(&jit_worker.lock);
+    pthread_cond_destroy(&jit_worker.cond);
 }
 
-/* -----------------------------------------------------------------------
- * Stub implementations (filled in Phases 3 and 4)
- * ----------------------------------------------------------------------- */
+void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
+{
+    (void)ctx;
+    if (js_jit_fb_jit_no_compile(b)) return;
+    if (js_jit_fb_get_func(b) != NULL) return;
+    /* Claim the slot: no other thread or call will enqueue this function */
+    js_jit_fb_set_no_compile(b);
+    if (!jit_worker.started) return;
+
+    JSJITCodeBuf cb;
+    char fname[64];
+    int unsupported = 0;
+    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported) < 0) {
+        return;
+    }
+
+    JITGCCJob *job = malloc(sizeof(*job));
+    if (!job) { jit_buf_free(&cb); return; }
+    job->b     = b;
+    job->c_src = cb.buf;   /* transfer buffer ownership to job */
+    cb.buf     = NULL;     /* prevent double-free if jit_buf_free is called */
+    memcpy(job->fname, fname, sizeof(job->fname));
+    job->next  = NULL;
+
+    pthread_mutex_lock(&jit_worker.lock);
+    if (jit_worker.tail) jit_worker.tail->next = job;
+    else                 jit_worker.head = job;
+    jit_worker.tail = job;
+    pthread_cond_signal(&jit_worker.cond);
+    pthread_mutex_unlock(&jit_worker.lock);
+}
 
 /* =======================================================================
  * Phase 2.3–2.11 — C code generator
@@ -579,10 +784,17 @@ static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
         "#include \"quickjs.h\"\n"
         "#include \"quickjs-jit.h\"\n"
         "#define _RT  (&js_jit_rt)\n"
-        "#define _DUP(v)  (_RT->dup(ctx,(v)))\n"
-        "#define _FREE(v) (_RT->free(ctx,(v)))\n"
+        /* JS_DupValue / JS_FreeValue are static inline in quickjs.h;
+         * GCC will inline them entirely, eliminating vtable dispatch. */
+        "#define _DUP(v)  JS_DupValue(ctx,(v))\n"
+        "#define _FREE(v) JS_FreeValue(ctx,(v))\n"
         "#define _CHK(v)  do{if(JS_VALUE_GET_TAG(v)==JS_TAG_EXCEPTION)"
                           "goto _ex;}while(0)\n"
+        /* Fast bool extraction: avoids external JS_ToBool call for the common
+         * case where the top-of-stack is already JS_TAG_BOOL (result of lt/gt/eq).
+         * For other tags JS_ToBool handles the general case.            */
+        "#define _BOOL(v) (JS_VALUE_GET_TAG(v)==JS_TAG_BOOL"
+                          "?JS_VALUE_GET_INT(v):JS_ToBool(ctx,(v)))\n"
     );
 
     /* Function signature */
@@ -601,9 +813,11 @@ static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
         jit_buf_str(cb, "    JSValue _s[1];\n"); /* avoid zero-length array */
     if (var_count > 0)
         jit_buf_printf(cb, "    JSValue _l[%d];\n", var_count);
-    jit_buf_str(cb,
-        "    int _sp=0, _i;\n"
-        "    (void)argc; (void)cpool; (void)var_refs;\n");
+    if (var_count > 0)
+        jit_buf_str(cb, "    int _sp=0, _i;\n");
+    else
+        jit_buf_str(cb, "    int _sp=0;\n");
+    jit_buf_str(cb, "    (void)argc; (void)cpool; (void)var_refs;\n");
     if (var_count > 0)
         jit_buf_printf(cb,
             "    for(_i=0;_i<%d;_i++) _l[_i]=JS_UNDEFINED;\n", var_count);
@@ -644,6 +858,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         int op = bc[pc];
         if (op >= op_sz_count || op_sz[op] == 0) {
+            fprintf(stderr, "[JIT] unsupported opcode 0x%02x at pc=%d\n", op, pc);
             *unsupported_out = 1; return -1;
         }
         int sz = op_sz[op];
@@ -715,6 +930,16 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "    _s[_sp++]=_DUP(cpool[%u]);\n",
                 (unsigned)bc[pc+1]);
             break;
+        case OP_push_atom_value: {
+            /* Push the string representation of an interned atom */
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _v=JS_AtomToValue(ctx,(JSAtom)%uu);"
+                " _CHK(_v); _s[_sp++]=_v; }\n", atom);
+            break;
+        }
+        /* OP_fclosure / OP_fclosure8: create closure — needs stack-frame access,
+         * not available in JIT.  Functions using these are kept in interpreter. */
 
         /* ---- Stack manipulation ---- */
         case OP_drop:
@@ -772,6 +997,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_put_loc:  case OP_put_loc_check:
         case OP_put_loc_check_init: GEN_PUT_LOC((int)bc_u16(&bc[pc+1])); break;
         case OP_set_loc:  GEN_SET_LOC((int)bc_u16(&bc[pc+1])); break;
+        /* TDZ init: mark local as uninitialized — skip in JIT (no TDZ checking) */
+        case OP_set_loc_uninitialized: break;
         case OP_get_loc8: GEN_GET_LOC((int)bc[pc+1]); break;
         case OP_put_loc8: GEN_PUT_LOC((int)bc[pc+1]); break;
         case OP_set_loc8: GEN_SET_LOC((int)bc[pc+1]); break;
@@ -821,12 +1048,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_SET_ARG
 
         /* ---- Closure variable access ---- */
+/* _VRV(idx) returns a pointer to the JSValue stored inside var_refs[idx].
+ * We use the vtable accessor rather than ->pvalue directly because JSVarRef
+ * is defined only in quickjs.c (incomplete type in generated C). */
 #define GEN_GET_VR(idx) \
-    jit_buf_printf(cb, "    _s[_sp++]=_DUP(*var_refs[%d]->pvalue);\n", idx)
+    jit_buf_printf(cb, "    _s[_sp++]=_DUP(*_RT->var_ref_value(var_refs[%d]));\n", idx)
 #define GEN_PUT_VR(idx) \
-    jit_buf_printf(cb, "    _FREE(*var_refs[%d]->pvalue); *var_refs[%d]->pvalue=_s[--_sp];\n", idx, idx)
+    jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
+                       " _FREE(*_p); *_p=_s[--_sp]; }\n", idx)
 #define GEN_SET_VR(idx) \
-    jit_buf_printf(cb, "    _FREE(*var_refs[%d]->pvalue); *var_refs[%d]->pvalue=_DUP(_s[_sp-1]);\n", idx, idx)
+    jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
+                       " _FREE(*_p); *_p=_DUP(_s[_sp-1]); }\n", idx)
 
         case OP_get_var_ref:
         case OP_get_var_ref_check: GEN_GET_VR((int)bc_u16(&bc[pc+1])); break;
@@ -850,6 +1082,28 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_GET_VR
 #undef GEN_PUT_VR
 #undef GEN_SET_VR
+
+        /* ---- Global/closure variable access (u16 index into var_refs) ----
+         *
+         * OP_get_var / OP_put_var: same as get/put_var_ref but with a 16-bit
+         * index.  TDZ and const checks are skipped — the JIT only runs on hot
+         * functions that have already executed successfully many times, so any
+         * TDZ violation would have been caught by the interpreter.
+         * ------------------------------------------------------------------ */
+        case OP_get_var: {
+            int idx = (int)bc_u16(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    _s[_sp++]=_DUP(*_RT->var_ref_value(var_refs[%d]));\n", idx);
+            break;
+        }
+        case OP_put_var:
+        case OP_put_var_init: {
+            int idx = (int)bc_u16(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);"
+                " _FREE(*_p); *_p=_s[--_sp]; }\n", idx);
+            break;
+        }
 
         /* ---- Arithmetic (binary) with inline integer fast paths ----
          *
@@ -1004,6 +1258,94 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      else { _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_a)); _FREE(_a); } }\n");
             break;
 
+        /* ---- Increment / decrement ---- */
+        /* OP_inc / OP_dec: pre-increment — pop, push ±1 (int fast path) */
+        case OP_inc:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _s[_sp++]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                "                                 :JS_NewInt32(ctx,ia+1);\n"
+                "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        case OP_dec:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                "                                 :JS_NewInt32(ctx,ia-1);\n"
+                "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        /* OP_post_inc / OP_post_dec: post-increment — pop original, push original, push ±1 result */
+        case OP_post_inc:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _s[_sp++]=_a; /* original */\n"
+                "        _s[_sp++]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                "                                 :JS_NewInt32(ctx,ia+1);\n"
+                "      } else { JSValue _r=_RT->add(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _s[_sp++]=_a; _s[_sp++]=_r; } }\n");
+            break;
+        case OP_post_dec:
+            jit_buf_str(cb,
+                "    { JSValue _a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _s[_sp++]=_a; /* original */\n"
+                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                "                                 :JS_NewInt32(ctx,ia-1);\n"
+                "      } else { JSValue _r=_RT->sub(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _s[_sp++]=_a; _s[_sp++]=_r; } }\n");
+            break;
+        /* OP_inc_loc / OP_dec_loc: in-place ±1 on local variable (1-byte index) */
+        case OP_inc_loc: {
+            int idx = bc[pc + 1];
+            jit_buf_printf(cb,
+                "    { JSValue _a=_l[%d];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _l[%d]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                "                              :JS_NewInt32(ctx,ia+1);\n"
+                "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
+                idx, idx, idx, idx);
+            break;
+        }
+        case OP_dec_loc: {
+            int idx = bc[pc + 1];
+            jit_buf_printf(cb,
+                "    { JSValue _a=_l[%d];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                "        _l[%d]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                "                              :JS_NewInt32(ctx,ia-1);\n"
+                "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
+                idx, idx, idx, idx);
+            break;
+        }
+        /* OP_add_loc: pop stack top and add it in-place to _l[idx] (1-byte index) */
+        case OP_add_loc: {
+            int idx = bc[pc + 1];
+            jit_buf_printf(cb,
+                "    { JSValue _b=_s[--_sp], *_pv=&_l[%d];\n"
+                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
+                "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                "                              :JS_NewFloat64(ctx,(double)_r);\n"
+                "      } else {\n"
+                "        JSValue _r=_RT->add(ctx,*_pv,_b); _CHK(_r); _FREE(*_pv); *_pv=_r;\n"
+                "      } }\n",
+                idx);
+            break;
+        }
+
         /* ---- Comparisons with inline int fast paths ---- */
 #define GEN_CMP_INT(int_op, rt_name) \
     jit_buf_printf(cb, \
@@ -1085,47 +1427,47 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Control flow ---- */
         case OP_if_false: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
-            int tgt = pc + sz + delta;
+            int tgt = pc + 1 + delta;
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=JS_ToBool(ctx,_v);"
+                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
                 " _FREE(_v); if(!_b) goto _L%d; }\n", tgt);
             break;
         }
         case OP_if_true: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
-            int tgt = pc + sz + delta;
+            int tgt = pc + 1 + delta;
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=JS_ToBool(ctx,_v);"
+                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
                 " _FREE(_v); if(_b) goto _L%d; }\n", tgt);
             break;
         }
         case OP_goto: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
-            int tgt = pc + sz + delta;
+            int tgt = pc + 1 + delta;
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
         case OP_if_false8: {
-            int tgt = pc + sz + (int)(int8_t)bc[pc+1];
+            int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=JS_ToBool(ctx,_v);"
+                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
                 " _FREE(_v); if(!_b) goto _L%d; }\n", tgt);
             break;
         }
         case OP_if_true8: {
-            int tgt = pc + sz + (int)(int8_t)bc[pc+1];
+            int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=JS_ToBool(ctx,_v);"
+                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
                 " _FREE(_v); if(_b) goto _L%d; }\n", tgt);
             break;
         }
         case OP_goto8: {
-            int tgt = pc + sz + (int)(int8_t)bc[pc+1];
+            int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
         case OP_goto16: {
-            int tgt = pc + sz + (int)(int16_t)bc_u16(&bc[pc+1]);
+            int tgt = pc + 1 + (int)(int16_t)bc_u16(&bc[pc+1]);
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
@@ -1223,11 +1565,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
                 "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
                 "      _sp -= _n+1; _FREE(_f);\n"
-                "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n"
-                "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n"
+                "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                nargs);
+            if (var_count > 0)
+                jit_buf_printf(cb,
+                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            jit_buf_str(cb,
                 "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return _r; }\n",
-                nargs, var_count);
+                "      return _r; }\n");
             break;
         }
         case OP_call_constructor: {
@@ -1248,20 +1593,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* ---- Return ---- */
         case OP_return: {
-            jit_buf_printf(cb,
-                "    { JSValue _r=_s[--_sp];\n"
-                "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n"
+            jit_buf_str(cb, "    { JSValue _r=_s[--_sp];\n");
+            if (var_count > 0)
+                jit_buf_printf(cb,
+                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            jit_buf_str(cb,
                 "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return _r; }\n",
-                var_count);
+                "      return _r; }\n");
             break;
         }
         case OP_return_undef: {
-            jit_buf_printf(cb,
-                "    { for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n"
-                "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return JS_UNDEFINED; }\n",
-                var_count);
+            jit_buf_str(cb, "    {");
+            if (var_count > 0)
+                jit_buf_printf(cb,
+                    " for(_i=0;_i<%d;_i++) _FREE(_l[_i]);", var_count);
+            jit_buf_str(cb,
+                " while(_sp>0) _FREE(_s[--_sp]); return JS_UNDEFINED; }\n");
             break;
         }
 
@@ -1280,6 +1627,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "    { JSValue _r=JS_NewObject(ctx); _CHK(_r);"
                 " _s[_sp++]=_r; }\n");
             break;
+        /* OP_define_field: obj val -> obj   (obj stays on stack, val consumed)
+         * Used in object literals: { key: val } sequences.
+         * JS_PROP_C_W_E = configurable | writable | enumerable */
+        case OP_define_field: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _v=_s[--_sp];\n"
+                "      int _r=JS_DefinePropertyValue(ctx,_s[_sp-1],(JSAtom)%uu,_v,"
+                "JS_PROP_C_W_E|JS_PROP_THROW);\n"
+                "      if(_r<0) goto _ex; }\n",
+                atom);
+            break;
+        }
         case OP_array_from: {
             int nargs = (int)bc_u16(&bc[pc+1]);
             jit_buf_printf(cb,
@@ -1295,6 +1655,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
+            fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
             *unsupported_out = 1;
             return -1;
         }
@@ -1331,6 +1692,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     int op_sz_count;
     const uint8_t *op_sz = js_jit_get_opcode_size_table(&op_sz_count);
 
+
     if (jit_buf_init(cb) < 0) {
         scan_result_free(&sr);
         return -1;
@@ -1359,148 +1721,19 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     return 0;
 }
 
-/* =======================================================================
- * Phase 3.1 — js_jit_new_tcc(): create and configure a TCCState
- *
- * Sets up include paths so the generated C can find quickjs.h and
- * quickjs-jit.h, registers the __jit_rt symbol so the generated code
- * can call vtable methods, and sets up error reporting.
- * ======================================================================= */
-
-/* TCC error callback — collects errors into a static buffer for logging */
-static void jit_tcc_error(void *opaque, const char *msg)
-{
-    (void)opaque;
-    /* For now: ignore TCC warnings/errors; compilation result is checked
-     * by tcc_relocate() return value.  Phase 3.4 will add proper logging. */
-    (void)msg;
-}
-
-static TCCState *js_jit_new_tcc(void)
-{
-    TCCState *s = tcc_new();
-    if (!s) return NULL;
-
-    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    tcc_set_error_func(s, NULL, jit_tcc_error);
-
-    /* Add include path so generated C can find quickjs.h / quickjs-jit.h.
-     * Use the directory where the quickjs binary lives (runtime path is
-     * unknown; fall back to a compile-time path via a macro).             */
-#ifdef JIT_INCLUDE_DIR
-    tcc_add_include_path(s, JIT_INCLUDE_DIR);
-#endif
-    /* Always search the current directory and the standard locations */
-    tcc_add_include_path(s, ".");
-
-    /* Register the vtable so generated code can call rt->add() etc. */
-    tcc_add_symbol(s, "js_jit_rt", &js_jit_rt);
-
-    return s;
-}
-
-/* =======================================================================
- * Phase 3.2–3.3 — js_jit_compile_tcc(): full TCC compilation with CAS guard
- *
- * Steps:
- *   1. CAS on jit_no_compile to claim the compilation slot (race guard).
- *   2. Generate C source via js_jit_gen_c().
- *   3. Compile and relocate via libtcc.
- *   4. Retrieve the function pointer via tcc_get_symbol().
- *   5. Atomically install the pointer with js_jit_fb_set_func().
- *
- * On any failure, mark the function as non-compilable and free the TCC state.
- * ======================================================================= */
-
-void js_jit_compile_tcc(JSContext *ctx, JSFunctionBytecode *b)
-{
-    (void)ctx;
-
-    /* Phase 3.3 — CAS race guard.
-     * If another thread beat us here, jit_no_compile will already be 1 or
-     * jit_func will be non-NULL.  In either case we have nothing to do.    */
-    if (js_jit_fb_jit_no_compile(b)) return;
-    if (js_jit_fb_get_func(b) != NULL) return;
-
-    /* Generate C source */
-    JSJITCodeBuf cb;
-    char fname[64];
-    int unsupported = 0;
-    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported) < 0) {
-        js_jit_fb_set_no_compile(b);
-        return;
-    }
-
-    /* Create TCC state and compile */
-    TCCState *s = js_jit_new_tcc();
-    if (!s) {
-        jit_buf_free(&cb);
-        js_jit_fb_set_no_compile(b);
-        return;
-    }
-
-    int rc = tcc_compile_string(s, cb.buf);
-    jit_buf_free(&cb);
-    if (rc < 0) {
-        tcc_delete(s);
-        js_jit_fb_set_no_compile(b);
-        return;
-    }
-
-    /* Relocate: allocates executable memory and patches addresses */
-    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
-        tcc_delete(s);
-        js_jit_fb_set_no_compile(b);
-        return;
-    }
-
-    /* Retrieve the generated function pointer */
-    JSJITFunc f = (JSJITFunc)tcc_get_symbol(s, fname);
-    if (!f) {
-        tcc_delete(s);
-        js_jit_fb_set_no_compile(b);
-        return;
-    }
-
-    /* Atomically install: js_jit_fb_set_func uses __atomic_store_n RELEASE */
-    js_jit_fb_set_func(b, f, s, 1);
-}
-
-void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
-{
-    /* Phase 4: enqueue for GCC background compilation */
-    (void)ctx;
-    (void)b;
-}
-
 /* -----------------------------------------------------------------------
- * Task #6 — cleanup hook called from free_function_bytecode()
- *
- * All struct member access goes through the accessor API because
- * JSFunctionBytecode is an incomplete type from quickjs-jit.c's
- * perspective (defined only inside quickjs.c).
+ * Cleanup hook called from free_function_bytecode()
  * ----------------------------------------------------------------------- */
 
 void js_jit_free_bytecode(JSFunctionBytecode *b)
 {
-    uint8_t tier       = js_jit_fb_get_tier(b);
-    void   *handle     = js_jit_fb_get_handle(b);
-    void   *old_handle = js_jit_fb_get_old_handle(b);
+    uint8_t tier   = js_jit_fb_get_tier(b);
+    void   *handle = js_jit_fb_get_handle(b);
 
-    /* Clear all JIT pointers first so no thread can race and call freed code */
     js_jit_fb_clear_handles(b);
 
-    if (tier == 1) {
-        /* Tier-1: handle is a TCCState* — free it (also frees compiled code) */
-        if (handle)
-            tcc_delete((TCCState *)handle);
-    } else if (tier == 2) {
-        /* Tier-2: handle is a dlopen handle (.so); old_handle may be a TCCState* */
-        if (handle)
-            dlclose(handle);
-        if (old_handle)
-            tcc_delete((TCCState *)old_handle);
-    }
+    if (tier == 2 && handle)
+        dlclose(handle);
 }
 
 #endif /* CONFIG_JIT */

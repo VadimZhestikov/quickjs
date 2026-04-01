@@ -1,4 +1,4 @@
-# JIT Performance Results — TCC Tier-1 vs Interpreter
+# JIT Performance Results — TCC Tier-1 and GCC Tier-2 vs Interpreter
 
 **Date:** 2026-03-31  
 **Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)  
@@ -103,13 +103,127 @@ call simply pushes a `JSStackFrame` onto the C stack and jumps to
 
 | Phase | Mechanism | Expected speedup |
 |---|---|---|
-| **Phase 4 — GCC tier-2** | Compile generated C with `gcc -O2` in a background thread; hot functions promoted after `JIT_THRESHOLD_GCC` (default 5000) calls | **2–4×** on arithmetic-heavy loops; GCC register-allocates the `JSValue` stack, hoists tag checks, and may vectorise integer loops |
 | **Phase 5 — Typed variables** | Annotate locals whose type is stable (`int`, `double`, `bool`) using profiling feedback; emit `int64_t`/`double` C locals instead of `JSValue` | **3–8×** on sum_loop/sum_sq/count_primes class; eliminates boxing entirely for the common integer case |
 | **Phase 6 — IC + shape guards** | Inline shape checks for property access; emit direct offset load instead of `JS_GetProperty` vtable call | **5–15×** on prop_read/prop_write class |
 | **Combined (tier-2 + types + IC)** | All of the above applied together | **10–30×** on hot numeric/property loops; fib and str_concat gain less (~2–4×) due to inherent pointer-chasing |
 
 These projections are based on published results for similar JSValue-unboxing
 JITs (LuaJIT, SpiderMonkey baseline vs Ion, JavaScriptCore DFG).
+
+---
+
+# GCC Tier-2 Results
+
+**Date:** 2026-03-31  
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)  
+**Build flags:**
+- Interpreter: `make CONFIG_JIT=y JIT_THRESHOLD_GCC=99999 qjs` (JIT never fires; interpreter only)
+- GCC tier-2:  `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs` (GCC -O2 shared lib, warmed 8 s)
+
+`bench_runner.js` used for interpreter baseline; `bench_gcc.js` for GCC tier-2 (waits 8 s for
+GCC background compilation to complete before measuring).  Iteration counts are identical between
+the two scripts.  Three runs each; table shows minimum elapsed time.
+
+---
+
+## Raw Measurements
+
+| Benchmark | Interp run1 | Interp run2 | Interp run3 | **Interp min** | GCC run1 | GCC run2 | GCC run3 | **GCC min** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib(30) x1           | 142.16 ms | 136.01 ms | 129.96 ms | **129.96 ms** | 165.22 ms | 194.73 ms | 160.54 ms | **160.54 ms** |
+| sum_loop(1e6) x20    | 1350.00 ms | 1250.29 ms | 1385.33 ms | **1250.29 ms** | 1451.07 ms | 1556.63 ms | 1482.20 ms | **1451.07 ms** |
+| sum_sq(1e6) x20      | 737.58 ms | 764.68 ms | 723.19 ms | **723.19 ms** | 698.65 ms | 699.31 ms | 696.26 ms | **696.26 ms** |
+| count_primes(3000) x10 | 11.64 ms | 9.24 ms | 14.48 ms | **9.24 ms** | 10.85 ms | 10.01 ms | 9.17 ms | **9.17 ms** |
+| arr_sum(10000) x1000 | 426.23 ms | 427.69 ms | 435.60 ms | **426.23 ms** | 479.03 ms | 518.59 ms | 441.46 ms | **441.46 ms** |
+
+---
+
+## Speedup Summary
+
+Speedup = Interp_min / GCC_min.  Values > 1.0 = GCC faster.
+
+| Benchmark | Interp min | GCC min | Speedup |
+|---|---:|---:|---:|
+| fib(30) x1           | 129.96 ms  | 160.54 ms  | **0.81×** |
+| sum_loop(1e6) x20    | 1250.29 ms | 1451.07 ms | **0.86×** |
+| sum_sq(1e6) x20      | 723.19 ms  | 696.26 ms  | **1.04×** |
+| count_primes(3000) x10 | 9.24 ms  | 9.17 ms    | **1.01×** |
+| arr_sum(10000) x1000 | 426.23 ms  | 441.46 ms  | **0.97×** |
+
+**GCC tier-2 is statistically equivalent to the interpreter (~1.00×).  No benchmark
+shows a consistent speedup and `fib` + `sum_loop` appear slightly slower.**
+
+---
+
+## Why GCC Tier-2 ≈ Interpreter (Phase 4 Without Typed Variables)
+
+Phase 4 GCC tier-2 generates the same C source as TCC tier-1 and compiles it with
+`gcc -O2 -shared -fPIC`.  The speedup ceiling is hit by the same four limits as TCC
+tier-1, with one additional factor:
+
+### 1–4. All TCC Tier-1 Limitations Still Apply
+
+See the *Why TCC Tier-1 ≈ Interpreter* section above.  JSValue boxing (factor 3) is
+the dominant limiter: GCC cannot eliminate tag checks on `JSValue` variables without
+proof that the tag is constant across the loop.  Even `-O2` with full alias analysis
+cannot collapse:
+
+```c
+JSValue s = JS_NewInt32(ctx, 0);          /* tag = INT */
+for (...) {
+    int64_t a = JS_VALUE_GET_INT(s);      /* GCC cannot hoist this... */
+    int64_t b = JS_VALUE_GET_INT(i_val);  /* ...because tag might change */
+    s = JS_NewInt32(ctx, (int)(a + b));   /* re-box each iteration */
+}
+```
+
+Every iteration still spends most cycles boxing/unboxing, not computing.
+
+### 5. Recursive calls through vtable (fib regression)
+
+`fib` calls itself via `_RT->call` (the vtable `JS_Call` wrapper).  The vtable call
+sets `JS_CALL_FLAG_COPY_ARGV`, which makes `JS_CallInternal` dup all arguments into a
+local buffer and free them on return — three heap reference-count operations per
+recursive call.  The GCC-optimised interpreter uses direct C recursion into
+`JS_CallInternal` with no dup overhead, so the interpreter wins for `fib`.
+
+### 6. `arr_sum` compiled by interpreter (JS_ATOM_length undefined in .so)
+
+`arr_sum` accesses `arr.length`, which emits `OP_get_field` with atom `JS_ATOM_length`.
+The generated C references `JS_ATOM_length` (a preprocessor macro from `quickjs-atom.h`),
+which is not exported via `quickjs.h` and thus causes a GCC compilation error.  The JIT
+sets `jit_no_compile = 1` for `arr_sum`; it continues running in the interpreter.
+The interpreter result in the `arr_sum` row is therefore the correct comparison baseline.
+This will be fixed in a future phase by emitting the atom numeric value directly.
+
+---
+
+## Phase 4 vs Phase 5 Projection
+
+Phase 4 GCC tier-2 delivers no speedup without typed variable information.  Phase 5
+(typed variables) is the key enabler: when locals are declared `int` or `double`, the
+generator emits `int64_t`/`double` C locals, eliminating boxing entirely.  Expected
+speedup for integer arithmetic loops with Phase 5: **5–8×** over the interpreter.
+
+Phase 4 is still a necessary foundation: it provides the background-compilation
+infrastructure (temp file, fork+exec gcc, dlopen/dlsym, atomic `jit_func` swap) that
+Phase 5 will use without modification.
+
+---
+
+## How to Reproduce (GCC Tier-2)
+
+```sh
+# From quickjs/
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=99999 qjs && cp qjs qjs_interp
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2     qjs && cp qjs qjs_t2
+
+# Interpreter baseline (bench_runner.js — same iteration counts)
+./qjs_interp jit_perf_tests/bench_runner.js
+
+# GCC tier-2 (bench_gcc.js — waits 8 s for background GCC to finish)
+./qjs_t2     jit_perf_tests/bench_gcc.js
+```
 
 ---
 
