@@ -186,6 +186,7 @@ const JSJITRuntime js_jit_rt = {
     .mul              = js_jit_op_mul,
     .div              = js_jit_op_div,
     .mod              = js_jit_op_mod,
+    .pow              = js_jit_op_pow,
     /* bitwise */
     .shl              = js_jit_op_shl,
     .sar              = js_jit_op_sar,
@@ -211,6 +212,7 @@ const JSJITRuntime js_jit_rt = {
     /* property access */
     .get_prop         = jit_rt_get_prop,
     .set_prop         = jit_rt_set_prop,
+    .get_var_slow     = js_jit_op_get_var_slow,
     .get_array_el     = jit_rt_get_array_el,
     .set_array_el     = jit_rt_set_array_el,
     /* calls */
@@ -1221,7 +1223,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     const uint8_t *op_sz, int op_sz_count,
                     int var_count, int arg_count, int stack_size,
                     int *unsupported_out,
-                    const uint8_t *local_type)
+                    const uint8_t *local_type,
+                    JSFunctionBytecode *b)
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -1528,8 +1531,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * ------------------------------------------------------------------ */
         case OP_get_var: {
             int idx = (int)bc_u16(&bc[pc+1]);
+            /* Must check for JS_UNINITIALIZED: a non-lexical global var may
+             * have been deleted at runtime (delete gvar).  In that case fall
+             * back to JS_GetPropertyInternal which throws ReferenceError.
+             * Bake the atom number and is_lexical flag into the generated C
+             * so the slow path needs no closure_var access at runtime. */
+            JSAtom cv_atom     = js_jit_fb_get_closure_var_atom(b, idx);
+            int    cv_is_lex   = js_jit_fb_get_closure_var_is_lexical(b, idx);
             jit_buf_printf(cb,
-                "    _s[_sp++]=_DUP(*_RT->var_ref_value(var_refs[%d]));\n", idx);
+                "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
+                "      if(unlikely(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED)){\n"
+                "        JSValue _r=_RT->get_var_slow(ctx,%uu,%d);\n"
+                "        _CHK(_r); _s[_sp++]=_r;\n"
+                "      } else _s[_sp++]=_DUP(*_pv); }\n",
+                idx, (unsigned)cv_atom, cv_is_lex);
             break;
         }
         case OP_put_var:
@@ -2505,7 +2520,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
-                 var_count, arg_count, stack_size, &unsup, local_type) < 0) {
+                 var_count, arg_count, stack_size, &unsup, local_type, b) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

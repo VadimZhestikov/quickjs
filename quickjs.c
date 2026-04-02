@@ -15659,6 +15659,22 @@ int      js_jit_fb_get_arg_count(JSFunctionBytecode *b) { return b->arg_count; }
 int      js_jit_fb_get_var_count(JSFunctionBytecode *b) { return b->var_count; }
 int      js_jit_fb_get_stack_size(JSFunctionBytecode *b) { return b->stack_size; }
 int      js_jit_fb_get_closure_var_count(JSFunctionBytecode *b) { return b->closure_var_count; }
+JSAtom   js_jit_fb_get_closure_var_atom(JSFunctionBytecode *b, int idx) { return b->closure_var[idx].var_name; }
+int      js_jit_fb_get_closure_var_is_lexical(JSFunctionBytecode *b, int idx) { return b->closure_var[idx].is_lexical; }
+
+/* Slow path for OP_get_var when the var_ref value is JS_UNINITIALIZED.
+ * Replicates the interpreter's fallback: lexical → TDZ throw,
+ * non-lexical → global property lookup (throws ReferenceError if absent). */
+JSValue js_jit_op_get_var_slow(JSContext *ctx, JSAtom atom, int is_lexical)
+{
+    if (is_lexical) {
+        JS_ThrowReferenceErrorUninitialized(ctx, atom);
+        return JS_EXCEPTION;
+    }
+    JSValue val = JS_GetPropertyInternal(ctx, ctx->global_obj, atom,
+                                         ctx->global_obj, TRUE);
+    return val;
+}
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
 /* Returns function name as a C string (caller must NOT free - static buffer). */
 const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
@@ -15725,6 +15741,7 @@ DEF_JIT_ARITH(sub, OP_sub)
 DEF_JIT_ARITH(mul, OP_mul)
 DEF_JIT_ARITH(div, OP_div)
 DEF_JIT_ARITH(mod, OP_mod)
+DEF_JIT_ARITH(pow, OP_pow)
 #undef DEF_JIT_ARITH
 
 /* Bitwise — all route through js_binary_logic_slow */

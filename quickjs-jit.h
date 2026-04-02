@@ -122,6 +122,8 @@ typedef struct JSJITRuntime {
     /* ------------------------------------------------------------------ */
     JSValue (*get_prop)(JSContext *, JSValue obj, JSAtom atom);
     int     (*set_prop)(JSContext *, JSValue obj, JSAtom atom, JSValue val);
+    /* Slow path for OP_get_var when value is JS_UNINITIALIZED (deleted global or TDZ) */
+    JSValue (*get_var_slow)(JSContext *, JSAtom atom, int is_lexical);
     JSValue (*get_array_el)(JSContext *, JSValue obj, JSValue idx);
     int     (*set_array_el)(JSContext *, JSValue obj, JSValue idx, JSValue val);
 
@@ -181,6 +183,8 @@ int            js_jit_fb_get_arg_count(JSFunctionBytecode *b);
 int            js_jit_fb_get_var_count(JSFunctionBytecode *b);
 int            js_jit_fb_get_stack_size(JSFunctionBytecode *b);
 int            js_jit_fb_get_closure_var_count(JSFunctionBytecode *b);
+JSAtom         js_jit_fb_get_closure_var_atom(JSFunctionBytecode *b, int idx);
+int            js_jit_fb_get_closure_var_is_lexical(JSFunctionBytecode *b, int idx);
 int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
 /* Opcode size table: opcode_size[opcode] = instruction length in bytes */
 const uint8_t *js_jit_get_opcode_size_table(int *count);
@@ -257,6 +261,8 @@ JSValue js_jit_op_sub(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_mul(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_div(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_mod(JSContext *, JSValue, JSValue);
+JSValue js_jit_op_pow(JSContext *, JSValue, JSValue);
+JSValue js_jit_op_get_var_slow(JSContext *, JSAtom atom, int is_lexical);
 JSValue js_jit_op_shl(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_sar(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_shr(JSContext *, JSValue, JSValue);
