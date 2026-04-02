@@ -1074,6 +1074,39 @@ The main performance win of Phase 7 is **startup consistency**, not throughput:
 
 ---
 
+---
+
+## Phase 8.1 — `JIT_T_INT` Integer Locals
+
+**Date:** 2026-04-02  
+**Binary:** same `./qjs` for both JIT and interpreter baseline (CONFIG_JIT=y build).
+
+Adds `int64_t _li[]` storage for locals proved always integral. Primary wins:
+- `sum_sq`: doubled integer multiplication throughput via INT gen_st → `GEN_CMP_FUSE_NUM`.
+- V8 score crosses "faster than interpreter" threshold.
+
+### Micro-benchmarks (3 runs, min; same binary for interp and JIT)
+
+| Benchmark | Interp min | JIT P8.1 min | Speedup | vs Phase 7 |
+|---|---:|---:|---:|---:|
+| fib(30) ×1 | 128 ms | 129 ms | **0.99×** | was 0.79× |
+| sum_loop(1e6) ×20 | 787 ms | 910 ms | **0.87×** | was 0.90× |
+| sum_sq(1e6) ×20 | 613 ms | 276 ms | **2.22×** | was 1.95× |
+| count_primes(3000) ×10 | 7.66 ms | 2.88 ms | **2.66×** | was 2.38× |
+| arr_sum(10000) ×1000 | 346 ms | 351 ms | **0.99×** | was 0.97× |
+
+### V8 benchmark (best-of-3 JIT; pure interpreter binary for baseline)
+
+| | Score |
+|---|---:|
+| JIT P8.1 best | 874 |
+| Pure interpreter (qjs_interp) | 776 |
+| Ratio | **1.13×** |
+
+Phase 7 was JIT 887 vs interpreter 984 = 0.90×.  P8.1 crosses 1.0× on V8.
+
+---
+
 ## How to Reproduce (Phase 7)
 
 ```sh

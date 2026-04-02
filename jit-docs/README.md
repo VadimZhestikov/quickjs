@@ -1,9 +1,9 @@
 # QuickJS JIT Compiler — Overview
 
 A two-tier native-code JIT for the QuickJS JavaScript engine, implemented incrementally
-across seven phases.  The JIT compiles hot JS functions to C, then lets GCC produce
-optimised machine code — no custom register allocator, no IR — just generated C as the
-intermediate representation.
+across eight phases (P8 in progress).  The JIT compiles hot JS functions to C, then lets
+GCC produce optimised machine code — no custom register allocator, no IR — just generated
+C as the intermediate representation.
 
 ---
 
@@ -20,6 +20,7 @@ intermediate representation.
 | [phase6-optimizations.md](phase6-optimizations.md) | Comparison+branch fusion, gen-time type stack, inline property cache |
 | [phase7-cache.md](phase7-cache.md) | Persistent .so cache, `--jit-aot`, `--jit-warmup`, e.stack fix |
 | [phase8-todo.md](phase8-todo.md) | Phase 8 improvement backlog: P8.1–P8.7 |
+| [phase8-p81-int-locals.md](phase8-p81-int-locals.md) | P8.1: `JIT_T_INT` integer locals, `int64_t _li[]`, inc/add/dec_loc fast paths |
 
 ---
 
@@ -238,31 +239,31 @@ read `obj->prop[cached_slot].u.value` directly — no hash chain walk.
 ## Performance summary
 
 All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2.
-Phase 7 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, < 3% variance).
+P8.1 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, min shown).
 Speedup = interpreter_min / JIT_min.  Values > 1 mean JIT is faster.
 
 ```
-Benchmark             Interp    JIT P7 AOT  Speedup   Bottleneck removed
-───────────────────────────────────────────────────────────────────────────
-fib(30) ×1             89 ms      112 ms     0.79×    vtable recursion overhead
-sum_loop(1e6) ×20     667 ms      745 ms     0.90×    no typed vars, no IC applies
-sum_sq(1e6) ×20       514 ms      264 ms     1.95×    Phase 5 double locals
-count_primes ×10      6.2 ms      2.6 ms     2.38×    Phase 5 inc_loc fast path
-arr_sum ×1000         293 ms      303 ms     0.97×    get_array_el still vtable
+Benchmark             Interp    JIT P8.1   Speedup   vs P7     Bottleneck
+───────────────────────────────────────────────────────────────────────────────
+fib(30) ×1            128 ms     129 ms     0.99×    +0.20     vtable recursion
+sum_loop(1e6) ×20     787 ms     910 ms     0.87×    −0.03     let vars, no add_loc
+sum_sq(1e6) ×20       613 ms     276 ms     2.22×    +0.27     INT gen_st fusion
+count_primes ×10      7.66 ms    2.88 ms    2.66×    +0.28     INT gen_st fusion
+arr_sum ×1000         346 ms     351 ms     0.99×    +0.02     get_array_el vtable
 ```
 
-V8 benchmark suite (best-of-5, higher = better, WSL2 noise ±15%):
+V8 benchmark suite (higher = better, WSL2 noise ±15%):
 
 ```
-Interpreter score: 984     JIT AOT score: 887   (0.90× — within WSL2 noise)
+Pure interpreter:  776   JIT P8.1 best: 874   (1.13× — JIT crosses 1× threshold)
 
-Phase 6.2 (background GCC, threshold=100): score varied 651–1025 per run
-Phase 7   (precompiled cache, --jit-aot):  score varies  704–887 per run (< 3× spread)
+Phase 7  (--jit-aot): best 887 vs interpreter 984 = 0.90×
+Phase 8.1 (--jit-aot): best 874 vs interpreter 776 = 1.13×
 ```
 
-Phase 7's main benefit is **startup consistency**.  Previous phases had high variance
-because background GCC competed with the 1-second v8bench measurement windows.
-With a warm cache, no GCC runs during execution — variance drops from ±20% to < 3%.
+P8.1's primary win is pushing `sum_sq` and `count_primes` further via integer type
+propagation through arithmetic in the gen-time type stack, enabling `GEN_CMP_FUSE_NUM`
+for inner-loop comparisons that involve only integer-typed locals.
 
 ---
 

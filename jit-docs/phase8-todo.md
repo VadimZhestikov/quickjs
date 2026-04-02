@@ -8,7 +8,7 @@ are regressions.  Phase 8 steps are ordered by impact-to-effort ratio.
 
 ## Todo
 
-- [ ] **P8.1 — `JIT_T_INT` integer type for locals**
+- [x] **P8.1 — `JIT_T_INT` integer type for locals**
   Integer loop counters are inferred as `double _ld[]` by Phase 5.  Add a third
   inferred type `JIT_T_INT` (→ `int32_t _li[]`).  Infer it when a local is only
   assigned from integer literals, `inc_loc`, or addition of two INT-typed values.
