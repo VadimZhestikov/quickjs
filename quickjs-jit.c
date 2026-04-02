@@ -1629,8 +1629,23 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "      else { JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n", \
         op_str, rt_name)
 
-        case OP_shl: GEN_BITOP_INT("<<", "shl"); break;
-        case OP_sar: GEN_BITOP_INT(">>", "sar"); break;
+        /* Shift operators must mask the shift count to & 31, matching the
+         * JavaScript spec (ToInt32 semantics) and avoiding C UB for shifts
+         * by >= 32 (e.g. 1 << 32 must equal 1, not 0). */
+        case OP_shl:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewInt32(ctx,(int32_t)((uint32_t)JS_VALUE_GET_INT(_a)<<(JS_VALUE_GET_INT(_b)&31)));\n"
+                "      else { JSValue _r=_RT->shl(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
+        case OP_sar:
+            jit_buf_str(cb,
+                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                "        _s[_sp++]=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31));\n"
+                "      else { JSValue _r=_RT->sar(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            break;
         case OP_and: GEN_BITOP_INT("&",  "band"); break;
         case OP_or:  GEN_BITOP_INT("|",  "bor");  break;
         case OP_xor: GEN_BITOP_INT("^",  "bxor"); break;
@@ -1795,7 +1810,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
                     "                              :JS_NewFloat64(ctx,(double)_r);\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->add(ctx,*_pv,_b); _CHK(_r); _FREE(*_pv); *_pv=_r;\n"
+                    /* _RT->add consumes both inputs (same ownership as interpreter\n"
+                     * stack ops). Move *_pv out first and clear the slot so the\n"
+                     * exception path (_ex) does not double-free it.              */
+                    "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
+                    "        JSValue _r=_RT->add(ctx,_old,_b); _CHK(_r); *_pv=_r;\n"
                     "      } }\n",
                     idx);
             }
