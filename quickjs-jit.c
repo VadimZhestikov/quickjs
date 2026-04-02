@@ -44,9 +44,13 @@
 #include "quickjs-opcode.h"
 
 /* Atom enum — needed to get numeric values of predefined atoms (e.g. JS_ATOM_length)
- * without pulling in the full quickjs.c internal headers.              */
+ * without pulling in the full quickjs.c internal headers.
+ * IMPORTANT: must match the runtime enum in quickjs.c exactly.
+ * The runtime enum starts with __JS_ATOM_NULL = 0 before the DEF entries,
+ * so the first DEF entry (null) gets value 1, not 0.              */
 #define DEF(name, str) JS_ATOM_##name,
 typedef enum {
+    __JIT_ATOM_NULL = 0, /* aligns with JS_ATOM_NULL = 0; DEF entries start at 1 */
 #include "quickjs-atom.h"
     JS_ATOM__COUNT
 } JSAtomEnumJIT;
@@ -1869,11 +1873,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _FREE(_o); _FREE(_idx); if(_r<0) goto _ex; }\n");
             break;
         case OP_get_length:
-            /* Emit atom value numerically to avoid needing quickjs-atom.h */
             jit_buf_printf(cb,
-                "    { JSValue _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);"
-                " _CHK(_r);\n"
-                "      _FREE(_s[--_sp]); _s[_sp++]=_r; }\n",
+                "    { JSValue _obj=_s[_sp-1];"
+                " JSValue _r=_RT->get_prop(ctx,_obj,(JSAtom)%uu);"
+                " _CHK(_r);"
+                " _FREE(_s[--_sp]); _s[_sp++]=_r; }\n",
                 (unsigned)JS_ATOM_length);
             break;
 
