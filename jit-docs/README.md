@@ -19,6 +19,7 @@ intermediate representation.
 | [phase5-typed-vars.md](phase5-typed-vars.md) | Forward type inference, `double _ld[]` locals, `inc_loc` fast path |
 | [phase6-optimizations.md](phase6-optimizations.md) | Comparison+branch fusion, gen-time type stack, inline property cache |
 | [phase7-cache.md](phase7-cache.md) | Persistent .so cache, `--jit-aot`, `--jit-warmup`, e.stack fix |
+| [phase8-todo.md](phase8-todo.md) | Phase 8 improvement backlog: P8.1–P8.7 |
 
 ---
 
