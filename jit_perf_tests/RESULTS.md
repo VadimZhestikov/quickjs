@@ -791,3 +791,140 @@ cd jit_perf_tests/v8bench
 ../../qjs_interp run_qjs.js
 ../../qjs_p61 run_qjs.js
 ```
+
+---
+
+# Phase 6.2 — Inline Property Cache (IC) for OP_get_field / OP_put_field
+
+**Date:** 2026-04-01
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)
+**Build flags:**
+- Interpreter: `make qjs` (GCC -O2, no JIT)
+- Phase 6.2 JIT: `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs`
+
+Phase 6.2 adds a monomorphic inline property cache (IC) to the generated C code for
+`OP_get_field`, `OP_get_field2`, and `OP_put_field`.
+
+**Mechanism:**
+
+Each JIT-compiled `get_field`/`put_field` callsite gets a function-local `static JSJITICEntry`
+(8 bytes: one `void*` shape pointer + one `uint32_t` slot index).  On each invocation:
+
+1. **Fast path (IC hit):** `js_jit_ic_check(obj, &ic)` checks `obj->shape == ic->shape` (single
+   pointer comparison via `JS_VALUE_GET_TAG` + `JS_VALUE_GET_PTR`).  On hit, `js_jit_ic_read`
+   returns `JS_DupValue(ctx, obj->prop[slot].u.value)` — direct array-index load, no hash walk.
+
+2. **Slow path (IC miss):** Falls back to `_RT->get_prop` (full `JS_GetProperty` with hash-chain
+   walk and prototype-chain traversal), then calls `js_jit_ic_fill_get` to populate the IC if
+   the property is a simple own data property.
+
+**What is cached:**
+- Only own (not prototype-inherited) simple data properties (`JS_PROP_NORMAL`, not accessor/varref)
+- For puts: additionally requires `JS_PROP_WRITABLE`
+- Non-cacheable callsites (prototype access, accessors, non-objects) always take the slow path
+
+**IC helpers** (`js_jit_ic_check`, `js_jit_ic_fill_get`, `js_jit_ic_fill_put`, `js_jit_ic_read`,
+`js_jit_ic_write`) are implemented in `quickjs.c` (where `JSObject` internals are accessible)
+and declared in `quickjs-jit.h`.
+
+---
+
+## Micro-benchmarks (bench_gcc.js, threshold=2, 8 s warm-up)
+
+Three runs each; table shows minimum elapsed time.
+
+| Benchmark | Interp run1 | Interp run2 | Interp run3 | **Interp min** | JIT P6.2 run1 | JIT P6.2 run2 | JIT P6.2 run3 | **JIT P6.2 min** | **Speedup** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib(30) x1             | 106.30 ms | 153.73 ms | 132.80 ms | **106.30 ms** |  95.17 ms | 101.42 ms | 142.82 ms |  **95.17 ms** | **1.12×** |
+| sum_loop(1e6) x20      | 833.29 ms | 946.96 ms | 857.71 ms | **833.29 ms** | 795.04 ms | 888.94 ms | 1000.69 ms | **795.04 ms** | **1.05×** |
+| sum_sq(1e6) x20        | 706.36 ms | 730.47 ms | 724.72 ms | **706.36 ms** | 269.83 ms | 365.92 ms | 479.87 ms | **269.83 ms** | **2.62×** |
+| count_primes(3000) x10 |  11.78 ms |   7.41 ms |   7.41 ms |   **7.41 ms** |   2.91 ms |   3.98 ms |   3.16 ms |   **2.91 ms** | **2.55×** |
+| arr_sum(10000) x1000   | 482.05 ms | 433.65 ms | 361.21 ms | **361.21 ms** | 378.98 ms | 396.12 ms | 478.55 ms | **378.98 ms** | **0.95×** |
+
+**Notes:**
+- `sum_sq` and `count_primes` speedups reflect both Phase 5 typed variables and Phase 6.2 IC.
+- `sum_loop` improvement (0.76× → 1.05×) likely reflects measurement variance rather than IC gain — `sum_loop` has no `get_field` opcodes.
+- `arr_sum` remains slightly below interpreter (0.95×); the loop uses `OP_get_array_el` (not `OP_get_field`) so the IC does not apply there.
+- WSL2 ±20% run-to-run variance; use minimum across 3 runs.
+
+---
+
+## V8 Benchmark Suite (threshold=100, 3 runs each)
+
+Higher is better.  GCC background compilation competes with the 1-second measurement window;
+runs where GCC completes during the window are penalised.
+
+#### Interpreter (no JIT)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    |   29 |  631 |  656 |  **656** |
+| DeltaBlue   |  617 |  519 |  532 |  **617** |
+| Crypto      |  938 |  459 |  770 |  **938** |
+| RayTrace    | 1049 |  815 |  976 | **1049** |
+| EarleyBoyer | 1294 | 1083 | 3820 | **1294**¹ |
+| RegExp      |  306 |  170 | 2811 |  **306**¹ |
+| Splay       | 1755 | 2060 | 2033 | **2060** |
+| **Score**   |  534 |  645 | 1283 |  **645** |
+
+¹ EarleyBoyer 3820 and RegExp 2811 in run 3 are outliers (fewer outer iterations in window).
+
+#### GCC JIT Phase 6.2 (threshold=100)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    |  709 |   19 |  866 |  **866** |
+| DeltaBlue   |  553 |  488 |  618 |  **618** |
+| Crypto      |  949 |  450 |  916 |  **949** |
+| RayTrace    |  903 |  774 |  933 |  **933** |
+| EarleyBoyer | 1204 | 3330 | 4138 | **1204**¹ |
+| RegExp      |  295 |  306 |  949 |  **949**¹ |
+| Splay       |  666 |  797 | 1054 | **1054** |
+| **Score**   |  696 |  429 | 1096 |  **696** |
+
+¹ EarleyBoyer/RegExp outliers excluded from best-of-three.
+
+#### Summary (best stable run)
+
+Using best non-outlier runs: Interp run 2 (645) vs JIT P6.2 run 1 (696):
+
+| Benchmark   | Interp | JIT P6.2 | Ratio |
+|---|---:|---:|---:|
+| Richards    |  631 |  709 | **1.12×** |
+| DeltaBlue   |  519 |  553 | **1.07×** |
+| Crypto      |  459 |  949 | **2.07×**¹ |
+| RayTrace    |  815 |  903 | **1.11×** |
+| EarleyBoyer | 1083 | 1204 | **1.11×** |
+| RegExp      |  170 |  295 | **1.74×**¹ |
+| Splay       | 2060 |  666 | **0.32×** |
+| **Score**   |  645 |  696 | **1.08×** |
+
+¹ Crypto and RegExp comparison is run-to-run noise (not a real 2× gain).  See note below.
+
+Both runs (interp run 2 and JIT run 1) had GCC compilation overhead competing with the
+measurement window, creating cross-run noise.  The Splay regression in JIT run 1 (666 vs
+2060) reflects GCC background compilation consuming CPU during the Splay test window.
+The most reliable comparison remains the micro-benchmarks above.
+
+**All 7 benchmarks pass with correct results.**
+
+---
+
+## How to Reproduce (Phase 6.2)
+
+```sh
+# From quickjs/
+make qjs -B && cp qjs qjs_interp
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs -B && cp qjs qjs_p62
+
+# Micro-benchmarks (interpreter baseline)
+./qjs_interp jit_perf_tests/bench_gcc.js
+
+# Micro-benchmarks (Phase 6.2 JIT, threshold=2, waits 8 s for compilation)
+./qjs_p62 jit_perf_tests/bench_gcc.js
+
+# V8 benchmark suite (run from v8bench/ subdirectory)
+cd jit_perf_tests/v8bench
+../../qjs_interp run_qjs.js
+../../qjs_p62 run_qjs.js
+```

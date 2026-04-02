@@ -199,6 +199,56 @@ JSValue *js_jit_var_ref_value(JSVarRef *ref);
 #endif
 
 /* ======================================================================= */
+/* Inline Property Cache (IC) — Phase 6.2                                 */
+/* Implemented in quickjs.c; used by JIT-generated C code.                */
+/* ======================================================================= */
+#ifdef CONFIG_JIT
+/*
+ * Monomorphic IC entry: caches the shape pointer and property slot index
+ * for a single (object-shape, atom) pair.  Zero-initialised entries have
+ * shape == NULL and are always treated as misses.
+ */
+typedef struct {
+    void     *shape;  /* JSShape* — opaque outside quickjs.c */
+    uint32_t  slot;   /* index into JSObject->prop[] */
+} JSJITICEntry;
+
+/*
+ * js_jit_ic_check: returns non-zero iff obj is an OBJECT whose shape
+ * matches ic->shape (fast inline shape guard).
+ */
+int js_jit_ic_check(JSValue obj, const JSJITICEntry *ic);
+
+/*
+ * js_jit_ic_fill_get: populate ic after a get_field miss.
+ * Only caches simple own data properties (JS_PROP_NORMAL, not accessor/varref).
+ * Returns 1 if cached, 0 if not cacheable (prototype property, accessor, etc.).
+ */
+int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
+                       JSJITICEntry *ic);
+
+/*
+ * js_jit_ic_fill_put: populate ic after a put_field miss.
+ * Only caches writable own data properties.
+ * Returns 1 if cached, 0 if not cacheable.
+ */
+int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
+                       JSJITICEntry *ic);
+
+/*
+ * js_jit_ic_read: read a property from the cached slot.
+ * Assumes ic check has already passed.  Returns a new reference.
+ */
+JSValue js_jit_ic_read(JSContext *ctx, JSValue obj, uint32_t slot);
+
+/*
+ * js_jit_ic_write: write val to the cached slot (transfers ownership of val).
+ * Assumes ic check has already passed.  Always returns 0.
+ */
+int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot);
+#endif
+
+/* ======================================================================= */
 /* Internal operator helpers (defined in quickjs.c, used by the vtable)   */
 /* ======================================================================= */
 #ifdef CONFIG_JIT

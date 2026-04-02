@@ -2041,31 +2041,44 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
-        /* ---- Property access ---- */
+        /* ---- Property access (with inline property cache) ---- */
         case OP_get_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
-                "    { JSValue _o=_s[--_sp];"
-                " JSValue _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);"
-                " _FREE(_o); _CHK(_r); _s[_sp++]=_r; }\n",
-                atom);
+                "    { static JSJITICEntry _ic%d={NULL,0};\n"
+                "      JSValue _o=_s[--_sp], _r;\n"
+                "      if (likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "          _r=js_jit_ic_read(ctx,_o,_ic%d.slot);\n"
+                "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
+                "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
+                "      _FREE(_o); _CHK(_r); _s[_sp++]=_r; }\n",
+                pc, pc, pc, atom, atom, pc);
             break;
         }
         case OP_get_field2: { /* keep object on stack */
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
-                "    { JSValue _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);"
-                " _CHK(_r); _s[_sp++]=_r; }\n",
-                atom);
+                "    { static JSJITICEntry _ic%d={NULL,0};\n"
+                "      JSValue _r;\n"
+                "      if (likely(js_jit_ic_check(_s[_sp-1],&_ic%d)))\n"
+                "          _r=js_jit_ic_read(ctx,_s[_sp-1],_ic%d.slot);\n"
+                "      else { _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);\n"
+                "             js_jit_ic_fill_get(ctx,_s[_sp-1],(JSAtom)%uu,&_ic%d); }\n"
+                "      _CHK(_r); _s[_sp++]=_r; }\n",
+                pc, pc, pc, atom, atom, pc);
             break;
         }
         case OP_put_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp], _o=_s[--_sp];\n"
-                "      int _r=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
-                "      _FREE(_o); if(_r<0) goto _ex; }\n",
-                atom);
+                "    { static JSJITICEntry _ic%d={NULL,0};\n"
+                "      JSValue _v=_s[--_sp], _o=_s[--_sp]; int _ret;\n"
+                "      if (likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "          _ret=js_jit_ic_write(ctx,_o,_v,_ic%d.slot);\n"
+                "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
+                "             js_jit_ic_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
+                "      _FREE(_o); if(_ret<0) goto _ex; }\n",
+                pc, pc, pc, atom, atom, pc);
             break;
         }
         case OP_get_array_el:

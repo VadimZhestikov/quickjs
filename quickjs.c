@@ -15801,6 +15801,75 @@ JSValue js_jit_op_type_of(JSContext *ctx, JSValue a)
     return JS_AtomToString(ctx, atom);
 }
 
+/* -----------------------------------------------------------------------
+ * Inline Property Cache helpers — Phase 6.2
+ * ----------------------------------------------------------------------- */
+
+/* Shape check: returns non-zero iff obj is an OBJECT with the cached shape. */
+int js_jit_ic_check(JSValue obj, const JSJITICEntry *ic)
+{
+    if (ic->shape == NULL)
+        return 0;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    return (void *)JS_VALUE_GET_OBJ(obj)->shape == ic->shape;
+}
+
+/* Fill IC entry for a get_field callsite.
+ * Only caches own simple data properties (no accessor, no varref, no proto). */
+int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
+                       JSJITICEntry *ic)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK))
+        return 0;
+    ic->shape = p->shape;
+    ic->slot  = (uint32_t)(pr - p->prop);
+    return 1;
+}
+
+/* Fill IC entry for a put_field callsite.
+ * Only caches own writable simple data properties. */
+int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
+                       JSJITICEntry *ic)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    prs = find_own_property(&pr, p, atom);
+    if (!prs)
+        return 0;
+    if ((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) != JS_PROP_WRITABLE)
+        return 0;
+    ic->shape = p->shape;
+    ic->slot  = (uint32_t)(pr - p->prop);
+    return 1;
+}
+
+/* Read property from cached slot (IC hit — returns new reference). */
+JSValue js_jit_ic_read(JSContext *ctx, JSValue obj, uint32_t slot)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    return JS_DupValue(ctx, p->prop[slot].u.value);
+}
+
+/* Write property to cached slot (IC hit — transfers ownership of val). */
+int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    set_value(ctx, &p->prop[slot].u.value, val);
+    return 0;
+}
+
 #endif /* CONFIG_JIT */
 
 static __exception int js_has_unscopable(JSContext *ctx, JSValueConst obj,
