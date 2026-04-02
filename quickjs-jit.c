@@ -1288,6 +1288,23 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                     jit_buf_printf(cb, "    _ld[%d]=0.0;\n", j);
         }
     }
+
+    /* P8.4: integer argument fast-path.
+     * _ai[i]  — int32_t holding the extracted integer value for arg i
+     * _aim    — bitmask: bit i is set iff argv[i] is JS_TAG_INT and valid in _ai[i]
+     * GEN_GET_ARG uses _ai[i] when the bit is set, avoiding repeated argv[] loads
+     * and enabling GCC to keep the value in a register across reads.
+     * GEN_PUT/SET_ARG keeps _aim consistent on writes. */
+    if (arg_count > 0) {
+        int n = arg_count < 32 ? arg_count : 32;
+        jit_buf_printf(cb, "    int32_t _ai[%d]; uint32_t _aim=0;\n", n);
+        for (int j = 0; j < n; j++)
+            jit_buf_printf(cb,
+                "    if(%d<argc&&JS_VALUE_GET_TAG(argv[%d])==JS_TAG_INT)"
+                "{_ai[%d]=JS_VALUE_GET_INT(argv[%d]);_aim|=%uu;}\n",
+                j, j, j, j, 1u << j);
+        jit_buf_str(cb, "    (void)_ai; (void)_aim;\n");
+    }
 }
 
 /*
@@ -1637,13 +1654,46 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_PUT_LOC
 #undef GEN_SET_LOC
 
-        /* ---- Argument access ---- */
-#define GEN_GET_ARG(idx) \
-    jit_buf_printf(cb, "    _s[_sp++]=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", idx, idx)
-#define GEN_PUT_ARG(idx) \
-    jit_buf_printf(cb, "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_s[--_sp];}else _FREE(_s[--_sp]);\n", idx, idx, idx)
-#define GEN_SET_ARG(idx) \
-    jit_buf_printf(cb, "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_s[_sp-1]);};\n", idx, idx, idx)
+        /* ---- Argument access (P8.4: int-arg fast path) ----
+         * _aim bit i: argv[i] is a JS_TAG_INT and its value is live in _ai[i].
+         * GEN_GET_ARG: prefer _ai[i] (register-friendly int32) over argv[i] load.
+         * GEN_PUT/SET_ARG: keep _ai[i] and _aim consistent on arg writes. */
+#define _AI_VALID(idx) ((idx) < 32)
+#define GEN_GET_ARG(idx) do { \
+    if (_AI_VALID(idx)) \
+        jit_buf_printf(cb, \
+            "    _s[_sp++]=((%d)<argc&&(_aim>>%du&1u))" \
+            "?JS_MKVAL(JS_TAG_INT,_ai[%d])" \
+            ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", \
+            idx, (unsigned)(idx), idx, idx, idx); \
+    else \
+        jit_buf_printf(cb, \
+            "    _s[_sp++]=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", idx, idx); \
+} while(0)
+#define GEN_PUT_ARG(idx) do { \
+    if (_AI_VALID(idx)) \
+        jit_buf_printf(cb, \
+            "    if((%d)<argc){JSValue _t=_s[--_sp];" \
+            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_ai[%d]=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
+            "_FREE(argv[%d]);argv[%d]=_t;}else _FREE(_s[--_sp]);\n", \
+            idx, idx, 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+    else \
+        jit_buf_printf(cb, \
+            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_s[--_sp];}else _FREE(_s[--_sp]);\n", \
+            idx, idx, idx); \
+} while(0)
+#define GEN_SET_ARG(idx) do { \
+    if (_AI_VALID(idx)) \
+        jit_buf_printf(cb, \
+            "    if((%d)<argc){JSValue _t=_s[_sp-1];" \
+            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_ai[%d]=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
+            "_FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
+            idx, idx, 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+    else \
+        jit_buf_printf(cb, \
+            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_s[_sp-1]);};\n", \
+            idx, idx, idx); \
+} while(0)
 
         case OP_get_arg: GEN_GET_ARG((int)bc_u16(&bc[pc+1])); break;
         case OP_put_arg: GEN_PUT_ARG((int)bc_u16(&bc[pc+1])); break;
@@ -1661,6 +1711,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_set_arg2: GEN_SET_ARG(2); break;
         case OP_set_arg3: GEN_SET_ARG(3); break;
 
+#undef _AI_VALID
 #undef GEN_GET_ARG
 #undef GEN_PUT_ARG
 #undef GEN_SET_ARG
