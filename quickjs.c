@@ -15873,45 +15873,80 @@ JSValue js_jit_op_type_of(JSContext *ctx, JSValue a)
  * ----------------------------------------------------------------------- */
 
 /* Shape check: returns non-zero iff obj is an OBJECT with the cached shape. */
+/* Megamorphic sentinel: an IC entry whose shape is set to JIT_IC_MEGAMORPHIC
+ * has been observed with multiple shapes.  js_jit_ic_check() will always miss
+ * for it, and js_jit_ic_fill_{get,put}() will skip the find_own_property()
+ * hash lookup so the miss path is as cheap as a direct slow-path call. */
+#define JIT_IC_MEGAMORPHIC ((void *)(uintptr_t)1)
+
+/* js_jit_ic_check: shape pointer guard + atom-at-slot ABA guard.
+ * The atom check prevents false positives when a shape is freed and its
+ * memory is reused for a different shape at the same address: the new shape
+ * will have a different atom at the cached slot unless the layout is identical,
+ * in which case the IC hit is valid anyway.
+ * NULL and JIT_IC_MEGAMORPHIC entries always miss. */
 int js_jit_ic_check(JSValue obj, const JSJITICEntry *ic)
 {
-    if (ic->shape == NULL)
+    JSObject *p;
+    if (ic->shape == NULL || ic->shape == JIT_IC_MEGAMORPHIC)
         return 0;
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return 0;
-    return (void *)JS_VALUE_GET_OBJ(obj)->shape == ic->shape;
+    p = JS_VALUE_GET_OBJ(obj);
+    if ((void *)p->shape != ic->shape)
+        return 0;
+    /* ABA guard: verify the expected atom is still at the cached slot. */
+    if (ic->slot >= (uint32_t)p->shape->prop_count)
+        return 0;
+    return get_shape_prop(p->shape)[ic->slot].atom == ic->atom;
 }
 
 /* Fill IC entry for a get_field callsite.
- * Only caches own simple data properties (no accessor, no varref, no proto). */
+ * Only caches own simple data properties (no accessor, no varref, no proto).
+ * If we see a second distinct shape the callsite is polymorphic: mark it
+ * megamorphic so subsequent misses skip the find_own_property() hash lookup. */
 int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
                        JSJITICEntry *ic)
 {
     JSObject *p;
     JSProperty *pr;
     JSShapeProperty *prs;
+    if (ic->shape == JIT_IC_MEGAMORPHIC)
+        return 0; /* already megamorphic — skip */
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return 0;
     p = JS_VALUE_GET_OBJ(obj);
+    if (ic->shape != NULL && ic->shape != p->shape) {
+        ic->shape = JIT_IC_MEGAMORPHIC;
+        return 0; /* polymorphic — degrade to megamorphic */
+    }
     prs = find_own_property(&pr, p, atom);
     if (!prs || (prs->flags & JS_PROP_TMASK))
         return 0;
     ic->shape = p->shape;
     ic->slot  = (uint32_t)(pr - p->prop);
+    ic->atom  = prs->atom;
     return 1;
 }
 
 /* Fill IC entry for a put_field callsite.
- * Only caches own writable simple data properties. */
+ * Only caches own writable simple data properties.
+ * Same megamorphic demotion as js_jit_ic_fill_get. */
 int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
                        JSJITICEntry *ic)
 {
     JSObject *p;
     JSProperty *pr;
     JSShapeProperty *prs;
+    if (ic->shape == JIT_IC_MEGAMORPHIC)
+        return 0; /* already megamorphic — skip */
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return 0;
     p = JS_VALUE_GET_OBJ(obj);
+    if (ic->shape != NULL && ic->shape != p->shape) {
+        ic->shape = JIT_IC_MEGAMORPHIC;
+        return 0; /* polymorphic — degrade to megamorphic */
+    }
     prs = find_own_property(&pr, p, atom);
     if (!prs)
         return 0;
@@ -15919,6 +15954,7 @@ int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
         return 0;
     ic->shape = p->shape;
     ic->slot  = (uint32_t)(pr - p->prop);
+    ic->atom  = prs->atom;
     return 1;
 }
 

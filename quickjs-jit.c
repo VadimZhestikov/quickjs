@@ -1026,7 +1026,7 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     int status = 0;
     waitpid(pid, &status, 0);
     int gcc_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (gcc_ok) unlink(c_path);
+    unlink(c_path);
     free(c_path);
     if (!gcc_ok) { unlink(so_path); goto fail; }
 
@@ -2296,7 +2296,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _o=_s[--_sp], _r;\n"
-                "      if (likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
                 "          _r=js_jit_ic_read(ctx,_o,_ic%d.slot);\n"
                 "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
@@ -2309,7 +2309,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
-                "      if (likely(js_jit_ic_check(_s[_sp-1],&_ic%d)))\n"
+                "      if (js_likely(js_jit_ic_check(_s[_sp-1],&_ic%d)))\n"
                 "          _r=js_jit_ic_read(ctx,_s[_sp-1],_ic%d.slot);\n"
                 "      else { _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_s[_sp-1],(JSAtom)%uu,&_ic%d); }\n"
@@ -2322,7 +2322,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _v=_s[--_sp], _o=_s[--_sp]; int _ret;\n"
-                "      if (likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
                 "          _ret=js_jit_ic_write(ctx,_o,_v,_ic%d.slot);\n"
                 "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
                 "             js_jit_ic_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"

@@ -230,6 +230,9 @@ JSValue *js_jit_var_ref_value(JSVarRef *ref);
 typedef struct {
     void     *shape;  /* JSShape* — opaque outside quickjs.c */
     uint32_t  slot;   /* index into JSObject->prop[] */
+    uint32_t  atom;   /* JSAtom at slot — ABA guard: if shape is freed and
+                       * reallocated for a different layout, the atom at this
+                       * slot will differ, preventing false IC hits. */
 } JSJITICEntry;
 
 /*
