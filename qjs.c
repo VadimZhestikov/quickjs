@@ -49,7 +49,8 @@
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
 
-static int jit_aot_mode = 0; /* set by --jit-aot */
+static int jit_aot_mode     = 0; /* set by --jit-aot     */
+static int jit_warmup_mode  = 0; /* set by --jit-warmup  */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -74,15 +75,20 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
             val = JS_EvalFunction(ctx, val);
         }
         val = js_std_await(ctx, val);
-    } else if (jit_aot_mode) {
+    } else if (jit_aot_mode || jit_warmup_mode) {
 #ifdef CONFIG_JIT
-        /* Compile-only pass to gather all functions, then compile+execute */
+        /* Compile-only pass to gather all functions, then GCC-compile them */
         val = JS_Eval(ctx, buf, buf_len, filename,
                       eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(val)) {
             if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
                 js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
             js_jit_drain();
+            if (jit_warmup_mode) {
+                /* --jit-warmup: populate cache only, do not execute */
+                JS_FreeValue(ctx, val);
+                return 0;
+            }
             val = JS_EvalFunction(ctx, val);
         }
 #else
@@ -336,6 +342,7 @@ void help(void)
            "-q  --quit         just instantiate the interpreter and quit\n"
 #ifdef CONFIG_JIT
            "    --jit-aot      compile all functions with GCC before running\n"
+           "    --jit-warmup   compile all functions into cache, then exit\n"
 #endif
            );
     exit(1);
@@ -474,6 +481,10 @@ int main(int argc, char **argv)
 #ifdef CONFIG_JIT
             if (!strcmp(longopt, "jit-aot")) {
                 jit_aot_mode = 1;
+                continue;
+            }
+            if (!strcmp(longopt, "jit-warmup")) {
+                jit_warmup_mode = 1;
                 continue;
             }
 #endif

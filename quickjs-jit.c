@@ -36,6 +36,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
 
@@ -846,12 +847,13 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
 /* Forward declaration: js_jit_gen_c is defined in the Phase 2 section below */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                          char *fname_out, size_t fname_sz, int *unsupported,
-                         const char *js_func_name);
+                         const char *js_func_name, uint64_t bc_hash);
 
 typedef struct JITGCCJob {
     JSFunctionBytecode *b;
     char               *c_src;     /* malloc'd C source; freed after gcc    */
     char                fname[64]; /* symbol name to look up via dlsym      */
+    uint64_t            bc_hash;   /* FNV-1a hash of bytecode + build stamp */
     struct JITGCCJob   *next;
 } JITGCCJob;
 
@@ -867,6 +869,96 @@ static struct {
     int             busy;       /* 1 while compiling a job */
     int             ref_count; /* how many JSRuntime instances share this thread */
 } jit_worker;
+
+/* =======================================================================
+ * Phase 7.3/7.4 — JIT cache helpers
+ *
+ * Cache key: FNV-1a 64-bit over bytecode bytes, then folded with a build
+ * stamp (__DATE__ __TIME__) so the cache is automatically invalidated when
+ * qjs is recompiled.
+ *
+ * Cache location: $QJS_JIT_CACHE env-var, falling back to ~/.cache/qjs-jit/
+ * Cache file:     <dir>/<hash16hex>.so
+ *
+ * Write path (Phase 7.3): after GCC succeeds, copy .so → cache atomically.
+ * Read path  (Phase 7.4): before generating C, dlopen cache hit directly.
+ * ======================================================================= */
+
+static const char jit_build_stamp[] = __DATE__ " " __TIME__;
+
+static uint64_t jit_fnv1a_64(const void *data, size_t len, uint64_t hash)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= p[i];
+        hash *= UINT64_C(0x00000100000001B3);
+    }
+    return hash;
+}
+
+static uint64_t jit_hash_bytecode(const uint8_t *bc, int bc_len)
+{
+    uint64_t h = UINT64_C(0xcbf29ce484222325);  /* FNV-1a offset basis */
+    h = jit_fnv1a_64(bc, (size_t)bc_len, h);
+    h = jit_fnv1a_64(jit_build_stamp, sizeof(jit_build_stamp) - 1, h);
+    return h;
+}
+
+static char jit_cache_dir[512];
+static int  jit_cache_enabled;
+
+static void jit_cache_init(void)
+{
+    const char *env = getenv("QJS_JIT_CACHE");
+    if (env && *env) {
+        snprintf(jit_cache_dir, sizeof(jit_cache_dir), "%s", env);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return;
+        snprintf(jit_cache_dir, sizeof(jit_cache_dir),
+                 "%s/.cache/qjs-jit", home);
+    }
+    mkdir(jit_cache_dir, 0755); /* no-op if already exists */
+    jit_cache_enabled = 1;
+}
+
+/* Returns malloc'd path to cached .so if it exists and is readable. */
+static char *jit_cache_get(uint64_t hash)
+{
+    if (!jit_cache_enabled) return NULL;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.so",
+             jit_cache_dir, (unsigned long long)hash);
+    if (access(path, R_OK) == 0)
+        return strdup(path);
+    return NULL;
+}
+
+/* Copy src_path to <cache_dir>/<hash>.so atomically via temp+rename. */
+static void jit_cache_put(const char *src_path, uint64_t hash)
+{
+    if (!jit_cache_enabled) return;
+    char dst_path[600], tmp_path[620];
+    snprintf(dst_path, sizeof(dst_path), "%s/%016llx.so",
+             jit_cache_dir, (unsigned long long)hash);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dst_path);
+
+    int src_fd = open(src_path, O_RDONLY);
+    if (src_fd < 0) return;
+    int dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd < 0) { close(src_fd); return; }
+
+    char buf[65536];
+    ssize_t n;
+    int ok = 1;
+    while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
+        if (write(dst_fd, buf, (size_t)n) != n) { ok = 0; break; }
+    }
+    close(src_fd);
+    close(dst_fd);
+    if (!ok || n < 0) { unlink(tmp_path); return; }
+    rename(tmp_path, dst_path); /* atomic on same filesystem */
+}
 
 /* Write src to a temp file with the given suffix; return malloc'd path. */
 static char *jit_write_tmp(const char *src, const char *suffix)
@@ -924,6 +1016,9 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     free(c_path);
     if (!gcc_ok) { unlink(so_path); goto fail; }
 
+    /* Cache the compiled .so before unlinking (Phase 7.3) */
+    jit_cache_put(so_path, job->bc_hash);
+
     /* Load the compiled .so; unlink immediately (kernel keeps it mapped) */
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     unlink(so_path);
@@ -969,6 +1064,7 @@ void js_jit_init(void)
         jit_worker.ref_count++;
         return;
     }
+    jit_cache_init();
     pthread_mutex_init(&jit_worker.lock, NULL);
     pthread_cond_init(&jit_worker.cond, NULL);
     pthread_cond_init(&jit_worker.idle_cond, NULL);
@@ -1023,21 +1119,47 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     js_jit_fb_set_no_compile(b);
     if (!jit_worker.started) return;
 
+    /* Compute stable bytecode hash for cache lookup and symbol naming */
+    int bc_len;
+    const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
+    uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
+
+    /* Phase 7.4: cache hit — load pre-compiled .so without running GCC */
+    char *cache_path = jit_cache_get(bc_hash);
+    if (cache_path) {
+        char fname[64];
+        snprintf(fname, sizeof(fname), "__jit_f_%016llx",
+                 (unsigned long long)bc_hash);
+        void *handle = dlopen(cache_path, RTLD_NOW | RTLD_LOCAL);
+        free(cache_path);
+        if (handle) {
+            JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, fname);
+            if (f) {
+                js_jit_fb_set_func(b, f, handle, 2);
+                return;
+            }
+            dlclose(handle);
+            /* Corrupted cache entry — fall through to recompile */
+        }
+    }
+
     JSJITCodeBuf cb;
     char fname[64];
     int unsupported = 0;
     const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
-    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported, js_name) < 0) {
+    if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported,
+                     js_name, bc_hash) < 0) {
         return;
     }
 
     JITGCCJob *job = malloc(sizeof(*job));
     if (!job) { jit_buf_free(&cb); return; }
-    job->b     = b;
-    job->c_src = cb.buf;   /* transfer buffer ownership to job */
-    cb.buf     = NULL;     /* prevent double-free if jit_buf_free is called */
+    job->b       = b;
+    job->c_src   = cb.buf;   /* transfer buffer ownership to job */
+    cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */
+    job->bc_hash = bc_hash;
     memcpy(job->fname, fname, sizeof(job->fname));
-    job->next  = NULL;
+    job->next    = NULL;
 
     pthread_mutex_lock(&jit_worker.lock);
     if (jit_worker.tail) jit_worker.tail->next = job;
@@ -1069,19 +1191,19 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
 
 /*
  * Emit the C preamble: type definitions and the function signature.
- * The function symbol name encodes the bytecode pointer as a hex address
- * so multiple compiled functions don't clash when linked.
+ * The function symbol name encodes the bytecode hash so it is stable
+ * across runs and can be looked up in a cached .so (Phase 7.3/7.4).
  */
-static void gen_preamble(JSJITCodeBuf *cb, JSFunctionBytecode *b,
+static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          int var_count, int arg_count, int stack_size,
                          int closure_var_count, int cpool_count,
                          char *fname_out, size_t fname_sz,
                          const uint8_t *local_type,
                          const char *js_func_name)
 {
-    /* Unique function name based on pointer value */
+    /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
-             (unsigned long long)(uintptr_t)b);
+             (unsigned long long)bc_hash);
 
     /* Debug: identify the JS source function */
     jit_buf_printf(cb, "/* JS function: %s */\n",
@@ -2482,7 +2604,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                         char *fname_out, size_t fname_sz, int *unsupported,
-                        const char *js_func_name)
+                        const char *js_func_name, uint64_t bc_hash)
 {
     *unsupported = 0;
 
@@ -2514,7 +2636,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    gen_preamble(cb, b, var_count, arg_count, stack_size,
+    gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
                  local_type, js_func_name);
 
