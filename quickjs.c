@@ -15973,6 +15973,43 @@ int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot)
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * P8.5: Dense array element fast paths
+ * ----------------------------------------------------------------------- */
+
+/* Fast array element read (P8.5).
+ * Precondition: JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT (caller-checked).
+ * Returns 1 if fast path succeeded (*out set to a new reference to arr[idx]).
+ * Returns 0 if slow path is needed (*out unchanged).
+ * Only handles dense JS_CLASS_ARRAY with integer index in bounds. */
+int js_jit_array_get(JSContext *ctx, JSValue obj, uint32_t idx, JSValue *out)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_ARRAY)
+        return 0;
+    if (idx >= (uint32_t)p->u.array.count)
+        return 0;
+    *out = JS_DupValue(ctx, p->u.array.u.values[idx]);
+    return 1;
+}
+
+/* Fast array element write (P8.5).
+ * Precondition: JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT (caller-checked).
+ * Returns 1 if fast path succeeded (val is consumed / stored in the array).
+ * Returns 0 if slow path is needed (val is NOT consumed).
+ * Only handles dense JS_CLASS_ARRAY with integer index within current bounds.
+ * Array extension (idx == count) falls through to the slow path. */
+int js_jit_array_set(JSContext *ctx, JSValue obj, uint32_t idx, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_ARRAY)
+        return 0;
+    if (idx >= (uint32_t)p->u.array.count)
+        return 0;
+    set_value(ctx, &p->u.array.u.values[idx], val);
+    return 1;
+}
+
 /* Recursively enqueue all eligible bytecode functions for GCC compilation.
  * Walks the cpool tree to find nested function definitions.
  * Called from --jit-aot mode after parsing, before execution. */

@@ -268,6 +268,14 @@ JSValue js_jit_ic_read(JSContext *ctx, JSValue obj, uint32_t slot);
  * Assumes ic check has already passed.  Always returns 0.
  */
 int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot);
+
+/* P8.5: Dense array element fast paths.
+ * Both functions require JS_VALUE_GET_TAG(obj)==JS_TAG_OBJECT (caller-checked).
+ * js_jit_array_get: on hit returns 1 with *out set to a new ref; 0 on miss.
+ * js_jit_array_set: on hit returns 1 (val consumed); 0 on miss (val intact).
+ */
+int js_jit_array_get(JSContext *ctx, JSValue obj, uint32_t idx, JSValue *out);
+int js_jit_array_set(JSContext *ctx, JSValue obj, uint32_t idx, JSValue val);
 #endif
 
 /* ======================================================================= */

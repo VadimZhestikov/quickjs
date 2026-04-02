@@ -2381,17 +2381,31 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 pc, pc, pc, atom, atom, pc);
             break;
         }
+        /* P8.5: dense array element fast path.
+         * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT.
+         * Fast path: js_jit_array_get/set hit the u.array.values[] directly.
+         * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty. */
         case OP_get_array_el:
             jit_buf_str(cb,
-                "    { JSValue _idx=_s[--_sp], _o=_s[--_sp];\n"
-                "      JSValue _r=_RT->get_array_el(ctx,_o,_idx);\n"
-                "      _FREE(_o); _FREE(_idx); _CHK(_r); _s[_sp++]=_r; }\n");
+                "    { JSValue _idx=_s[--_sp],_o=_s[--_sp];\n"
+                "      JSValue _r;\n"
+                "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
+                "         &&js_jit_array_get(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),&_r))\n"
+                "          ;/* fast hit */\n"
+                "      else _r=_RT->get_array_el(ctx,_o,_idx);\n"
+                "      _FREE(_o);_FREE(_idx);_CHK(_r);_s[_sp++]=_r; }\n");
             break;
         case OP_put_array_el:
             jit_buf_str(cb,
                 "    { JSValue _v=_s[--_sp],_idx=_s[--_sp],_o=_s[--_sp];\n"
-                "      int _r=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                "      _FREE(_o); _FREE(_idx); if(_r<0) goto _ex; }\n");
+                "      int _ret;\n"
+                "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
+                "         &&js_jit_array_set(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),_v))\n"
+                "          _ret=0;/* fast hit, _v consumed */\n"
+                "      else _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                "      _FREE(_o);_FREE(_idx);if(_ret<0) goto _ex; }\n");
             break;
         case OP_get_length:
             jit_buf_printf(cb,
