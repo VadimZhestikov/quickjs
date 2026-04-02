@@ -202,6 +202,9 @@ const char    *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b);
 JSAtom         js_jit_fb_get_func_atom(JSFunctionBytecode *b);
 /* P8.2: interrupt poll — wraps js_poll_interrupts (static inline) for vtable use */
 int            js_jit_poll_interrupts(JSContext *ctx);
+/* P8.3: JIT-to-JIT fast call — checks jit_func, calls directly if compiled */
+JSValue        js_jit_call(JSContext *, JSValue func, JSValue this_val,
+                            int argc, JSValue *argv);
 #endif
 
 /* ======================================================================= */

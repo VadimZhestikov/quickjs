@@ -15677,9 +15677,55 @@ JSValue js_jit_op_get_var_slow(JSContext *ctx, JSAtom atom, int is_lexical)
 }
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
 JSAtom   js_jit_fb_get_func_atom(JSFunctionBytecode *b)  { return b->func_name; }
-/* P8.2: interrupt poll wrapper — allows generated C to call js_poll_interrupts
- * (which is static inline) through the vtable without exposing internals.    */
-int      js_jit_poll_interrupts(JSContext *ctx)           { return js_poll_interrupts(ctx); }
+/* P8.2: interrupt poll wrapper — also checks C stack depth.
+ * Direct P8.2/P8.3 JIT calls bypass JS_CallInternal's stack overflow check,
+ * so we combine the interrupt poll with a stack check here.                  */
+int js_jit_poll_interrupts(JSContext *ctx)
+{
+    if (js_poll_interrupts(ctx))
+        return -1;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    if (unlikely(js_check_stack_overflow(rt, 0))) {
+        JS_ThrowStackOverflow(ctx);
+        return -1;
+    }
+    return 0;
+}
+
+/* P8.3: JIT-to-JIT fast call path.
+ *
+ * Replaces the simple JS_Call vtable entry.  For bytecode functions that have
+ * already been JIT-compiled, this bypasses JS_CallInternal entirely:
+ *   1. Check tag == JS_TAG_OBJECT && class_id == JS_CLASS_BYTECODE_FUNCTION
+ *   2. Atomic-read jit_func (ACQUIRE)
+ *   3. If non-NULL: poll interrupts, then call jit_func directly with the
+ *      function's own cpool and var_refs.
+ *   4. Otherwise: fall through to JS_Call (interpreter or future GCC compile).
+ *
+ * Cost on the fast path: tag check + class_id check + one ACQUIRE load +
+ * poll_interrupts (mostly a counter decrement) + one direct call.
+ * Cost on the slow path: same checks + JS_Call.
+ *
+ * Self-recursive calls are handled by P8.2 (zero vtable overhead); this
+ * function handles all other JIT-to-JIT calls.                              */
+JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
+                    int argc, JSValue *argv)
+{
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(func);
+        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+            if (jf) {
+                if (js_jit_poll_interrupts(ctx))
+                    return JS_EXCEPTION;
+                return jf(ctx, this_val, argc, argv,
+                          b->cpool, p->u.func.var_refs);
+            }
+        }
+    }
+    return JS_Call(ctx, func, this_val, argc, argv);
+}
 /* Returns function name as a C string (caller must NOT free - static buffer). */
 const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
 {

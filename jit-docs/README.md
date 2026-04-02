@@ -22,6 +22,7 @@ C as the intermediate representation.
 | [phase8-todo.md](phase8-todo.md) | Phase 8 improvement backlog: P8.1–P8.7 |
 | [phase8-p81-int-locals.md](phase8-p81-int-locals.md) | P8.1: `JIT_T_INT` integer locals, `int64_t _li[]`, inc/add/dec_loc fast paths |
 | [phase8-p82-self-recursive.md](phase8-p82-self-recursive.md) | P8.2: direct self-recursive C calls, `JIT_T_SELF_FUNC` gen_st marker, `unlikely` bug fix |
+| [phase8-p83-jit-to-jit.md](phase8-p83-jit-to-jit.md) | P8.3: `js_jit_call` vtable entry bypasses `JS_CallInternal` for JIT-compiled callees |
 
 ---
 
@@ -247,12 +248,12 @@ All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache,
 `qjs_interp` = JIT-disabled binary.  5 runs, min shown.
 
 ```
-Benchmark             Interp    JIT P8.2   Speedup   vs P8.1   Bottleneck
+Benchmark             Interp    JIT P8.3   Speedup   vs P8.2   Bottleneck
 ───────────────────────────────────────────────────────────────────────────────
-fib(30) ×1            112 ms      34 ms     3.3×     n/a†      direct self-calls
+fib(30) ×1            112 ms      28 ms     4.0×     +0.7×     self-recursive + JIT-to-JIT
 sum_loop(1e6) ×20     796 ms     940 ms     0.85×    same      let vars, no add_loc
-sum_sq(1e6) ×20       616 ms     284 ms     2.17×    +0.27     INT gen_st fusion
-count_primes ×10      7.59 ms   2.96 ms     2.56×    same      INT gen_st fusion
+sum_sq(1e6) ×20       616 ms     237 ms     2.60×    +0.43×    INT fusion + JIT-to-JIT callee
+count_primes ×10      7.59 ms   2.48 ms     3.06×    +0.50×    INT fusion + JIT-to-JIT callee
 arr_sum ×1000         345 ms     350 ms     0.99×    same      get_array_el vtable
 ```
 

@@ -216,8 +216,8 @@ const JSJITRuntime js_jit_rt = {
     .get_var_slow     = js_jit_op_get_var_slow,
     .get_array_el     = jit_rt_get_array_el,
     .set_array_el     = jit_rt_set_array_el,
-    /* calls */
-    .call             = jit_rt_call,
+    /* calls — P8.3: js_jit_call checks jit_func before falling to JS_Call */
+    .call             = js_jit_call,
     .call_constructor = jit_rt_call_constructor,
     /* exceptions */
     .throw_type_error = jit_rt_throw_type_error,

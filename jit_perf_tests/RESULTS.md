@@ -1167,3 +1167,48 @@ cd jit_perf_tests/v8bench
 
 Note: WSL2 variance is ±30% on v8bench; scores are not reliable for comparison.
 Individual micro-benchmarks are the reliable signal.
+
+---
+
+## Phase 8.3 — JIT-to-JIT Call Fast Path
+
+**Date:** 2026-04-02  
+**Binary:** `qjs_interp` (CONFIG_JIT=n) for interpreter baseline; `./qjs --jit-aot` for JIT.
+
+**Key change:** Replaced `jit_rt_call` vtable entry (a thin `JS_Call` wrapper) with
+`js_jit_call`, which checks whether the callee already has `jit_func != NULL` and
+calls it directly — bypassing `JS_Call → JS_CallInternal`.  Self-recursive calls
+(P8.2) still use zero-overhead direct C calls; this applies to all other JIT-to-JIT
+calls made through the `_RT->call` vtable entry.
+
+### Micro-benchmarks (5 runs each, min shown; `qjs_interp` for interp baseline)
+
+| Benchmark | Interp min | JIT P8.3 min | Speedup | vs P8.2 |
+|---|---:|---:|---:|---:|
+| fib(30) ×1 | 112 ms | 28 ms | **4.0×** | +0.7× |
+| sum_loop(1e6) ×20 | 796 ms | 940 ms | **0.85×** | same |
+| sum_sq(1e6) ×20 | 616 ms | 237 ms | **2.60×** | +0.43× |
+| count_primes(3000) ×10 | 7.59 ms | 2.48 ms | **3.06×** | +0.50× |
+| arr_sum(10000) ×1000 | 345 ms | 350 ms | **0.99×** | same |
+
+### Inter-function synthetic benchmark
+
+```js
+function square(x) { return x * x; }
+function sumSquares(n) { let s=0; for(let i=0;i<n;i++) s+=square(i); return s; }
+```
+
+| | Time |
+|---|---:|
+| Interpreter | 783 ms |
+| JIT P8.3 | 559 ms |
+| **Speedup** | **1.40×** |
+
+### V8 benchmark (best of 3, JIT AOT vs qjs_interp)
+
+| | Score |
+|---|---:|
+| JIT P8.3 best | 631 |
+| Pure interpreter best | 809 |
+
+Note: WSL2 variance is ±30% on v8bench.

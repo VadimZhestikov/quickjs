@@ -22,7 +22,7 @@ are regressions.  Phase 8 steps are ordered by impact-to-effort ratio.
   of `_RT->call`.  Eliminates argv dup + 3 refcount heap ops per recursive frame.
   *Fixes: fib regression (0.79× → expected ~2×)*
 
-- [ ] **P8.3 — Inline intra-module JIT-to-JIT calls**
+- [x] **P8.3 — Inline intra-module JIT-to-JIT calls**
   Generalize P8.2 to all callees whose `JSFunctionBytecode` is reachable in the
   current module's cpool at compile time.  For each such callee, emit an `extern`
   declaration for its `__jit_f_<hash>` symbol and call it directly, bypassing
