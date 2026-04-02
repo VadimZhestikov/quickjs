@@ -857,10 +857,12 @@ static struct {
     pthread_t       thread;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
+    pthread_cond_t  idle_cond;  /* signaled when head==NULL && !busy */
     JITGCCJob      *head;
     JITGCCJob      *tail;
     int             stop;
     int             started;
+    int             busy;       /* 1 while compiling a job */
     int             ref_count; /* how many JSRuntime instances share this thread */
 } jit_worker;
 
@@ -945,11 +947,15 @@ static void *jit_worker_thread(void *arg)
         JITGCCJob *job = jit_worker.head;
         jit_worker.head = job->next;
         if (!jit_worker.head) jit_worker.tail = NULL;
+        jit_worker.busy = 1;
         pthread_mutex_unlock(&jit_worker.lock);
         jit_compile_gcc_job(job);
         free(job);
 
         pthread_mutex_lock(&jit_worker.lock);
+        jit_worker.busy = 0;
+        if (!jit_worker.head)
+            pthread_cond_broadcast(&jit_worker.idle_cond);
     }
     pthread_mutex_unlock(&jit_worker.lock);
     return NULL;
@@ -963,8 +969,10 @@ void js_jit_init(void)
     }
     pthread_mutex_init(&jit_worker.lock, NULL);
     pthread_cond_init(&jit_worker.cond, NULL);
+    pthread_cond_init(&jit_worker.idle_cond, NULL);
     jit_worker.head = jit_worker.tail = NULL;
     jit_worker.stop = 0;
+    jit_worker.busy = 0;
     jit_worker.ref_count = 1;
     if (pthread_create(&jit_worker.thread, NULL, jit_worker_thread, NULL) == 0)
         jit_worker.started = 1;
@@ -991,6 +999,18 @@ void js_jit_free(void)
     jit_worker.head = jit_worker.tail = NULL;
     pthread_mutex_destroy(&jit_worker.lock);
     pthread_cond_destroy(&jit_worker.cond);
+    pthread_cond_destroy(&jit_worker.idle_cond);
+}
+
+/* Block until all enqueued GCC jobs have finished compiling.
+ * Called from --jit-aot mode before executing the compiled program. */
+void js_jit_drain(void)
+{
+    if (!jit_worker.started) return;
+    pthread_mutex_lock(&jit_worker.lock);
+    while (jit_worker.head || jit_worker.busy)
+        pthread_cond_wait(&jit_worker.idle_cond, &jit_worker.lock);
+    pthread_mutex_unlock(&jit_worker.lock);
 }
 
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)

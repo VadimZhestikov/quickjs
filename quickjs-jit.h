@@ -313,5 +313,19 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b);
  */
 void js_jit_free_bytecode(JSFunctionBytecode *b);
 
+/*
+ * js_jit_compile_all() — recursively enqueue all eligible nested functions
+ * in the bytecode tree rooted at b for GCC background compilation.
+ * Called in --jit-aot mode after JS_Eval(COMPILE_ONLY), before JS_EvalFunction.
+ */
+void js_jit_compile_all(JSContext *ctx, JSFunctionBytecode *b);
+
+/*
+ * js_jit_drain() — block until all enqueued GCC jobs have completed.
+ * Called in --jit-aot mode to ensure all functions are compiled before
+ * execution begins.
+ */
+void js_jit_drain(void);
+
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */

@@ -42,9 +42,14 @@
 
 #include "cutils.h"
 #include "quickjs-libc.h"
+#ifdef CONFIG_JIT
+#include "quickjs-jit.h"
+#endif
 
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
+
+static int jit_aot_mode = 0; /* set by --jit-aot */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -59,9 +64,30 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                       eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(val)) {
             js_module_set_import_meta(ctx, val, TRUE, TRUE);
+#ifdef CONFIG_JIT
+            if (jit_aot_mode) {
+                if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
+                    js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
+                js_jit_drain();
+            }
+#endif
             val = JS_EvalFunction(ctx, val);
         }
         val = js_std_await(ctx, val);
+    } else if (jit_aot_mode) {
+#ifdef CONFIG_JIT
+        /* Compile-only pass to gather all functions, then compile+execute */
+        val = JS_Eval(ctx, buf, buf_len, filename,
+                      eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(val)) {
+            if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
+                js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
+            js_jit_drain();
+            val = JS_EvalFunction(ctx, val);
+        }
+#else
+        val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
+#endif
     } else {
         val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
     }
@@ -307,7 +333,11 @@ void help(void)
            "    --no-unhandled-rejection  ignore unhandled promise rejections\n"
            "-s                    strip all the debug info\n"
            "    --strip-source    strip the source code\n"
-           "-q  --quit         just instantiate the interpreter and quit\n");
+           "-q  --quit         just instantiate the interpreter and quit\n"
+#ifdef CONFIG_JIT
+           "    --jit-aot      compile all functions with GCC before running\n"
+#endif
+           );
     exit(1);
 }
 
@@ -441,6 +471,12 @@ int main(int argc, char **argv)
                 strip_flags = JS_STRIP_SOURCE;
                 continue;
             }
+#ifdef CONFIG_JIT
+            if (!strcmp(longopt, "jit-aot")) {
+                jit_aot_mode = 1;
+                continue;
+            }
+#endif
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {

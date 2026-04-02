@@ -15870,6 +15870,23 @@ int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot)
     return 0;
 }
 
+/* Recursively enqueue all eligible bytecode functions for GCC compilation.
+ * Walks the cpool tree to find nested function definitions.
+ * Called from --jit-aot mode after parsing, before execution. */
+void js_jit_compile_all(JSContext *ctx, JSFunctionBytecode *b)
+{
+    int i;
+    if (!b) return;
+    if (js_jit_is_eligible(b) && !js_jit_fb_jit_no_compile(b) &&
+        js_jit_fb_get_func(b) == NULL) {
+        js_jit_queue_gcc(ctx, b);
+    }
+    for (i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+            js_jit_compile_all(ctx, JS_VALUE_GET_PTR(b->cpool[i]));
+    }
+}
+
 #endif /* CONFIG_JIT */
 
 static __exception int js_has_unscopable(JSContext *ctx, JSValueConst obj,
