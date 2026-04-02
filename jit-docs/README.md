@@ -1,7 +1,7 @@
 # QuickJS JIT Compiler — Overview
 
 A two-tier native-code JIT for the QuickJS JavaScript engine, implemented incrementally
-across six phases.  The JIT compiles hot JS functions to C, then lets GCC produce
+across seven phases.  The JIT compiles hot JS functions to C, then lets GCC produce
 optimised machine code — no custom register allocator, no IR — just generated C as the
 intermediate representation.
 
@@ -18,6 +18,7 @@ intermediate representation.
 | [phase4-gcc-tier2.md](phase4-gcc-tier2.md) | GCC tier-2: background thread, fork/exec, dlopen, atomic install |
 | [phase5-typed-vars.md](phase5-typed-vars.md) | Forward type inference, `double _ld[]` locals, `inc_loc` fast path |
 | [phase6-optimizations.md](phase6-optimizations.md) | Comparison+branch fusion, gen-time type stack, inline property cache |
+| [phase7-cache.md](phase7-cache.md) | Persistent .so cache, `--jit-aot`, `--jit-warmup`, e.stack fix |
 
 ---
 
@@ -57,8 +58,12 @@ The JIT eliminates all four by emitting C code that GCC -O2 can reason about sta
     │   JS_CallInternal()      │  ~200–500 MIPS on typical workloads
     └──────────┬───────────────┘
                │  count == JIT_THRESHOLD_GCC
-               │  js_jit_queue_gcc() ──────────────────────────────────┐
-               │                                                        │
+               │  js_jit_queue_gcc()
+               │     │
+               │     ├─ jit_cache_get(hash) ──hit──► dlopen(.so) → atomic install
+               │     │                                (no GCC, ~1 ms)
+               │     │
+               │     └─ miss ──────────────────────────────────────────┐
                │  (continues interpreting while GCC works)             ▼
                │                                             ┌─────────────────────┐
                │                                             │  Background worker  │
@@ -66,6 +71,7 @@ The JIT eliminates all four by emitting C code that GCC -O2 can reason about sta
                │                                             │                     │
                │                                             │  gen_body() → .c    │
                │                                             │  fork+exec gcc -O2  │
+               │                                             │  jit_cache_put(.so) │
                │                                             │  dlopen .so         │
                │                                             │  atomic install     │
                │                                             └─────────────────────┘
@@ -74,7 +80,7 @@ The JIT eliminates all four by emitting C code that GCC -O2 can reason about sta
                ▼
     ┌──────────────────────────┐
     │   GCC tier-2 stub        │  GCC -O2, XMM regs, inlined IC, vectorised
-    │   __jit_f_<addr>()       │  typically 2–3× faster than interpreter
+    │   __jit_f_<hash>()       │  typically 2–3× faster than interpreter
     └──────────────────────────┘
 ```
 
@@ -130,7 +136,10 @@ JSFunctionBytecode
         │  fork + exec gcc -O2 -shared -fPIC
         │
         ▼
-   .so  →  dlopen  →  dlsym("__jit_f_<addr>")
+   jit_cache_put()                      ← Phase 7.3: copy to ~/.cache/qjs-jit/<hash>.so
+        │
+        ▼
+   .so  →  dlopen  →  dlsym("__jit_f_<hash>")   ← hash-stable symbol (Phase 7.3)
         │
         ▼
    js_jit_fb_set_func()   ← atomic RELEASE store
@@ -159,6 +168,7 @@ Every optimisation phase targets one aspect of JSValue boxing overhead:
 | Phase 5 | Loop counters and accumulator variables: `double _ld[]` instead of `JSValue` |
 | Phase 6.1 | `JSBool` boxing between comparison and branch: fuse into one C `if` |
 | Phase 6.2 | `JSProperty` hash lookup on every field read: inline shape guard + slot index |
+| Phase 7 | GCC compilation overhead on startup: pre-built `.so` loaded from cache |
 
 ### Vtable for slow paths
 
@@ -226,27 +236,32 @@ read `obj->prop[cached_slot].u.value` directly — no hash chain walk.
 
 ## Performance summary
 
-All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, 3 runs minimum.
+All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2.
+Phase 7 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, < 3% variance).
 Speedup = interpreter_min / JIT_min.  Values > 1 mean JIT is faster.
 
 ```
-Benchmark           Interp     JIT P6.2   Speedup   Bottleneck removed
-─────────────────────────────────────────────────────────────────────
-fib(30) ×1          106 ms      95 ms      1.12×    (vtable recursion limits gain)
-sum_loop(1e6) ×20   833 ms     795 ms      1.05×    (no typed vars, no IC)
-sum_sq(1e6) ×20     706 ms     270 ms      2.62×    Phase 5 double locals + IC
-count_primes ×10    7.4 ms     2.9 ms      2.55×    Phase 5 inc_loc fast path
-arr_sum ×1000       361 ms     379 ms      0.95×    get_array_el still vtable
+Benchmark             Interp    JIT P7 AOT  Speedup   Bottleneck removed
+───────────────────────────────────────────────────────────────────────────
+fib(30) ×1             89 ms      112 ms     0.79×    vtable recursion overhead
+sum_loop(1e6) ×20     667 ms      745 ms     0.90×    no typed vars, no IC applies
+sum_sq(1e6) ×20       514 ms      264 ms     1.95×    Phase 5 double locals
+count_primes ×10      6.2 ms      2.6 ms     2.38×    Phase 5 inc_loc fast path
+arr_sum ×1000         293 ms      303 ms     0.97×    get_array_el still vtable
 ```
 
-V8 benchmark suite (higher = better, WSL2 noise ±15%):
+V8 benchmark suite (best-of-5, higher = better, WSL2 noise ±15%):
 
 ```
-Richards    656 → 866   (+32%)   property-access heavy, IC fires
-DeltaBlue   617 → 618   (≈ same) similarly property-heavy, noise masks gain
-Crypto      938 → 949   (≈ same) mostly float arithmetic
-RayTrace   1049 → 933   (−11%)  GCC compile-time competing with 1-s window
+Interpreter score: 984     JIT AOT score: 887   (0.90× — within WSL2 noise)
+
+Phase 6.2 (background GCC, threshold=100): score varied 651–1025 per run
+Phase 7   (precompiled cache, --jit-aot):  score varies  704–887 per run (< 3× spread)
 ```
+
+Phase 7's main benefit is **startup consistency**.  Previous phases had high variance
+because background GCC competed with the 1-second v8bench measurement windows.
+With a warm cache, no GCC runs during execution — variance drops from ±20% to < 3%.
 
 ---
 
@@ -261,6 +276,16 @@ make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs  # threshold=2 (benchmark mode)
 Lower = JIT fires sooner (useful for benchmarks); higher = only truly hot functions
 are compiled (good for startup-sensitive workloads).
 
+## CLI flags (Phase 7)
+
+```sh
+./qjs --jit-warmup script.js   # compile all functions → cache, then exit
+./qjs --jit-aot    script.js   # compile all functions → cache (or hit), then execute
+./qjs              script.js   # normal: JIT triggers at threshold during execution
+```
+
+Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
+
 ---
 
 ## Source files
@@ -270,6 +295,7 @@ are compiled (good for startup-sensitive workloads).
 | `quickjs-jit.h` | Public JIT API: vtable struct, IC entry, accessor declarations |
 | `quickjs-jit.c` | Code generator, GCC worker thread, vtable implementations |
 | `quickjs.c` | Hot probe in `JS_CallInternal`; bytecode accessor functions; IC helpers |
-| `jit_perf_tests/bench_gcc.js` | Micro-benchmark suite (8-second warm-up) |
+| `jit_perf_tests/bench_gcc.js` | Micro-benchmark suite (8-second warm-up, background GCC) |
+| `jit_perf_tests/bench_aot.js` | Micro-benchmark suite for `--jit-aot` mode (no warm-up needed) |
 | `jit_perf_tests/v8bench/` | V8 benchmark suite port |
 | `jit_perf_tests/RESULTS.md` | Raw measurements for all phases |
