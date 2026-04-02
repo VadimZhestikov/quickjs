@@ -143,6 +143,14 @@ typedef struct JSJITRuntime {
     JSValue (*throw_type_error)(JSContext *, const char *fmt, ...);
     /* Throw an arbitrary value (takes ownership of val) */
     JSValue (*throw_val)(JSContext *, JSValue val);
+
+    /* ------------------------------------------------------------------ */
+    /* P8.2 — interrupt poll for direct self-recursive JIT calls           */
+    /* ------------------------------------------------------------------ */
+    /* Mirrors js_poll_interrupts (static inline in quickjs.c).
+     * Called once per direct recursive call to honour JS_SetInterruptHandler.
+     * Returns non-zero and sets an exception on the context if interrupted. */
+    int (*poll_interrupts)(JSContext *);
 } JSJITRuntime;
 
 /*
@@ -190,6 +198,10 @@ int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
 const uint8_t *js_jit_get_opcode_size_table(int *count);
 /* Function name as a C string (static buf — for debug/logging only) */
 const char    *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b);
+/* P8.2: function's own name atom (JS_ATOM_NULL if anonymous) */
+JSAtom         js_jit_fb_get_func_atom(JSFunctionBytecode *b);
+/* P8.2: interrupt poll — wraps js_poll_interrupts (static inline) for vtable use */
+int            js_jit_poll_interrupts(JSContext *ctx);
 #endif
 
 /* ======================================================================= */

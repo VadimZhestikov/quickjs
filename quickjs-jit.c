@@ -222,6 +222,8 @@ const JSJITRuntime js_jit_rt = {
     /* exceptions */
     .throw_type_error = jit_rt_throw_type_error,
     .throw_val        = jit_rt_throw_val,
+    /* P8.2: interrupt poll for direct self-recursive calls */
+    .poll_interrupts  = js_jit_poll_interrupts,
 };
 
 /* -----------------------------------------------------------------------
@@ -585,9 +587,13 @@ static inline uint16_t bc_u16(const uint8_t *p) {
     return (uint16_t)p[0]|((uint16_t)p[1]<<8);
 }
 
-#define JIT_T_JSVAL  0  /* unknown — always use JSValue */
-#define JIT_T_NUMBER 1  /* provably always numeric — use C double */
-#define JIT_T_INT    2  /* provably always integral — use int64_t _li[] */
+#define JIT_T_JSVAL    0  /* unknown — always use JSValue */
+#define JIT_T_NUMBER   1  /* provably always numeric — use C double */
+#define JIT_T_INT      2  /* provably always integral — use int64_t _li[] */
+/* P8.2 gen_st marker: the value in this stack slot came from a self-recursive
+ * OP_get_var.  Used to detect self-recursive call patterns at codegen time so
+ * the call can be emitted as a direct C function call instead of _RT->call. */
+#define JIT_T_SELF_FUNC 3
 
 /*
  * jit_infer_types() — returns malloc'd uint8_t[var_count] or NULL.
@@ -1363,7 +1369,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     int var_count, int arg_count, int stack_size,
                     int *unsupported_out,
                     const uint8_t *local_type,
-                    JSFunctionBytecode *b)
+                    JSFunctionBytecode *b,
+                    uint64_t bc_hash)
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -1385,6 +1392,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #define _GS_TOP()   (gen_sp > 0 ? gen_st[gen_sp-1]   : (uint8_t)JIT_T_JSVAL)
 #define _GS_TOP2()  (gen_sp > 1 ? gen_st[gen_sp-2]   : (uint8_t)JIT_T_JSVAL)
 #define _GS_DROP(n) do { gen_sp -= (n); if (gen_sp < 0) gen_sp = 0; } while(0)
+
+    /* P8.2: self-recursive direct call detection.
+     * self_func_atom is the function's own name atom.  When OP_get_var loads a
+     * closure var whose atom matches self_func_atom, the gen_st slot is marked
+     * JIT_T_SELF_FUNC.  When OP_call* sees that the function slot has that
+     * marker, we emit a direct C call to __jit_f_<hash> instead of _RT->call.
+     * self_jit_sym is the stable symbol name already emitted by gen_preamble. */
+    JSAtom self_func_atom = js_jit_fb_get_func_atom(b);
+    char   self_jit_sym[32];
+    snprintf(self_jit_sym, sizeof(self_jit_sym), "__jit_f_%016llx",
+             (unsigned long long)bc_hash);
 
     while (pc < bc_len) {
         /* Emit label if this offset is a branch target.
@@ -1701,7 +1719,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             int    cv_is_lex   = js_jit_fb_get_closure_var_is_lexical(b, idx);
             jit_buf_printf(cb,
                 "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
-                "      if(unlikely(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED)){\n"
+                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED){\n"
                 "        JSValue _r=_RT->get_var_slow(ctx,%uu,%d);\n"
                 "        _CHK(_r); _s[_sp++]=_r;\n"
                 "      } else _s[_sp++]=_DUP(*_pv); }\n",
@@ -2345,15 +2363,35 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             else
                 nargs = op - OP_call0;
             /* stack: func arg0 arg1 ... argN-1
-             * After call: func and args consumed, result pushed            */
-            jit_buf_printf(cb,
-                "    { int _n=%d;\n"
-                "      JSValue _f=_s[_sp-1-_n];\n"
-                "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
-                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                "      _sp -= _n+1; _FREE(_f);\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n",
-                nargs);
+             * After call: func and args consumed, result pushed.
+             *
+             * P8.2: If the function slot in gen_st is JIT_T_SELF_FUNC, emit a
+             * direct C call to self rather than going through _RT->call.
+             * We still poll interrupts to honour JS_SetInterruptHandler.       */
+            {
+                int func_slot = gen_sp - 1 - nargs;
+                int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
+                if (is_self) {
+                    jit_buf_printf(cb,
+                        "    { int _n=%d;\n"
+                        "      JSValue _f=_s[_sp-1-_n];\n"
+                        "      if(_RT->poll_interrupts(ctx)) goto _ex;\n"
+                        "      JSValue _r=%s(ctx,JS_UNDEFINED,_n,&_s[_sp-_n],cpool,var_refs);\n"
+                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
+                        "      _sp -= _n+1; _FREE(_f);\n"
+                        "      _CHK(_r); _s[_sp++]=_r; }\n",
+                        nargs, self_jit_sym);
+                } else {
+                    jit_buf_printf(cb,
+                        "    { int _n=%d;\n"
+                        "      JSValue _f=_s[_sp-1-_n];\n"
+                        "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
+                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
+                        "      _sp -= _n+1; _FREE(_f);\n"
+                        "      _CHK(_r); _s[_sp++]=_r; }\n",
+                        nargs);
+                }
+            }
             break;
         }
         case OP_call_method: {
@@ -2393,15 +2431,31 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_tail_call: {
             int nargs = (int)bc_u16(&bc[pc+1]);
-            /* treat tail calls as regular calls for correctness */
-            jit_buf_printf(cb,
-                "    { int _n=%d;\n"
-                "      JSValue _f=_s[_sp-1-_n];\n"
-                "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
-                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                "      _sp -= _n+1; _FREE(_f);\n"
-                "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
-                nargs);
+            /* P8.2: self-recursive tail call → direct C call */
+            {
+                int func_slot = gen_sp - 1 - nargs;
+                int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
+                if (is_self) {
+                    jit_buf_printf(cb,
+                        "    { int _n=%d;\n"
+                        "      JSValue _f=_s[_sp-1-_n];\n"
+                        "      if(_RT->poll_interrupts(ctx)) goto _ex;\n"
+                        "      JSValue _r=%s(ctx,JS_UNDEFINED,_n,&_s[_sp-_n],cpool,var_refs);\n"
+                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
+                        "      _sp -= _n+1; _FREE(_f);\n"
+                        "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                        nargs, self_jit_sym);
+                } else {
+                    jit_buf_printf(cb,
+                        "    { int _n=%d;\n"
+                        "      JSValue _f=_s[_sp-1-_n];\n"
+                        "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
+                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
+                        "      _sp -= _n+1; _FREE(_f);\n"
+                        "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                        nargs);
+                }
+            }
             if (var_count > 0)
                 jit_buf_printf(cb,
                     "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
@@ -2532,6 +2586,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             /* --- get_arg: always JSVAL (unknown call-site type) --- */
             case OP_get_arg:  case OP_get_arg0: case OP_get_arg1:
             case OP_get_arg2: case OP_get_arg3:
+                _gs_push = JIT_T_JSVAL; break;
+
+            /* --- get_var: SELF_FUNC if loading the function's own name, else JSVAL.
+             * P8.2: marks the stack slot so OP_call* can emit a direct C call. --- */
+            case OP_get_var: {
+                int _vi = (int)bc_u16(&bc[pc+1]);
+                JSAtom _va = js_jit_fb_get_closure_var_atom(b, _vi);
+                _gs_push = (self_func_atom != JS_ATOM_NULL && _va == self_func_atom)
+                           ? JIT_T_SELF_FUNC : JIT_T_JSVAL;
+                break;
+            }
+            /* get_var_ref* also push JSVAL (never self-func) */
+            case OP_get_var_ref: case OP_get_var_ref_check:
+            case OP_get_var_ref0: case OP_get_var_ref1:
+            case OP_get_var_ref2: case OP_get_var_ref3:
                 _gs_push = JIT_T_JSVAL; break;
 
             /* --- get_length: NUMBER (array length is always a non-neg int) --- */
@@ -2698,7 +2767,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
-                 var_count, arg_count, stack_size, &unsup, local_type, b) < 0) {
+                 var_count, arg_count, stack_size, &unsup, local_type, b, bc_hash) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

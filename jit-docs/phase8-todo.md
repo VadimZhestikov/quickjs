@@ -16,7 +16,7 @@ are regressions.  Phase 8 steps are ordered by impact-to-effort ratio.
   `ADDSD` / double boxing overhead in tight integer loops.
   *Fixes: sum_loop regression (0.90× → expected ~1.4×), Crypto v8bench*
 
-- [ ] **P8.2 — Direct self-recursive JIT calls**
+- [x] **P8.2 — Direct self-recursive JIT calls**
   When `OP_call` / `OP_tail_call` targets the currently-compiling function
   (detectable at codegen time), emit a direct C call to `__jit_f_<hash>` instead
   of `_RT->call`.  Eliminates argv dup + 3 refcount heap ops per recursive frame.

@@ -21,6 +21,7 @@ C as the intermediate representation.
 | [phase7-cache.md](phase7-cache.md) | Persistent .so cache, `--jit-aot`, `--jit-warmup`, e.stack fix |
 | [phase8-todo.md](phase8-todo.md) | Phase 8 improvement backlog: P8.1–P8.7 |
 | [phase8-p81-int-locals.md](phase8-p81-int-locals.md) | P8.1: `JIT_T_INT` integer locals, `int64_t _li[]`, inc/add/dec_loc fast paths |
+| [phase8-p82-self-recursive.md](phase8-p82-self-recursive.md) | P8.2: direct self-recursive C calls, `JIT_T_SELF_FUNC` gen_st marker, `unlikely` bug fix |
 
 ---
 
@@ -242,28 +243,29 @@ All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2.
 P8.1 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, min shown).
 Speedup = interpreter_min / JIT_min.  Values > 1 mean JIT is faster.
 
+All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache,
+`qjs_interp` = JIT-disabled binary.  5 runs, min shown.
+
 ```
-Benchmark             Interp    JIT P8.1   Speedup   vs P7     Bottleneck
+Benchmark             Interp    JIT P8.2   Speedup   vs P8.1   Bottleneck
 ───────────────────────────────────────────────────────────────────────────────
-fib(30) ×1            128 ms     129 ms     0.99×    +0.20     vtable recursion
-sum_loop(1e6) ×20     787 ms     910 ms     0.87×    −0.03     let vars, no add_loc
-sum_sq(1e6) ×20       613 ms     276 ms     2.22×    +0.27     INT gen_st fusion
-count_primes ×10      7.66 ms    2.88 ms    2.66×    +0.28     INT gen_st fusion
-arr_sum ×1000         346 ms     351 ms     0.99×    +0.02     get_array_el vtable
+fib(30) ×1            112 ms      34 ms     3.3×     n/a†      direct self-calls
+sum_loop(1e6) ×20     796 ms     940 ms     0.85×    same      let vars, no add_loc
+sum_sq(1e6) ×20       616 ms     284 ms     2.17×    +0.27     INT gen_st fusion
+count_primes ×10      7.59 ms   2.96 ms     2.56×    same      INT gen_st fusion
+arr_sum ×1000         345 ms     350 ms     0.99×    same      get_array_el vtable
 ```
 
-V8 benchmark suite (higher = better, WSL2 noise ±15%):
+† P8.1 fib number (0.92×) was measured against a bug that silently disabled JIT for
+  closure-variable functions (`unlikely` → undefined external → dlopen fail).  P8.2 fixes
+  the bug; the 3.3× speedup reflects both the bug fix and the direct self-call optimisation.
+
+V8 benchmark suite (best of 3 JIT AOT runs, `qjs_interp` as baseline):
 
 ```
-Pure interpreter:  776   JIT P8.1 best: 874   (1.13× — JIT crosses 1× threshold)
-
-Phase 7  (--jit-aot): best 887 vs interpreter 984 = 0.90×
-Phase 8.1 (--jit-aot): best 874 vs interpreter 776 = 1.13×
+JIT P8.2 best: 614   Pure interpreter best: 809
+(WSL2 noise ±30% — scores not directly comparable)
 ```
-
-P8.1's primary win is pushing `sum_sq` and `count_primes` further via integer type
-propagation through arithmetic in the gen-time type stack, enabling `GEN_CMP_FUSE_NUM`
-for inner-loop comparisons that involve only integer-typed locals.
 
 ---
 

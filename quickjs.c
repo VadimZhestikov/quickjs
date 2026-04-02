@@ -15676,6 +15676,10 @@ JSValue js_jit_op_get_var_slow(JSContext *ctx, JSAtom atom, int is_lexical)
     return val;
 }
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
+JSAtom   js_jit_fb_get_func_atom(JSFunctionBytecode *b)  { return b->func_name; }
+/* P8.2: interrupt poll wrapper — allows generated C to call js_poll_interrupts
+ * (which is static inline) through the vtable without exposing internals.    */
+int      js_jit_poll_interrupts(JSContext *ctx)           { return js_poll_interrupts(ctx); }
 /* Returns function name as a C string (caller must NOT free - static buffer). */
 const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
 {

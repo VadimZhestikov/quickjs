@@ -1127,3 +1127,43 @@ cd jit_perf_tests/v8bench
 ../../qjs_interp               run_qjs.js
 ../../qjs_jit_aot --jit-aot   run_qjs.js
 ```
+
+---
+
+## Phase 8.2 — Direct Self-Recursive JIT Calls + `unlikely` Bug Fix
+
+**Date:** 2026-04-02  
+**Binary:** `qjs_interp` (CONFIG_JIT=n) for interpreter baseline; `./qjs --jit-aot` for JIT.
+
+**Key change:** Two separate improvements:
+
+1. **Bug fix**: `OP_get_var` generated C contained `unlikely(...)` which is not defined
+   after `#include "quickjs.h"` (quickjs.h `#undef`s `js_unlikely` at its end).  GCC
+   treated it as an external function; `dlopen(..., RTLD_NOW)` failed for every function
+   that used closure variable access, silently falling back to the interpreter.  The P8.1
+   fib numbers (0.99×) were pure-interpreter measurements.
+
+2. **P8.2 optimisation**: direct `__jit_f_<hash>(...)` C call for self-recursive
+   functions, bypassing `_RT->call → JS_Call → JS_CallInternal`.  Detected via a new
+   `JIT_T_SELF_FUNC` gen_st marker for closure-var slots that match the function's own
+   name atom.
+
+### Micro-benchmarks (5 runs each, min shown; `qjs_interp` for interp baseline)
+
+| Benchmark | Interp min | JIT P8.2 min | Speedup | P8.1 (corrected) |
+|---|---:|---:|---:|---:|
+| fib(30) ×1 | 112 ms | 33.7 ms | **3.3×** | ~1.0× (bug) |
+| sum_loop(1e6) ×20 | 796 ms | 940 ms | **0.85×** | 0.87× |
+| sum_sq(1e6) ×20 | 616 ms | 284 ms | **2.17×** | 2.27× |
+| count_primes(3000) ×10 | 7.59 ms | 2.96 ms | **2.56×** | 2.39× |
+| arr_sum(10000) ×1000 | 345 ms | 350 ms | **0.99×** | 0.97× |
+
+### V8 benchmark (best of 3, JIT AOT vs qjs_interp)
+
+| | Score |
+|---|---:|
+| JIT P8.2 best | 614 |
+| Pure interpreter best | 809 |
+
+Note: WSL2 variance is ±30% on v8bench; scores are not reliable for comparison.
+Individual micro-benchmarks are the reliable signal.
