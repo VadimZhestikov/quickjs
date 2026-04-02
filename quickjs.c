@@ -17817,10 +17817,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * array even when JS_CALL_FLAG_COPY_ARGV was set.
              * If we made copies (arg_allocated_size > 0), free them
              * after the call — mirroring what the interpreter's done:
-             * path does via the local_buf..sp loop.              */
-            rt->current_stack_frame = sf->prev_frame;
+             * path does via the local_buf..sp loop.
+             *
+             * Keep sf in rt->current_stack_frame while the JIT runs so
+             * that exceptions thrown from JIT code (or functions it calls)
+             * include this function in e.stack.  Set cur_pc to the start of
+             * the bytecode — the JIT does not track PC so we cannot give an
+             * exact line, but the function name and source file appear. */
+            sf->cur_pc = pc; /* pc == b->byte_code_buf at this point */
             JSValue jit_ret = jf(ctx, (JSValue)this_obj, sf->arg_count,
                                  arg_buf, b->cpool, var_refs);
+            rt->current_stack_frame = sf->prev_frame;
             if (unlikely(arg_allocated_size)) {
                 for (i = 0; i < arg_allocated_size; i++)
                     JS_FreeValue(ctx, arg_buf[i]);
