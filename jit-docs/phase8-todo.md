@@ -30,14 +30,14 @@ are regressions.  Phase 8 steps are ordered by impact-to-effort ratio.
   *Largest single gain for v8bench: Richards, DeltaBlue, EarleyBoyer spend most
   time in short intra-module methods calling each other*
 
-- [ ] **P8.4 — Integer argument type guards at function entry**
+- [x] **P8.4 — Integer argument type guards at function entry**
   Add a generated preamble check: for each argument, if `JS_VALUE_GET_TAG(argv[i])
   == JS_TAG_INT`, extract to a local `int32_t _ai[]` and use it throughout.  On tag
   mismatch (rare) fall through to the `JSValue` slow path.  Enables functions like
   `fib(n)` to treat the argument as `int32_t` without caller-side type information.
   *Prerequisite for P8.1+P8.2 to fully eliminate boxing in argument-taking functions*
 
-- [ ] **P8.5 — Array element inline cache for `OP_get_array_el` / `OP_set_array_el`**
+- [x] **P8.5 — Array element inline cache for `OP_get_array_el` / `OP_set_array_el`**
   Phase 6.2 caches `get_field` but not array index access.  For dense arrays
   (`class_id == JS_CLASS_ARRAY`, integer index in range), emit an inline guard and
   direct `prop[index].u.value` read/write, matching the interpreter's `fast_array`
