@@ -673,7 +673,7 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_get_field:    _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
             case OP_get_field2:                 _TI_PUSH(JIT_T_JSVAL); break;
             case OP_get_array_el: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
-            case OP_get_length:   _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_get_length:   _TI_DROPN(1); _TI_PUSH(JIT_T_NUMBER); break;
             case OP_object:                     _TI_PUSH(JIT_T_JSVAL); break;
             case OP_array_from: {
                 int n = (int)bc_u16(&bc[pc+1]); _TI_DROPN(n); _TI_PUSH(JIT_T_JSVAL); break;
@@ -1138,6 +1138,60 @@ static void gen_footer(JSJITCodeBuf *cb, int var_count)
         "}\n");
 }
 
+/* =======================================================================
+ * Phase 6.1 — Comparison+branch fusion helper
+ *
+ * When a comparison opcode (lt/lte/gt/gte/eq/neq/strict_eq/strict_neq) is
+ * immediately followed by if_false or if_true, and the if_false/if_true
+ * bytecode offset is NOT itself a branch target (i.e. nothing else jumps
+ * directly to the if_false instruction), we can fuse the two into a single
+ * C block that avoids creating a JSValue bool on the stack.
+ *
+ * Savings per loop iteration:
+ *   - JS_NewBool() call eliminated (was a JSValue push)
+ *   - _s[_sp++] / _s[--_sp] pair eliminated
+ *   - _BOOL() macro + _FREE() call eliminated
+ *   - When both operands are NUMBER: vtable lt/lte/gt/gte call eliminated;
+ *     direct double comparison used instead.
+ * ======================================================================= */
+typedef struct {
+    int fuse;      /* 1 = fusion possible */
+    int tgt;       /* branch target pc */
+    int negate;    /* 1 = if_false (jump when !cond), 0 = if_true (jump when cond) */
+    int extra_sz;  /* size of the if_false/if_true instruction to skip */
+} JitFuseInfo;
+
+static JitFuseInfo
+jit_check_fuse(const uint8_t *bc, int next_pc, int bc_len,
+               const uint8_t *op_sz, const JSJITScanResult *sr)
+{
+    JitFuseInfo fi = {0, 0, 0, 0};
+    if (next_pc >= bc_len) return fi;
+    /* Only fuse if the if_false/if_true opcode is not itself a jump target —
+     * otherwise we must emit its label and cannot skip it. */
+    if (scan_is_target(sr, next_pc)) return fi;
+
+    int nop = bc[next_pc];
+    if (nop == OP_if_false) {
+        fi.fuse = 1; fi.negate = 1;
+        fi.tgt = next_pc + 1 + (int)(int32_t)bc_u32(&bc[next_pc + 1]);
+        fi.extra_sz = op_sz[OP_if_false];
+    } else if (nop == OP_if_true) {
+        fi.fuse = 1; fi.negate = 0;
+        fi.tgt = next_pc + 1 + (int)(int32_t)bc_u32(&bc[next_pc + 1]);
+        fi.extra_sz = op_sz[OP_if_true];
+    } else if (nop == OP_if_false8) {
+        fi.fuse = 1; fi.negate = 1;
+        fi.tgt = next_pc + 1 + (int)(int8_t)bc[next_pc + 1];
+        fi.extra_sz = op_sz[OP_if_false8];
+    } else if (nop == OP_if_true8) {
+        fi.fuse = 1; fi.negate = 0;
+        fi.tgt = next_pc + 1 + (int)(int8_t)bc[next_pc + 1];
+        fi.extra_sz = op_sz[OP_if_true8];
+    }
+    return fi;
+}
+
 /*
  * Main code generator: iterates over the bytecode and emits a C statement
  * for each opcode.  Unsupported opcodes set *unsupported=1 and return -1.
@@ -1145,22 +1199,45 @@ static void gen_footer(JSJITCodeBuf *cb, int var_count)
 static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     const JSJITScanResult *sr,
                     const uint8_t *op_sz, int op_sz_count,
-                    int var_count, int arg_count,
+                    int var_count, int arg_count, int stack_size,
                     int *unsupported_out,
                     const uint8_t *local_type)
 {
     *unsupported_out = 0;
     int pc = 0;
 
+    /* Phase 6.1: gen-time type stack.  Tracks the abstract type (JIT_T_NUMBER
+     * or JIT_T_JSVAL) of each slot on the value stack during code generation.
+     * Used to select optimised comparison paths and to enable comparison+branch
+     * fusion.  Conservative: reset to all-JSVAL at every branch target. */
+    int gen_stk_cap = (stack_size < 4 ? 4 : stack_size) + 8;
+    uint8_t *gen_st = (uint8_t *)calloc(gen_stk_cap, 1);
+    int gen_sp = 0;
+    if (!gen_st) {
+        *unsupported_out = 0;
+        return -1;
+    }
+
+#define _GS_PUSH(t) do { if (gen_sp < gen_stk_cap) gen_st[gen_sp++] = (uint8_t)(t); } while(0)
+#define _GS_POP()   (gen_sp > 0 ? gen_st[--gen_sp] : (uint8_t)JIT_T_JSVAL)
+#define _GS_TOP()   (gen_sp > 0 ? gen_st[gen_sp-1]   : (uint8_t)JIT_T_JSVAL)
+#define _GS_TOP2()  (gen_sp > 1 ? gen_st[gen_sp-2]   : (uint8_t)JIT_T_JSVAL)
+#define _GS_DROP(n) do { gen_sp -= (n); if (gen_sp < 0) gen_sp = 0; } while(0)
+
     while (pc < bc_len) {
-        /* Emit label if this offset is a branch target */
-        if (scan_is_target(sr, pc))
+        /* Emit label if this offset is a branch target.
+         * Also reset gen_st conservatively — multiple control-flow paths merge
+         * here so we cannot assume the type stack is consistent. */
+        if (scan_is_target(sr, pc)) {
+            memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
+            gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
+        }
 
         int op = bc[pc];
         if (op >= op_sz_count || op_sz[op] == 0) {
             fprintf(stderr, "[JIT] unsupported opcode 0x%02x at pc=%d\n", op, pc);
-            *unsupported_out = 1; return -1;
+            *unsupported_out = 1; free(gen_st); return -1;
         }
         int sz = op_sz[op];
 
@@ -1705,67 +1782,198 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
-        /* ---- Comparisons with inline int fast paths ---- */
-#define GEN_CMP_INT(int_op, rt_name) \
+        /* ---- Comparisons (Phase 6.1: fused branch + NUMBER-aware paths) ----
+         *
+         * For each comparison opcode we try to fuse with the immediately
+         * following if_false / if_true / if_false8 / if_true8.  If fusion is
+         * possible (next opcode is a branch AND the branch pc is not itself a
+         * jump target), we emit a single C block that avoids creating a JSBool
+         * on the stack and saves a push/pop pair.
+         *
+         * When both stack operands are typed NUMBER (INT or FLOAT64) by the
+         * gen-time type stack, we additionally skip the slow vtable path and
+         * use direct double arithmetic, which is always correct for INT/FLOAT64
+         * values and handles FLOAT64 operands that the old INT-only fast path
+         * could not reach.                                                     */
+
+/* Helper: emit fused NUMBER×NUMBER comparison+branch.
+ * _va = first pushed (left operand), _vb = second pushed (right operand). */
+#define GEN_CMP_FUSE_NUM(c_op, ftgt, fneg) \
     jit_buf_printf(cb, \
+        "    { JSValue _va=_s[_sp-2],_vb=_s[_sp-1]; _sp-=2;\n" \
+        "      double _da=(JS_VALUE_GET_TAG(_va)==JS_TAG_INT)" \
+                         "?(double)JS_VALUE_GET_INT(_va):JS_VALUE_GET_FLOAT64(_va);\n" \
+        "      double _db=(JS_VALUE_GET_TAG(_vb)==JS_TAG_INT)" \
+                         "?(double)JS_VALUE_GET_INT(_vb):JS_VALUE_GET_FLOAT64(_vb);\n" \
+        "      if(%s(_da " c_op " _db)) goto _L%d; }\n", \
+        (fneg)?"!":"", (ftgt))
+
+/* Helper: emit fused general comparison+branch with INT fast path.
+ * rt_call: full vtable call expression, e.g. "_RT->lt(ctx,_a,_b)" */
+#define GEN_CMP_FUSE_GEN(int_op, rt_call, ftgt, fneg) \
+    jit_buf_printf(cb, \
+        "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n" \
+        "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
+        "        _cond=(JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
+        "      else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
+        "      if(%s_cond) goto _L%d; }\n", \
+        (fneg)?"!":"", (ftgt))
+
+/* Helper: unfused comparison (produces BOOL on stack) with INT fast path */
+#define GEN_CMP_UNFUSED(int_op, rt_call_or_expr) \
+    jit_buf_str(cb, \
         "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
         "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
-        "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b));\n" \
-        "      else { JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n", \
-        int_op, rt_name)
+        "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
+        "      else { " rt_call_or_expr " } }\n")
 
-        case OP_lt:  GEN_CMP_INT("<",  "lt");  break;
-        case OP_lte: GEN_CMP_INT("<=", "lte"); break;
+/* Shared logic for comparison opcodes. Usage:
+ *   DO_CMP(c_op, int_op, vtable_call_expr_normal, vtable_call_expr_if_neg_int)
+ * c_op: C double operator (e.g. "<")
+ * int_op: C int operator (e.g. "<")
+ * vt_call: vtable call using _a,_b (normal order)
+ * vt_neg_call: vtable call for negated-int case (neq/strict_neq use eq/strict_eq)
+ * For gt: vt_call is _RT->lt(ctx,_b,_a) (reversed)
+ * For neq/strict_neq the unfused code is slightly different — handle separately */
 
-#undef GEN_CMP_INT
+        case OP_lt: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM("<",  _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+            } else {
+                GEN_CMP_UNFUSED("<", "JSValue _r=_RT->lt(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
+        case OP_lte: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM("<=", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("<=","_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate);
+            } else {
+                GEN_CMP_UNFUSED("<=","JSValue _r=_RT->lte(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
+        case OP_gt: {
+            /* a > b  ≡  b < a  (strict):  vtable uses lt(b,a) */
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM(">",  _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN(">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate);
+            } else {
+                GEN_CMP_UNFUSED(">", "JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
+        case OP_gte: {
+            /* a >= b  ≡  b <= a  (inclusive): vtable uses lte(b,a) */
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM(">=", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN(">=","_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate);
+            } else {
+                GEN_CMP_UNFUSED(">=","JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
 
-        case OP_gt:
-            /* a > b  ≡  b < a  (strict):  use lt(b,a) */
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+        case OP_eq: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("==","_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+            } else {
+                GEN_CMP_UNFUSED("==","JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
-        case OP_gte:
-            /* a >= b  ≡  b <= a  (inclusive): use lte(b,a) */
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)>=JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+        }
+        case OP_neq: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                /* neq fused: "!=" is the comparison; negate inverts it */
+                if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
+                else     jit_buf_printf(cb,
+                    "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "      else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                    "      if(%s_cond) goto _L%d; }\n",
+                    _fi.negate?"!":"", _fi.tgt);
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
+                    "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
+        }
+        case OP_strict_eq: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("==","_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate);
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
+                    "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
+        case OP_strict_neq: {
+            JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
+            int _bn = (_GS_TOP2()==JIT_T_NUMBER && _GS_TOP()==JIT_T_NUMBER);
+            if (_fi.fuse) {
+                sz += _fi.extra_sz;
+                if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
+                else     jit_buf_printf(cb,
+                    "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "      else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                    "      if(%s_cond) goto _L%d; }\n",
+                    _fi.negate?"!":"", _fi.tgt);
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
+                    "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+            }
+            _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
+            break;
+        }
 
-        case OP_eq:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
-            break;
-        case OP_neq:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
-                "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
-            break;
-        case OP_strict_eq:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
-            break;
-        case OP_strict_neq:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
-                "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
-            break;
+#undef GEN_CMP_FUSE_NUM
+#undef GEN_CMP_FUSE_GEN
+#undef GEN_CMP_UNFUSED
 
         /* ---- instanceof / in ---- */
         case OP_instanceof:
@@ -2040,10 +2248,163 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
             *unsupported_out = 1;
+            free(gen_st);
             return -1;
         }
+
+        /* Phase 6.1: update gen-time type stack.
+         * Comparison opcodes (OP_lt..OP_strict_neq) already updated gen_st
+         * inline above.  All other opcodes are handled here.              */
+        {
+            uint8_t _gs_push = 255; /* 255 = no push */
+            int     _gs_drop = 0;
+
+            switch (op) {
+            /* --- Numeric constant pushes → NUMBER --- */
+            case OP_push_i32: case OP_push_i8: case OP_push_i16:
+            case OP_push_0:   case OP_push_1:  case OP_push_2:  case OP_push_3:
+            case OP_push_4:   case OP_push_5:  case OP_push_6:  case OP_push_7:
+            case OP_push_minus1:
+                _gs_push = JIT_T_NUMBER; break;
+
+            /* --- Non-numeric pushes → JSVAL --- */
+            case OP_push_false: case OP_push_true: case OP_push_empty_string:
+            case OP_undefined:  case OP_null:      case OP_push_this:
+            case OP_push_const: case OP_push_const8: case OP_push_atom_value:
+                _gs_push = JIT_T_JSVAL; break;
+
+            /* --- get_loc: propagate local's type --- */
+            case OP_get_loc: case OP_get_loc_check: case OP_get_loc_checkthis:
+                { int _i=(int)bc_u16(&bc[pc+1]);
+                  _gs_push=(local_type&&_i<var_count)?local_type[_i]:JIT_T_JSVAL; break; }
+            case OP_get_loc8:
+                { int _i=(int)bc[pc+1];
+                  _gs_push=(local_type&&_i<var_count)?local_type[_i]:JIT_T_JSVAL; break; }
+            case OP_get_loc0: _gs_push=(local_type&&var_count>0)?local_type[0]:JIT_T_JSVAL; break;
+            case OP_get_loc1: _gs_push=(local_type&&var_count>1)?local_type[1]:JIT_T_JSVAL; break;
+            case OP_get_loc2: _gs_push=(local_type&&var_count>2)?local_type[2]:JIT_T_JSVAL; break;
+            case OP_get_loc3: _gs_push=(local_type&&var_count>3)?local_type[3]:JIT_T_JSVAL; break;
+
+            /* --- get_arg: always JSVAL (unknown call-site type) --- */
+            case OP_get_arg:  case OP_get_arg0: case OP_get_arg1:
+            case OP_get_arg2: case OP_get_arg3:
+                _gs_push = JIT_T_JSVAL; break;
+
+            /* --- get_length: NUMBER (array length is always a non-neg int) --- */
+            case OP_get_length: _gs_drop=1; _gs_push=JIT_T_NUMBER; break;
+
+            /* --- Arithmetic: NUMBER iff both operands were NUMBER --- */
+            case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod: {
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                _gs_drop = 2;
+                _gs_push = (_t2==JIT_T_NUMBER&&_t1==JIT_T_NUMBER)
+                           ? JIT_T_NUMBER : JIT_T_JSVAL;
+                break;
+            }
+            /* --- Bitwise: always produces an INT (NUMBER) --- */
+            case OP_shl: case OP_sar: case OP_shr:
+            case OP_and: case OP_or:  case OP_xor: _gs_drop=2; _gs_push=JIT_T_NUMBER; break;
+            case OP_not:                            _gs_drop=1; _gs_push=JIT_T_NUMBER; break;
+
+            /* --- Unary numeric: NUMBER iff operand was NUMBER --- */
+            case OP_neg: case OP_plus: case OP_inc: case OP_dec:
+                { uint8_t _t=_GS_TOP();
+                  _gs_drop=1;
+                  _gs_push=(_t==JIT_T_NUMBER)?JIT_T_NUMBER:JIT_T_JSVAL; break; }
+            /* post_inc/dec: pop 1 (original), push 2 (original + result).
+             * We set _gs_drop=1 and push the result type; the original is
+             * re-pushed via a special case in the application block below. */
+            case OP_post_inc: case OP_post_dec:
+                { uint8_t _t=_GS_TOP();
+                  _gs_drop=1;
+                  _gs_push=(_t==JIT_T_NUMBER)?JIT_T_NUMBER:JIT_T_JSVAL; break; }
+
+            /* --- Comparisons: handled inline in main switch above --- */
+            case OP_lt:  case OP_lte: case OP_gt:  case OP_gte:
+            case OP_eq:  case OP_neq: case OP_strict_eq: case OP_strict_neq:
+                break; /* already updated in main switch */
+
+            /* --- Boolean / typeof --- */
+            case OP_lnot: case OP_typeof: _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            case OP_instanceof: case OP_in: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+
+            /* --- put_loc: pop 1 --- */
+            case OP_put_loc: case OP_put_loc_check: case OP_put_loc_check_init:
+            case OP_put_loc8: case OP_put_loc0: case OP_put_loc1:
+            case OP_put_loc2: case OP_put_loc3:
+                _gs_drop = 1; break;
+            /* set_loc: peek, no pop */
+
+            /* --- put_arg: pop 1 --- */
+            case OP_put_arg:  case OP_put_arg0: case OP_put_arg1:
+            case OP_put_arg2: case OP_put_arg3: _gs_drop=1; break;
+
+            /* --- put_var_ref / put_var: pop 1 --- */
+            case OP_put_var_ref:  case OP_put_var_ref_check:
+            case OP_put_var_ref_check_init:
+            case OP_put_var_ref0: case OP_put_var_ref1:
+            case OP_put_var_ref2: case OP_put_var_ref3:
+            case OP_put_var: case OP_put_var_init:
+                _gs_drop = 1; break;
+
+            /* --- drop: pop 1 --- */
+            case OP_drop: _gs_drop=1; break;
+
+            /* --- add_loc: pop 1 (modifies local in-place) --- */
+            case OP_add_loc: _gs_drop=1; break;
+
+            /* --- Calls: pop n+1 (or n+2 for method), push JSVAL --- */
+            case OP_call: case OP_tail_call:
+                { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+1; _gs_push=JIT_T_JSVAL; break; }
+            case OP_call0: _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            case OP_call1: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_call2: _gs_drop=3; _gs_push=JIT_T_JSVAL; break;
+            case OP_call3: _gs_drop=4; _gs_push=JIT_T_JSVAL; break;
+            case OP_call_method: case OP_tail_call_method:
+                { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+2; _gs_push=JIT_T_JSVAL; break; }
+            case OP_call_constructor:
+                { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+2; _gs_push=JIT_T_JSVAL; break; }
+
+            /* --- Property / array access → JSVAL --- */
+            case OP_get_field:    _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            case OP_get_field2:              _gs_push=JIT_T_JSVAL; break;
+            case OP_get_array_el: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_object:                  _gs_push=JIT_T_JSVAL; break;
+            case OP_array_from:
+                { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n; _gs_push=JIT_T_JSVAL; break; }
+
+            /* --- if_false/if_true: pop 1 (only reached when NOT fused) --- */
+            case OP_if_false:  case OP_if_true:
+            case OP_if_false8: case OP_if_true8: _gs_drop=1; break;
+
+            /* --- return: clear stack --- */
+            case OP_return: gen_sp=0; break;
+            case OP_return_undef: gen_sp=0; break;
+            case OP_throw: gen_sp=0; break;
+
+            /* Everything else: no tracked stack effect (conservative) */
+            default: break;
+            }
+
+            /* Apply drop then push */
+            if (_gs_drop > 0) { gen_sp -= _gs_drop; if (gen_sp < 0) gen_sp = 0; }
+            if (_gs_push != 255 && gen_sp < gen_stk_cap)
+                gen_st[gen_sp++] = _gs_push;
+            /* post_inc/dec: push a second time (original + result both go on stack) */
+            if ((op == OP_post_inc || op == OP_post_dec) && gen_sp < gen_stk_cap)
+                gen_st[gen_sp++] = _gs_push;
+        }
+
         pc += sz;
     }
+
+#undef _GS_PUSH
+#undef _GS_POP
+#undef _GS_TOP
+#undef _GS_TOP2
+#undef _GS_DROP
+
+    free(gen_st);
     return 0;
 }
 
@@ -2092,7 +2453,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
-                 var_count, arg_count, &unsup, local_type) < 0) {
+                 var_count, arg_count, stack_size, &unsup, local_type) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);
