@@ -423,7 +423,148 @@ cd jit_perf_tests/v8bench
 
 ---
 
+# Phase 5 + Atom Enum Fix — Re-measurement (2026-04-01)
+
+**Date:** 2026-04-01  
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)  
+**Build flags:**
+- Interpreter: `make qjs` (GCC -O2, no JIT)
+- GCC tier-2 micro-bench: `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs`
+- GCC tier-2 v8bench:     `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs`
+
+**Critical fix in this build:**
+- `JSAtomEnumJIT` in `quickjs-jit.c` was missing a leading `__JIT_ATOM_NULL = 0`
+  entry, making every predefined atom value one too low (e.g. `JS_ATOM_length`
+  was 49 in JIT but 50 at runtime).  `OP_get_length` baked the wrong atom into
+  generated C code, causing `get_prop(ctx, array, 49)` to look up `"callee"`
+  instead of `"length"`.  Arrays have no `"callee"` property, so the JIT
+  returned `JS_UNDEFINED` for every `.length` access.
+
+**Impact on previous measurements:**  
+All previous JIT results that involved `.length` (DeltaBlue's `OC.prototype.size`,
+`arr_sum`, RayTrace, and others) were running **incorrect code**.  In the worst
+case (`arr_sum`), the JIT-compiled loop never executed because `i < undefined`
+is always `false` — producing a 0 ms result that looked like a 2000× speedup
+but was simply returning the wrong answer (0 instead of the correct sum).
+
+---
+
+## Micro-benchmarks (bench_gcc.js, threshold=2, 8 s warm-up)
+
+Three runs each; table shows minimum elapsed time.
+
+| Benchmark | Interp run1 | Interp run2 | Interp run3 | **Interp min** | JIT run1 | JIT run2 | JIT run3 | **JIT min** | **Speedup** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib(30) x1             | 100.79 ms | 104.80 ms |  89.83 ms |  **89.83 ms** | 107.92 ms | 122.87 ms | 108.76 ms | **107.92 ms** | **0.83×** |
+| sum_loop(1e6) x20      | 665.73 ms | 659.80 ms | 673.22 ms | **659.80 ms** | 893.43 ms | 1013.93 ms | 888.86 ms | **888.86 ms** | **0.74×** |
+| sum_sq(1e6) x20        | 528.02 ms | 540.01 ms | 522.61 ms | **522.61 ms** | 314.53 ms |  375.03 ms | 291.10 ms | **291.10 ms** | **1.79×** |
+| count_primes(3000) x10 |   6.87 ms |   7.80 ms |   6.43 ms |   **6.43 ms** |   2.26 ms |    2.74 ms |   2.20 ms |   **2.20 ms** | **2.92×** |
+| arr_sum(10000) x1000   | 293.65 ms | 299.54 ms | 300.43 ms | **293.65 ms** | 372.82 ms |  413.95 ms | 345.06 ms | **345.06 ms** | **0.85×** |
+
+**Notes:**
+- `sum_sq` and `count_primes` speedups come from Phase 5 typed-variable inference
+  (NUMBER locals → `double _ld[]` C variables, no JSValue boxing).
+- `arr_sum` is now slower than interpreter because the JIT calls `JS_GetProperty`
+  for every `.length` check in the loop header, while the interpreter uses an
+  inline fast path.  The JIT correctly computes the right answer (unlike prior
+  runs where the wrong atom caused the loop to never execute).
+- `fib` and `sum_loop` regressions are expected: `fib` uses vtable recursive
+  calls; `sum_loop` has no typed variables to infer.
+
+---
+
+## V8 Benchmark Suite (threshold=2, 3 runs each)
+
+Higher is better.  WSL2 timing is noisy; GCC compilation runs concurrently
+with the benchmark, which adds variance.  Previous results with the atom bug
+were invalid (DeltaBlue and others ran incorrect code).
+
+#### Interpreter (no JIT)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    |  944 |  927 |  665 |  **944** |
+| DeltaBlue   |  826 |  796 |  606 |  **826** |
+| Crypto      | 1190 | 1149 |  771 | **1190** |
+| RayTrace    | 1245 | 1225 | 1016 | **1245** |
+| EarleyBoyer | 1613 | 3296 | 1227 | **1613**¹ |
+| RegExp      |  407 |  262 |  308 |  **407** |
+| Splay       | 2525 | 1562 | 1998 | **2525** |
+| **Score**   | 1097 | 1049 |  814 | **1097** |
+
+¹ EarleyBoyer 3296 in run 2 is an outlier (fewer outer iterations in window).
+
+#### GCC JIT (threshold=2)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    |   72 |  534 |  718 |  **718** |
+| DeltaBlue   |  783 |  507 |  652 |  **783** |
+| Crypto      | 1265 |  832 | 1003 | **1265** |
+| RayTrace    | 1028 |  930 |  926 | **1028** |
+| EarleyBoyer | 1401 | 1290 | 1378 | **1401** |
+| RegExp      |  322 |  395 |  205 |  **395** |
+| Splay       |  708 | 1136 | 1024 | **1136** |
+| **Score**   |  584 |  740 |  744 |  **744** |
+
+#### Summary (best-of-three)
+
+| Benchmark   | Interp best | JIT best | Ratio |
+|---|---:|---:|---:|
+| Richards    |  944 |  718 | **0.76×** |
+| DeltaBlue   |  826 |  783 | **0.95×** |
+| Crypto      | 1190 | 1265 | **1.06×** |
+| RayTrace    | 1245 | 1028 | **0.83×** |
+| EarleyBoyer | 1613 | 1401 | **0.87×** |
+| RegExp      |  407 |  395 | **0.97×** |
+| Splay       | 2525 | 1136 | **0.45×** |
+| **Score**   | 1097 |  744 | **0.68×** |
+
+**All 7 benchmarks pass with correct results.**  The JIT scores are lower than
+the interpreter because GCC compilation runs concurrently with the benchmark
+measurement (v8bench uses a 1-second window per test; the fork+exec GCC
+subprocess competes for CPU).  The variance between runs (e.g. Richards: 72 vs
+718) reflects how much of the measurement window was consumed by background
+compilation.  With threshold=2, compilation fires very early; some benchmark
+runs are heavily penalised if the compile completes after much of the timing
+window has passed.
+
+This measurement methodology is not ideal for evaluating JIT steady-state
+performance.  A more representative approach is `bench_gcc.js`, which uses an
+explicit 8-second warm-up before any timed measurement; those results (above)
+show the true JIT speed for benchmarks where typed-variable inference applies.
+
+---
+
+## How to Reproduce
+
+```sh
+# From quickjs/
+make qjs -B && cp qjs qjs_interp
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs -B && cp qjs qjs_jit2
+
+# Micro-benchmarks (interpreter baseline)
+./qjs_interp jit_perf_tests/bench_gcc.js
+
+# Micro-benchmarks (GCC JIT, threshold=2, waits 8 s for compilation)
+./qjs_jit2 jit_perf_tests/bench_gcc.js
+
+# V8 benchmark suite
+cd jit_perf_tests/v8bench
+../../qjs_interp run_qjs.js
+../../qjs_jit2   run_qjs.js
+```
+
+---
+
 # Phase 5 + Bug Fixes — Re-measurement (2026-04-01)
+
+> **⚠ NOTE:** These results are superseded by the "Phase 5 + Atom Enum Fix" section
+> above.  The `JSAtomEnumJIT` atom-numbering bug was not yet fixed when this section
+> was measured, so all JIT results involving `.length` (DeltaBlue, arr_sum, RayTrace,
+> etc.) were running incorrect code.  The `arr_sum ~1970×` figure in particular was
+> a false result — the loop never executed because the wrong atom caused `.length`
+> to return `JS_UNDEFINED`.  See the fix section for correct measurements.
 
 **Date:** 2026-04-01 (re-run)  
 **Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)  
