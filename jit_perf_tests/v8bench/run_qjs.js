@@ -49,3 +49,31 @@ BenchmarkSuite.RunSuites({
     NotifyError:  PrintError,
     NotifyScore:  PrintScore
 });
+
+
+print('-------------------------------------------');
+
+BenchmarkSuite.RunSuites({
+    NotifyResult: PrintResult,
+    NotifyError:  PrintError,
+    NotifyScore:  PrintScore
+});
+
+
+print('-------------------------------------------');
+
+BenchmarkSuite.RunSuites({
+    NotifyResult: PrintResult,
+    NotifyError:  PrintError,
+    NotifyScore:  PrintScore
+});
+
+
+print('-------------------------------------------');
+
+BenchmarkSuite.RunSuites({
+    NotifyResult: PrintResult,
+    NotifyError:  PrintError,
+    NotifyScore:  PrintScore
+});
+
