@@ -308,6 +308,27 @@ Phase 9 addresses the two remaining structural inefficiencies in the generated C
 amount of opcode-level tuning can fix: the explicit value stack and the goto-based control
 flow.
 
+### 9.0 Compiler-side annotations (prerequisite)
+
+Rather than re-deriving structure from bytecode in the JIT (stack simulation, dominator
+analysis), Phase 9 taps information the `quickjs.c` compiler already has at compile time.
+
+**Stack depths** — `compute_stack_size()` already simulates every opcode; it just doesn't
+save the per-PC table.  One new field (`int8_t *stack_depth_tab`) in `JSFunctionBytecode`
+and ~10 lines make it available.  The JIT's ~60-line pre-pass simulation disappears.
+
+**Control flow structure** — at each label patch site the compiler knows
+`(branch_pc, target_pc, kind)` for every `if`, `for`, `while`, and `switch` at the
+moment the jump is resolved.  A compact `JSJITCFAnnotation[]` side-table records this:
+
+```c
+typedef enum { JIT_CF_LOOP, JIT_CF_IF, JIT_CF_ELSE, JIT_CF_SWITCH } JSJITCFKind;
+typedef struct { uint32_t branch_pc, target_pc; uint8_t kind; } JSJITCFAnnotation;
+```
+
+Cost in `quickjs.c`: ~60 lines total.  Benefit: ~350 lines of CFG/dominator analysis
+removed from the JIT; P9.3 drops from ~5 days to ~2 days.
+
 ### 9.1 Variable names (debuggability)
 
 `JSFunctionBytecode::vardefs[i].var_name` holds the original JS identifier as a `JSAtom`.
@@ -344,8 +365,8 @@ _s[_sp++]=JS_NewFloat64(..);
 ```
 
 GCC now sees pure locals — no pointer aliasing, all temporaries live in registers.
-A pre-pass computes `stack_depth_tab[pc]` so each opcode knows the exact slot names
-to use without changing the linear gen_body structure.
+`stack_depth_tab[pc]` (filled by `compute_stack_size()` in P9.0) tells each opcode
+the exact slot names to use — no separate JIT pre-pass needed.
 
 ### 9.3 Control flow structuring
 
@@ -353,24 +374,21 @@ to use without changing the linear gen_body structure.
 GCC can sometimes recover loop structure from gotos, but it cannot reliably apply
 vectorisation, LICM, or unrolling unless it sees canonical `while`/`for` forms.
 
-**Algorithm:**
-
-1. Extend `JSJITScanResult` to a full CFG (basic blocks + successor/predecessor edges)
-2. Compute dominator tree (iterative Cooper-Harvey-Kennedy, ~35 lines)
-3. Identify back-edges (loop headers) and immediate post-dominators (if/else joins)
-4. Replace the linear opcode loop with a recursive structured emitter:
+With the P9.0 `cf_annotations` table, no CFG or dominator analysis is needed.
+The JIT loads the annotation table and uses it directly in a recursive emitter:
 
 ```
-emit_region(b, end):
-  if b is loop header  →  emit "while(1){" + emit_region(body) + "}"
-  if b is if/else      →  emit condition + "if(){" + then + "}else{" + else + "}"
-  if b is switch       →  emit "switch(val){ case N: ... }"
-  else                 →  emit block contents + advance to successor
+emit_region(pc, end_pc):
+  ann = cf_by_branch[pc]
+  if ann.kind == LOOP    →  emit "while(1){" + emit_region(body) + "}"
+  if ann.kind == IF/ELSE →  emit condition + "if(){" + then + "}else{" + else + "}"
+  if ann.kind == SWITCH  →  emit "switch(val){ case N: ... }"
+  else                   →  emit block contents + advance to next PC
 ```
 
-Fallback to `goto` for exception paths, labelled break/continue, and any pattern the
-structurer does not recognise.  All reducible CFGs (the only kind QuickJS generates
-from structured JavaScript) are handled without fallback.
+Fallback to `goto _L{pc}` for any branch PC not in the annotation table (exception
+paths, complex patterns).  If `cf_annotations` is NULL (stripped build), the old
+linear goto emitter is used unchanged.
 
 ### 9.4 Typed stack temporaries
 

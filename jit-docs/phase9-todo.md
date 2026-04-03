@@ -8,15 +8,88 @@ the original structure of the JavaScript — named variables, real loops, real
 conditionals — giving GCC the information it needs to apply its full optimisation
 arsenal (LICM, vectorisation, loop unrolling, CSE across the full expression tree).
 
+### Compiler-assisted approach
+
+Rather than re-deriving structure from bytecode (dominator analysis, stack simulation),
+Phase 9 taps the information the quickjs.c compiler already has at compile time:
+
+- `compute_stack_size()` already walks every opcode tracking depth — it just doesn't
+  save the per-PC table.  One new field + ~10 lines makes it available to the JIT.
+- The label patch sites (`emit_label` / `patch_label`) know the exact `(branch_pc →
+  target_pc, kind)` for every `if`, `for`, `while`, and `switch` at the moment they
+  are resolved.  A compact side-table records this for the JIT.
+
+This eliminates ~350 lines of dominator/CFG analysis from the JIT and reduces P9.3
+from ~5 days to ~2 days, at the cost of ~60 lines in `quickjs.c`.
+
 **Dependencies between sub-phases:**
 ```
-P9.1 (variable names)  ─────────────────── independent, do first
-P9.2 (stackless)       ─────────────────── independent of P9.3
-  └──► P9.4 (typed temps)                  requires P9.2
-P9.2 ──► P9.3 (CF structuring)             benefits from stackless locals being named
+P9.0 (quickjs.c annotations)  ── do first; P9.2 and P9.3 depend on it
+P9.1 (variable names)         ── independent of P9.0, do in parallel
+P9.2 (stackless)              ── requires P9.0 (stack_depth_tab field)
+  └──► P9.4 (typed temps)        requires P9.2
+P9.3 (CF structuring)         ── requires P9.0 (CF annotation table)
 ```
 
-Suggested order: P9.1 → P9.2 → P9.3 → P9.4
+Suggested order: P9.0 + P9.1 (parallel) → P9.2 → P9.3 → P9.4
+
+---
+
+## P9.0 — Compiler-side Annotations in `quickjs.c`
+**Estimated effort:** ~1 day  **Risk:** low  **Files:** `quickjs.c`, `quickjs-jit.h`
+
+### P9.0-A — Per-PC stack depth table
+
+`compute_stack_size()` (~line 35128 in `quickjs.c`) already simulates the opcode
+stream to find the maximum stack depth.  Extend it to save the per-PC depths.
+
+- [ ] Add field to `JSFunctionBytecode`:
+  ```c
+  int8_t *stack_depth_tab;   /* [bc_len] depth before each opcode; NULL if stripped */
+  ```
+- [ ] In `compute_stack_size()`, allocate `js_malloc(ctx, bc_len)` and store depth
+  before applying each opcode's net effect.  Free in `js_free_function_def()` and
+  `free_function_bytecode()`.
+- [ ] Add accessor in `quickjs-jit.h`:
+  ```c
+  static inline int8_t *js_jit_fb_stack_depth_tab(JSFunctionBytecode *b) {
+      return b->stack_depth_tab;
+  }
+  ```
+
+### P9.0-B — Control flow annotation table
+
+At each label patch site the compiler knows `(branch_pc, target_pc, kind)`.  Record
+this into a side-table stored in `JSFunctionBytecode`.
+
+- [ ] Add to `quickjs-jit.h`:
+  ```c
+  typedef enum { JIT_CF_LOOP=0, JIT_CF_IF=1, JIT_CF_ELSE=2, JIT_CF_SWITCH=3 } JSJITCFKind;
+  typedef struct { uint32_t branch_pc, target_pc; uint8_t kind; } JSJITCFAnnotation;
+  ```
+- [ ] Add fields to `JSFunctionBytecode`:
+  ```c
+  JSJITCFAnnotation *cf_annotations;
+  int                cf_annotation_count;
+  ```
+- [ ] In `quickjs.c`, at the three label-patch sites (loop back-edge, if/else forward
+  jump, switch case jump), append to a `DynBuf` that is stored into
+  `cf_annotations` after bytecode finalisation.
+- [ ] Add accessor:
+  ```c
+  JSJITCFAnnotation *js_jit_fb_cf_annotations(JSFunctionBytecode *b, int *count_out);
+  ```
+- [ ] Free in `free_function_bytecode()`.
+
+### P9.0-C — Tests
+
+- [ ] `make CONFIG_JIT=y test` — verify no leaks, no crashes.
+- [ ] Manual check: `--jit-dump` on a function with a `for` loop; confirm
+  `stack_depth_tab` non-NULL and `cf_annotations` contains a `JIT_CF_LOOP` entry.
+
+### Definition of done
+`JSFunctionBytecode` carries `stack_depth_tab` and `cf_annotations` after compilation.
+No existing tests regress.
 
 ---
 
@@ -71,14 +144,13 @@ local within each basic block.
 
 ### Tasks
 
-- [ ] **P9.2-A** Add `stack_depth_tab` pre-pass (~60 lines):
-  Before the main `while (pc < bc_len)` loop in `gen_body()`, allocate
-  `int8_t *stack_depth_tab = calloc(bc_len, 1)` and do a linear simulation:
-  - Track `int depth = 0`
-  - At each label target (`scan_is_target`): reset to 0
-  - For each opcode: apply its net stack effect (push count − pop count)
-  - Store `stack_depth_tab[pc] = depth` before applying the effect
-  This gives the stack depth BEFORE each opcode.
+- [ ] **P9.2-A** Obtain `stack_depth_tab` from the bytecode object (P9.0 prerequisite):
+  ```c
+  int8_t *stack_depth_tab = js_jit_fb_stack_depth_tab(b);
+  assert(stack_depth_tab != NULL);  /* set by compute_stack_size() */
+  ```
+  No simulation needed in the JIT — the compiler already filled the table.
+  (Previously this was a ~60-line pre-pass; P9.0-A eliminates it.)
 
 - [ ] **P9.2-B** Replace preamble stack array with named temporaries:
   ```c
@@ -126,62 +198,32 @@ spills between consecutive arithmetic ops.
 ---
 
 ## P9.3 — Control Flow Structuring
-**Estimated effort:** ~5 days  **Risk:** medium-high  **Files:** `quickjs-jit.c`
+**Estimated effort:** ~2 days  **Risk:** medium  **Files:** `quickjs-jit.c`  **Requires:** P9.0
 
 ### Background
 
 `gen_body()` currently emits `_L{pc}:;` goto-labels and `goto _L{pc};` for all
 branches.  GCC's vectoriser, LICM, and loop unroller require canonical `while`/`for`
-form.  Since QuickJS only generates reducible CFGs from structured JavaScript (no
-`goto` in JS source), dominator-based structuring always succeeds.
+form.  The P9.0-B annotation table records the original control flow structure directly
+from the compiler — no dominator analysis or CFG reconstruction is needed.
 
 ### Tasks
 
-#### P9.3-A — Proper CFG (extend `JSJITScanResult`) (~150 lines)
+#### P9.3-A — Load CF annotation table from bytecode object (~10 lines)
 
-- [ ] Add `JITBlock` struct:
+- [ ] At the top of `gen_body()`, retrieve the annotation table built by P9.0-B:
   ```c
-  typedef struct JITBlock {
-      int start_pc, end_pc;    // [start, end) — exclusive
-      int succ[2];             // successor block indices; -1 = none/exit
-      int n_pred;
-      int *preds;              // predecessor block indices (malloc'd)
-      int idom;                // immediate dominator block index
-      int is_loop_header;      // 1 if a back-edge targets this block
-      int loop_exit;           // block index of loop exit (-1 if not header)
-  } JITBlock;
+  int n_cf;
+  JSJITCFAnnotation *cf = js_jit_fb_cf_annotations(b, &n_cf);
   ```
-- [ ] Extend `js_jit_scan()` to fill a `JITBlock` array alongside `sr->targets`:
-  split at every branch opcode and every label target; record successor and
-  predecessor edges.
+  Build two lookup arrays indexed by `branch_pc` for O(1) access during emission:
+  - `cf_by_branch[pc]` → pointer to annotation (or NULL)
+  - `cf_loop_headers[]` → sorted array of loop header PCs (target_pc of LOOP entries)
 
-#### P9.3-B — Dominator tree (~100 lines)
+  No CFG construction, no dominator tree, no post-dominator analysis needed —
+  the compiler already recorded the structure in P9.0-B.
 
-- [ ] Implement the iterative Cooper-Harvey-Kennedy algorithm:
-  ```
-  idom[entry] = entry
-  repeat until stable:
-    for b in reverse-post-order (skip entry):
-      new_idom = first processed predecessor of b
-      for each other predecessor p of b:
-        if idom[p] is computed: new_idom = intersect(new_idom, p)
-      idom[b] = new_idom
-  ```
-- [ ] Mark back-edges: edge (A→B) is a back-edge iff B dominates A.
-- [ ] Set `is_loop_header` for targets of back-edges.
-- [ ] Compute loop extents: natural loop of header H = all blocks that can reach
-  the latch without leaving H's dominance subtree.
-
-#### P9.3-C — If/else join point detection (~80 lines)
-
-- [ ] For each block B with two successors (conditional branch):
-  - Compute immediate post-dominator using the dominator tree of the reversed CFG,
-    or simpler: find the lowest common dominator of the two successors.
-  - Record as `join_block[B]`.
-- [ ] Classify: if one successor == join_block → if-only (no else).
-  If both differ from join → if-else.
-
-#### P9.3-D — Recursive structured emitter (~400 lines)
+#### P9.3-B — Recursive structured emitter (~200 lines)
 
 - [ ] Replace the `while (pc < bc_len)` linear loop with:
   ```c
@@ -199,16 +241,15 @@ form.  Since QuickJS only generates reducible CFGs from structured JavaScript (n
 - [ ] `break` / `continue` detection: a `goto` whose target is the current loop
   header → emit `continue;`; target outside the loop → emit `break;`.
   Multi-level labelled break → emit `goto _L{N};` (fallback).
-- [ ] Fallback: any block/edge not matched by the above → emit the current goto-label
-  output (never fails, always correct).
-- [ ] Guard: if dominator computation or structuring fails for a function (shouldn't
-  happen with well-formed QuickJS bytecode), fall back silently to the old linear
-  emitter.
+- [ ] Fallback: any branch PC not found in `cf_by_branch` → emit the existing
+  `goto _L{pc};` label output (never fails, always correct).
+- [ ] Guard: if `cf_annotations` is NULL (stripped build or very old bytecode),
+  fall back silently to the old linear goto emitter.
 
-#### P9.3-E — Integration and testing
+#### P9.3-C — Integration and testing
 
-- [ ] Wire `emit_region` into `gen_body()`: compute CFG + dominators once, then
-  call `emit_region(entry_block, exit_block)` instead of the `while (pc < bc_len)` loop.
+- [ ] Wire `emit_region` into `gen_body()`: load annotation table (P9.3-A), then
+  call `emit_region(0, bc_len)` instead of the `while (pc < bc_len)` loop.
 - [ ] Run `make test`.
 - [ ] Verify with `--jit-dump` that a JS `for` loop produces `while(1){...break;}` or
   `for(...){}` in the generated C.
@@ -278,11 +319,12 @@ properties, the generated C contains only `double` arithmetic and a single
 
 | Sub-phase | Deliverable | Effort | Risk | Expected V8bench |
 |---|---|---:|---|---:|
+| P9.0 Compiler annotations | `stack_depth_tab` + `cf_annotations` in bytecode | 1 day | low | no change |
 | P9.1 Variable names | Human-readable generated C | 1 day | low | no change |
 | P9.2 Stackless | No `_s[]`; named `_tsv{N}` | 3 days | medium | +30–60% |
-| P9.3 CF structuring | `if`/`while`/`for` in output | 5 days | medium-high | +40–100% |
+| P9.3 CF structuring | `if`/`while`/`for` in output | 2 days | medium | +40–100% |
 | P9.4 Typed temps | Zero tag-checks for float64 | 2 days | medium | +30–80% on float benchmarks |
-| **Total** | | **~11 days** | | **~2–3× overall** |
+| **Total** | | **~9 days** | | **~2–3× overall** |
 
 ## Testing checklist (run after each sub-phase)
 
