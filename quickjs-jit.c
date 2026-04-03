@@ -1233,14 +1233,25 @@ static char **jit_build_varnames(JSRuntime *rt, JSFunctionBytecode *b,
         const char *aname = NULL;
         if (atom != JS_ATOM_NULL)
             aname = js_jit_atom_get_str(rt, atom_buf, sizeof(atom_buf), atom);
+        /* Sanitize JS name to a valid C identifier: $ → S, reject non-ASCII */
+        char sane[64];
         int valid = 0;
-        if (aname && aname[0] && (isalpha((unsigned char)aname[0]) || aname[0] == '_')) {
-            valid = 1;
-            for (const char *p = aname + 1; *p; p++)
-                if (!isalnum((unsigned char)*p) && *p != '_') { valid = 0; break; }
+        if (aname && aname[0]) {
+            char c0 = (aname[0] == '$') ? 'S' : aname[0];
+            if (isalpha((unsigned char)c0) || c0 == '_') {
+                int slen = 0;
+                sane[slen++] = c0;
+                valid = 1;
+                for (const char *p = aname + 1; *p && slen < (int)sizeof(sane)-1; p++) {
+                    char c = (*p == '$') ? 'S' : *p;
+                    if (!isalnum((unsigned char)c) && c != '_') { valid = 0; break; }
+                    sane[slen++] = c;
+                }
+                sane[slen] = '\0';
+            }
         }
         if (valid)
-            snprintf(buf, sizeof(buf), "%s_%d", aname, i);
+            snprintf(buf, sizeof(buf), "%s_%d", sane, i);
         else
             snprintf(buf, sizeof(buf), "%d", i);
         names[i] = strdup(buf);
