@@ -200,6 +200,21 @@ int            js_jit_fb_get_closure_var_is_lexical(JSFunctionBytecode *b, int i
 int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
 /* P9.0: per-PC stack depth table; value 0xffff = unreachable */
 const uint16_t *js_jit_fb_get_stack_depth_tab(JSFunctionBytecode *b);
+/* P9.3: control-flow annotation kinds */
+typedef enum {
+    JIT_CF_WHILE_LOOP   = 0,  /* while() {} back-edge — safe to restructure */
+    JIT_CF_DOWHILE_LOOP = 1,  /* do {} while() back-edge — safe to restructure */
+    JIT_CF_FOR_LOOP     = 2,  /* for(;;) back-edge — NOT restructured */
+    JIT_CF_FORIN_LOOP   = 3,  /* for-in/of back-edge — NOT restructured */
+    JIT_CF_IF           = 4,  /* future: if/else */
+} JSJITCFKind;
+typedef struct {
+    uint32_t header_pc;  /* loop header bytecode offset */
+    uint32_t exit_pc;    /* first bytecode offset after the loop */
+    uint8_t  kind;       /* JSJITCFKind */
+} JSJITCFAnnotation;
+/* P9.3: CF annotation table accessor */
+const JSJITCFAnnotation *js_jit_fb_cf_annotations(JSFunctionBytecode *b, int *count_out);
 /* P9.1: atom → C string helper (wraps JS_AtomGetStrRT) */
 const char *js_jit_atom_get_str(JSRuntime *rt, char *buf, int buf_size, JSAtom atom);
 /* P9.1: JS identifier atoms for locals and arguments */

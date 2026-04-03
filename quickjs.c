@@ -675,6 +675,8 @@ typedef struct JSFunctionBytecode {
     JSJITFunc         jit_func;       /* NULL → interpreter, else JIT entry  */
     void             *jit_handle;     /* dlopen handle for compiled .so      */
     uint16_t         *stack_depth_tab; /* [byte_code_len] stack depth before each opcode; P9.0 */
+    JSJITCFAnnotation *cf_annotations;  /* loop CF annotations; P9.3 */
+    int                cf_annotation_count;
 #endif
     struct {
         /* debug info, move to separate structure to save memory? */
@@ -15710,6 +15712,11 @@ const char *js_jit_atom_get_str(JSRuntime *rt, char *buf, int buf_size, JSAtom a
 const uint16_t *js_jit_fb_get_stack_depth_tab(JSFunctionBytecode *b) {
     return b->stack_depth_tab;
 }
+/* P9.3: CF annotation table (loop header/exit PCs) */
+const JSJITCFAnnotation *js_jit_fb_cf_annotations(JSFunctionBytecode *b, int *count_out) {
+    if (count_out) *count_out = b->cf_annotation_count;
+    return b->cf_annotations;
+}
 /* P9.1: original JS identifier atoms for locals and arguments */
 JSAtom js_jit_fb_get_local_atom(JSFunctionBytecode *b, int local_idx) {
     if (!b->vardefs) return JS_ATOM_NULL;
@@ -22072,6 +22079,12 @@ typedef struct JSFunctionDef {
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
+#ifdef CONFIG_JIT
+    /* Raw CF records accumulated during parsing; 9 bytes per record:
+     * uint8 kind + int32 header_label + int32 exit_label.
+     * Finalized to cf_annotations in js_create_function() after resolve_labels(). */
+    DynBuf jit_cf_raw;
+#endif
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -28621,6 +28634,23 @@ static int is_let(JSParseState *s, int decl_mask)
     return res;
 }
 
+#ifdef CONFIG_JIT
+/* P9.3: record a raw CF annotation (kind + label IDs) into fd->jit_cf_raw.
+ * Called at loop back-edges during parsing; resolved to PCs after resolve_labels(). */
+static void jit_cf_record(JSFunctionDef *fd, int kind, int header_label, int exit_label)
+{
+    if (!fd || header_label < 0 || exit_label < 0) return;
+    uint8_t  k  = (uint8_t)kind;
+    int32_t  hl = (int32_t)header_label;
+    int32_t  el = (int32_t)exit_label;
+    dbuf_put(&fd->jit_cf_raw, &k,  1);
+    dbuf_put(&fd->jit_cf_raw, (uint8_t*)&hl, 4);
+    dbuf_put(&fd->jit_cf_raw, (uint8_t*)&el, 4);
+}
+#else
+#define jit_cf_record(fd, kind, hl, el) (void)0
+#endif
+
 /* XXX: handle IteratorClose when exiting the loop before the
    enumeration is done */
 static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
@@ -28830,6 +28860,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     }
     /* on stack: enum_rec / enum_obj value bool */
     emit_goto(s, OP_if_false, label_next);
+    jit_cf_record(fd, JIT_CF_FORIN_LOOP, label_next, label_break);
     /* drop the undefined value from for_xx_next */
     emit_op(s, OP_drop);
 
@@ -29029,6 +29060,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             if (js_parse_statement(s))
                 goto fail;
             emit_goto(s, OP_goto, label_cont);
+            jit_cf_record(s->cur_func, JIT_CF_WHILE_LOOP, label_cont, label_break);
 
             emit_label(s, label_break);
 
@@ -29068,6 +29100,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     goto fail;
             }
             emit_goto(s, OP_if_true, label1);
+            jit_cf_record(s->cur_func, JIT_CF_DOWHILE_LOOP, label1, label_break);
 
             emit_label(s, label_break);
 
@@ -29209,8 +29242,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     if (ls->pos >= pos_cont && ls->pos < pos_body)
                         ls->pos += offset;
                 }
+                jit_cf_record(s->cur_func, JIT_CF_FOR_LOOP, label_test, label_break);
             } else {
                 emit_goto(s, OP_goto, label_cont);
+                jit_cf_record(s->cur_func, JIT_CF_FOR_LOOP, label_cont, label_break);
             }
 
             emit_label(s, label_break);
@@ -32076,6 +32111,9 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     //fd->pc2line_last_line_num = line_num;
     //fd->pc2line_last_pc = 0;
     fd->last_opcode_source_ptr = source_ptr;
+#ifdef CONFIG_JIT
+    dbuf_init(&fd->jit_cf_raw);
+#endif
     return fd;
 }
 
@@ -32165,6 +32203,9 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
 
     JS_FreeAtom(ctx, fd->filename);
     dbuf_free(&fd->pc2line);
+#ifdef CONFIG_JIT
+    dbuf_free(&fd->jit_cf_raw);
+#endif
 
     js_free(ctx, fd->source);
 
@@ -35624,6 +35665,40 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     js_free(ctx, s->jump_slots);
     s->jump_slots = NULL;
 #endif
+#ifdef CONFIG_JIT
+    /* P9.3: resolve raw CF annotations (label IDs → PCs) while label_slots is
+     * still valid. Results stored temporarily back into jit_cf_raw as a flat
+     * array of JSJITCFAnnotation structs (replacing the 9-byte packed records).
+     * js_create_function() will move these into b->cf_annotations. */
+    if (s->jit_cf_raw.size > 0 && !s->jit_cf_raw.error) {
+        int _n = (int)(s->jit_cf_raw.size / 9);
+        JSJITCFAnnotation *_resolved = js_mallocz(ctx, _n * sizeof(JSJITCFAnnotation));
+        if (_resolved) {
+            const uint8_t *_p = s->jit_cf_raw.buf;
+            int _valid = 0;
+            for (int _i = 0; _i < _n; _i++, _p += 9) {
+                uint8_t _kind = _p[0];
+                int32_t _hl, _el;
+                memcpy(&_hl, _p + 1, 4);
+                memcpy(&_el, _p + 5, 4);
+                if (_hl >= 0 && _hl < s->label_count &&
+                    _el >= 0 && _el < s->label_count &&
+                    s->label_slots[_hl].addr >= 0 &&
+                    s->label_slots[_el].addr >= 0) {
+                    _resolved[_valid].header_pc = (uint32_t)s->label_slots[_hl].addr;
+                    _resolved[_valid].exit_pc   = (uint32_t)s->label_slots[_el].addr;
+                    _resolved[_valid].kind      = _kind;
+                    _valid++;
+                }
+            }
+            dbuf_free(&s->jit_cf_raw);
+            dbuf_init(&s->jit_cf_raw);
+            /* Store resolved annotations as raw bytes in jit_cf_raw for pickup by js_create_function */
+            dbuf_put(&s->jit_cf_raw, (uint8_t *)_resolved, _valid * sizeof(JSJITCFAnnotation));
+            js_free(ctx, _resolved);
+        }
+    }
+#endif
     js_free(ctx, s->label_slots);
     s->label_slots = NULL;
     /* XXX: should delay until copying to runtime bytecode function */
@@ -36163,6 +36238,23 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 #ifdef CONFIG_JIT
     b->stack_depth_tab = sdt;
     sdt = NULL; /* ownership transferred to b */
+
+    /* P9.3: transfer CF annotations resolved by resolve_labels() into b.
+     * resolve_labels() already resolved label IDs → PCs and stored them as
+     * flat JSJITCFAnnotation structs in jit_cf_raw. */
+    {
+        int _n = (int)(fd->jit_cf_raw.size / sizeof(JSJITCFAnnotation));
+        if (_n > 0 && !fd->jit_cf_raw.error) {
+            JSJITCFAnnotation *_annots = js_mallocz(ctx, _n * sizeof(JSJITCFAnnotation));
+            if (_annots) {
+                memcpy(_annots, fd->jit_cf_raw.buf, _n * sizeof(JSJITCFAnnotation));
+                b->cf_annotations      = _annots;
+                b->cf_annotation_count = _n;
+            }
+        }
+        dbuf_free(&fd->jit_cf_raw);
+        dbuf_init(&fd->jit_cf_raw); /* reset so js_free_function_def doesn't double-free */
+    }
 #endif
 
     if (fd->strip_debug) {
@@ -36287,6 +36379,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     remove_gc_object(&b->header);
 #ifdef CONFIG_JIT
     js_free_rt(rt, b->stack_depth_tab);
+    js_free_rt(rt, b->cf_annotations);
+    b->cf_annotations = NULL;
     js_jit_free_bytecode(b);
 #endif
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {

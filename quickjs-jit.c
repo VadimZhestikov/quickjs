@@ -1459,6 +1459,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     /* P9.2: per-PC stack depth table (from compute_stack_size pass). */
     const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
 
+    /* P9.3: CF annotations for structured loop emission (while/do-while only). */
+    int n_cf = 0;
+    const JSJITCFAnnotation *cf_annots = js_jit_fb_cf_annotations(b, &n_cf);
+    typedef struct { uint32_t header_pc, exit_pc; } P93Loop;
+    P93Loop p93_active[16]; /* max nesting depth */
+    int p93_depth = 0;
+
     /* P9.1: named-variable helpers — defined here so all opcode cases can use them */
 #define LNAME(idx) varnames[arg_count + (idx)]
 #define ANAME(idx) varnames[(idx)]
@@ -1500,6 +1507,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
             gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
+            /* P9.3: if this PC is a while/do-while loop header, open while(1){ */
+            if (n_cf > 0 && p93_depth < 16) {
+                for (int _ci = 0; _ci < n_cf; _ci++) {
+                    if ((cf_annots[_ci].kind == JIT_CF_WHILE_LOOP ||
+                         cf_annots[_ci].kind == JIT_CF_DOWHILE_LOOP) &&
+                        (uint32_t)pc == cf_annots[_ci].header_pc) {
+                        jit_buf_str(cb, "while(1) {\n");
+                        p93_active[p93_depth].header_pc = cf_annots[_ci].header_pc;
+                        p93_active[p93_depth].exit_pc   = cf_annots[_ci].exit_pc;
+                        p93_depth++;
+                        break;
+                    }
+                }
+            }
         }
 
         /* P9.2: stack depth BEFORE this opcode.  sdt[pc]==0xffff means unreachable. */
@@ -2397,6 +2418,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "      if(%s(_da " c_op " _db)) goto _L%d; }\n", \
         d-2, d-1, d-2, (fneg)?"!":"", (ftgt))
 
+/* P9.3: break-emitting variant of GEN_CMP_FUSE_NUM (used when branch target is loop exit) */
+#define GEN_CMP_FUSE_NUM_BRK(c_op, fneg) \
+    jit_buf_printf(cb, \
+        "    { JSValue _va=_tsv%d,_vb=_tsv%d; _sp=%d;\n" \
+        "      double _da=(JS_VALUE_GET_TAG(_va)==JS_TAG_INT)" \
+                         "?(double)JS_VALUE_GET_INT(_va):JS_VALUE_GET_FLOAT64(_va);\n" \
+        "      double _db=(JS_VALUE_GET_TAG(_vb)==JS_TAG_INT)" \
+                         "?(double)JS_VALUE_GET_INT(_vb):JS_VALUE_GET_FLOAT64(_vb);\n" \
+        "      if(%s(_da " c_op " _db)) break; }\n", \
+        d-2, d-1, d-2, (fneg)?"!":"")
+
 /* Helper: emit fused general comparison+branch — INT fast path, float64 middle
  * path (P8.6), vtable fallback. */
 #define GEN_CMP_FUSE_GEN(int_op, c_op, rt_call, ftgt, fneg) \
@@ -2413,6 +2445,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "      } else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
         "      if(%s_cond) goto _L%d; }\n", \
         d-2, d-1, d-2, (fneg)?"!":"", (ftgt))
+
+/* P9.3: break-emitting variant of GEN_CMP_FUSE_GEN (used when branch target is loop exit) */
+#define GEN_CMP_FUSE_GEN_BRK(int_op, c_op, rt_call, fneg) \
+    jit_buf_printf(cb, \
+        "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n" \
+        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n" \
+        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n" \
+        "        _cond=(JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
+        "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&" \
+                      "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n" \
+        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n" \
+        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n" \
+        "        _cond=(_da " c_op " _db);\n" \
+        "      } else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
+        "      if(%s_cond) break; }\n", \
+        d-2, d-1, d-2, (fneg)?"!":"")
 
 /* Helper: unfused comparison (produces BOOL on stack).
  * P9.2: pop 2, push 1 at _tsv{d-2}; _sp = d-1.
@@ -2630,46 +2678,110 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_if_false: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
-            jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            /* P9.3: emit break instead of goto if target is loop exit */
+            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
+            else
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_if_true: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
-            jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            /* P9.3: emit break instead of goto if target is loop exit */
+            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) break; }\n", d-1, d-1);
+            else
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_goto: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
+            /* P9.3: check if this is a loop back-edge or break-to-exit */
+            if (p93_depth > 0) {
+                P93Loop *_cl = &p93_active[p93_depth - 1];
+                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
+                    /* Back-edge: close while(1){ */
+                    jit_buf_str(cb, "} /* while */\n");
+                    p93_depth--;
+                    break;
+                }
+                if ((uint32_t)tgt == _cl->exit_pc) {
+                    jit_buf_str(cb, "    break;\n");
+                    break;
+                }
+            }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
         case OP_if_false8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
-            jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            /* P9.3: emit break instead of goto if target is loop exit */
+            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
+            else
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_if_true8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
-            jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            /* P9.3: emit break instead of goto if target is loop exit */
+            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) break; }\n", d-1, d-1);
+            else
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_goto8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
+            /* P9.3: check if this is a loop back-edge or break-to-exit */
+            if (p93_depth > 0) {
+                P93Loop *_cl = &p93_active[p93_depth - 1];
+                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
+                    jit_buf_str(cb, "} /* while */\n");
+                    p93_depth--;
+                    break;
+                }
+                if ((uint32_t)tgt == _cl->exit_pc) {
+                    jit_buf_str(cb, "    break;\n");
+                    break;
+                }
+            }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
         case OP_goto16: {
             int tgt = pc + 1 + (int)(int16_t)bc_u16(&bc[pc+1]);
+            /* P9.3: check if this is a loop back-edge or break-to-exit */
+            if (p93_depth > 0) {
+                P93Loop *_cl = &p93_active[p93_depth - 1];
+                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
+                    jit_buf_str(cb, "} /* while */\n");
+                    p93_depth--;
+                    break;
+                }
+                if ((uint32_t)tgt == _cl->exit_pc) {
+                    jit_buf_str(cb, "    break;\n");
+                    break;
+                }
+            }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
