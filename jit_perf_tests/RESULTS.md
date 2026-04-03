@@ -1212,3 +1212,95 @@ function sumSquares(n) { let s=0; for(let i=0;i<n;i++) s+=square(i); return s; }
 | Pure interpreter best | 809 |
 
 Note: WSL2 variance is ±30% on v8bench.
+
+---
+
+## Phase 8.4 + 8.5 + IC-fixes + EarleyBoyer fix
+
+**Date:** 2026-04-02  
+**Binary:** `qjs_interp` (CONFIG_JIT=n) for interpreter; `./qjs --jit-aot` (CONFIG_JIT=y, threshold=2) for JIT.  
+**Commits:** `27f5b8e` (IC fixes), `b01183c` (P8.4), `09ef837` (P8.5), `62b24d8` (OP_put_var + js_jit_call padding).
+
+**Key changes:**
+- **IC fixes** (`27f5b8e`): `likely` → `js_likely` in 3 IC codegen strings; atom ABA guard; megamorphic demotion
+- **P8.4** (`b01183c`): integer argument fast-path — `int32_t _ai[]` / `uint32_t _aim` bitmask extracted at entry
+- **P8.5** (`09ef837`): dense array element fast path — bypass `JS_ValueToAtom` + hash walk for `JS_CLASS_ARRAY` integer indices
+- **EarleyBoyer fix** (`62b24d8`): two correctness bugs: `OP_put_var` UNINITIALIZED check for implicit globals; `js_jit_call` argc padding when callee has more formal params than passed args
+
+### Micro-benchmarks — bench_aot.js (3 runs each, min shown)
+
+| Benchmark | Interp r1 | Interp r2 | Interp r3 | **Interp min** | JIT r1 | JIT r2 | JIT r3 | **JIT min** | Speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fib(38) ×1           | 6232 ms | 5745 ms | 5602 ms | **5602 ms** | 1923 ms | 2197 ms | 1925 ms | **1923 ms** | **2.9×** |
+| fib(30) ×1           |  92.7 ms |  94.3 ms |  90.1 ms | **90.1 ms** |  32.7 ms |  32.8 ms |  32.0 ms | **32.0 ms** | **2.8×** |
+| sum_loop(1e6) ×20    | 668 ms | 658 ms | 665 ms | **658 ms** | 615 ms | 613 ms | 611 ms | **611 ms** | **1.08×** |
+| sum_sq(1e6) ×20      | 514 ms | 512 ms | 509 ms | **509 ms** | 324 ms | 314 ms | 315 ms | **314 ms** | **1.62×** |
+| count_primes(3000) ×10 | 8.12 ms | 6.33 ms | 7.38 ms | **6.33 ms** | 2.65 ms | 2.43 ms | 2.50 ms | **2.43 ms** | **2.60×** |
+| arr_sum(10000) ×1000 | 288 ms | 287 ms | 288 ms | **287 ms** | 197 ms | 187 ms | 203 ms | **187 ms** | **1.54×** |
+
+### V8 benchmark — run_qjs.js (3 runs each, best score used)
+
+#### Interpreter (no JIT)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    | 1024 |  781 |  825 | **1024** |
+| DeltaBlue   |  876 |  663 |  714 | **876** |
+| Crypto      | 1148 |  863 |  968 | **1148** |
+| RayTrace    | 1247 |  948 | 1031 | **1247** |
+| EarleyBoyer | 1497 | 3394 | 1820 | **3394** |
+| RegExp      |  294 |  183 |  282 | **294** |
+| Splay       | 1872 | 1958 | 1741 | **1958** |
+| **Score**   | 1008 |  910 |  912 | **1008** |
+
+#### GCC JIT (`--jit-aot`, warm cache)
+
+| Benchmark   | run 1 | run 2 | run 3 | **best** |
+|---|---:|---:|---:|---:|
+| Richards    |  611 |  724 |  707 | **724** |
+| DeltaBlue   |  537 |  781 |  833 | **833** |
+| Crypto      |  752 | 1289 | 1242 | **1289** |
+| RayTrace    |  918 |  898 |  853 | **918** |
+| EarleyBoyer | 1101 | 2106 | 1346 | **2106** |
+| RegExp      |  380 |  400 |  216 | **400** |
+| Splay       | 1168 | 1179 | 1250 | **1250** |
+| **Score**   |  730 |  940 |  809 | **940** |
+
+### Summary
+
+| Benchmark | Interp best | JIT best | Speedup |
+|---|---:|---:|---:|
+| fib(38) ×1             | 5602 ms | 1923 ms | **2.9×** |
+| fib(30) ×1             |  90.1 ms |  32.0 ms | **2.8×** |
+| sum_loop(1e6) ×20      |  658 ms |  611 ms | **1.08×** |
+| sum_sq(1e6) ×20        |  509 ms |  314 ms | **1.62×** |
+| count_primes(3000) ×10 |  6.33 ms |  2.43 ms | **2.60×** |
+| arr_sum(10000) ×1000   |  287 ms |  187 ms | **1.54×** |
+| V8bench Score          | 1008 | 940 | **0.93×** |
+
+**Note:** `sum_loop` regression (1.08× instead of expected ~1.4×) remains —
+the hot loop uses `let i` and `let s` which are `OP_set_loc` / `add_loc` paths
+that are correctly handled by P8.1, but the GCC-compiled code still has overhead
+from the JSValue stack ops surrounding the increment. The 0.93× v8bench score
+reflects that Richards, DeltaBlue, and RayTrace workloads are not yet well-served
+by the JIT (object-heavy or float-heavy code paths still go through the vtable).
+EarleyBoyer now runs correctly (bug fixed in `62b24d8`).
+
+### How to reproduce
+
+```sh
+# From quickjs/
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs
+
+# Populate cache
+./qjs --jit-warmup jit_perf_tests/bench_aot.js
+
+# Micro-benchmarks
+./qjs_interp              jit_perf_tests/bench_aot.js
+./qjs --jit-aot           jit_perf_tests/bench_aot.js
+
+# V8 benchmark suite (from v8bench subdirectory)
+cd jit_perf_tests/v8bench
+../../qjs_interp           run_qjs.js
+../../qjs --jit-aot        run_qjs.js
+```

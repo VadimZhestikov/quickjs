@@ -131,3 +131,69 @@ deleted on success, cluttering `/tmp` on every compilation failure.  Changed to
 | `quickjs.c` | `js_jit_ic_fill_get`: fill `ic->atom`; add megamorphic demotion |
 | `quickjs.c` | `js_jit_ic_fill_put`: fill `ic->atom`; add megamorphic demotion |
 | `quickjs.c` | Add `#define JIT_IC_MEGAMORPHIC ((void *)(uintptr_t)1)` |
+
+---
+
+## Bug 4 — `OP_put_var` skipped `JS_UNINITIALIZED` check (implicit globals)
+
+Commit `62b24d8`.
+
+### Symptom
+
+EarleyBoyer threw `TypeError: cannot read property 'appendJSString' of undefined`
+when JIT-compiled code ran `p = SC_DEFAULT_OUT` inside `sc_display(o, p)` (called
+with one argument).  `p` remained `undefined` after the assignment.
+
+### Root cause
+
+The JIT's `OP_put_var` / `OP_put_var_init` emitted:
+
+```c
+{ JSValue *_p = _RT->var_ref_value(var_refs[idx]);
+  _FREE(*_p); *_p = _s[--_sp]; }
+```
+
+For non-lexical implicit globals (e.g. top-level `var SC_DEFAULT_OUT = ...` in a
+loaded script), `*pvalue` is always `JS_UNINITIALIZED` — the interpreter always
+routes reads/writes through `JS_GetPropertyInternal` / `JS_SetPropertyInternal` on
+the global object.  The JIT bypassed this and wrote directly to `*pvalue`, but
+`OP_get_var` still read via `get_var_slow` → `JS_GetPropertyInternal`, so it saw
+the old (or absent) value.
+
+### Fix
+
+Added `put_var_slow` vtable entry (`js_jit_op_put_var_slow` in `quickjs.c`) that
+mirrors the interpreter's `OP_put_var` slow path.  Updated `OP_put_var` /
+`OP_put_var_init` codegen to emit an `JS_TAG_UNINITIALIZED` check before the
+direct write; the slow path is taken when the check fires.  The only exception:
+`OP_put_var_init` for a lexical variable writes directly (this is the normal `let`
+initialisation path, identical to the interpreter's `goto put_var_ok`).
+
+---
+
+## Bug 5 — `js_jit_call` passed unpadded `argc` to JIT callee (P8.3 path)
+
+Commit `62b24d8`.
+
+### Symptom
+
+`sc_display(result)` is called with one argument (`argc=1`) but `sc_display` has
+`arg_count=2` (parameters `o` and `p`).  When the caller was JIT-compiled (P8.3
+`js_jit_call` path), the JIT callee saw `argc=1`.  `GEN_PUT_ARG(1)` guards with
+`if (1 < argc)` → false → silently discards `p = SC_DEFAULT_OUT`.  Subsequent
+`GEN_GET_ARG(1)` returns `JS_UNDEFINED` (the `1 < argc` check is false), so `p`
+is `undefined` when `p.appendJSString(...)` is called.
+
+A secondary bug: naively padding with `alloca` + shallow copy caused a double-free
+on shutdown (both the callee's `_FREE(padded[i])` and the caller's cleanup
+decremented the same refcount), manifesting as `Assertion 'list_empty(&rt->gc_obj_list)'
+failed`.
+
+### Fix
+
+In `js_jit_call`, when `argc < b->arg_count`: allocate a padded `JSValue` array
+via `alloca`, `JS_DupValue` each provided argument into it (so the callee owns its
+own reference), fill remaining slots with `JS_UNDEFINED`, call the JIT function
+with `n = b->arg_count`, then `JS_FreeValue` all padded slots after the call.  The
+DUP/free pattern matches what `JS_CallInternal` does for its `arg_buf` when padding
+is needed.
