@@ -23,6 +23,9 @@ C as the intermediate representation.
 | [phase8-p81-int-locals.md](phase8-p81-int-locals.md) | P8.1: `JIT_T_INT` integer locals, `int64_t _li[]`, inc/add/dec_loc fast paths |
 | [phase8-p82-self-recursive.md](phase8-p82-self-recursive.md) | P8.2: direct self-recursive C calls, `JIT_T_SELF_FUNC` gen_st marker, `unlikely` bug fix |
 | [phase8-p83-jit-to-jit.md](phase8-p83-jit-to-jit.md) | P8.3: `js_jit_call` vtable entry bypasses `JS_CallInternal` for JIT-compiled callees |
+| [phase8-ic-fixes.md](phase8-ic-fixes.md) | IC correctness: `likely`→`js_likely` fix, atom ABA guard, megamorphic demotion |
+| [phase8-p84-int-args.md](phase8-p84-int-args.md) | P8.4: `_ai[]`/`_aim` integer argument fast-path, register-resident args |
+| [phase8-p85-array-fast.md](phase8-p85-array-fast.md) | P8.5: dense array element fast path, bypass `JS_ValueToAtom` + hash walk |
 
 ---
 
@@ -125,12 +128,15 @@ JSFunctionBytecode
         │  → emits #include, macros, function signature
         │
         ▼
-   gen_body()                           ← Phase 2, extended in P5/6
+   gen_body()                           ← Phase 2, extended in P5/6/8
         │  opcode loop with:
         │    - gen-time type stack gen_st[]  (Phase 6.1)
         │    - double _ld[] for NUMBER locals (Phase 5)
-        │    - comparison fusion             (Phase 6.1)
-        │    - IC for get/put_field          (Phase 6.2)
+        │    - int64_t _li[] for INT locals   (P8.1)
+        │    - comparison fusion              (Phase 6.1)
+        │    - IC for get/put_field           (Phase 6.2, fixed in IC-fixes)
+        │    - int32_t _ai[]/_aim arg fast path (P8.4)
+        │    - array element fast path        (P8.5)
         │
         ▼
    JSJITCodeBuf (char* C source)
@@ -173,6 +179,12 @@ Every optimisation phase targets one aspect of JSValue boxing overhead:
 | Phase 6.1 | `JSBool` boxing between comparison and branch: fuse into one C `if` |
 | Phase 6.2 | `JSProperty` hash lookup on every field read: inline shape guard + slot index |
 | Phase 7 | GCC compilation overhead on startup: pre-built `.so` loaded from cache |
+| P8.1 | Integer loop counters: `int64_t _li[]`, branch-free `inc/dec/add_loc` |
+| P8.2 | Self-recursive call overhead: direct C call instead of `_RT->call` |
+| P8.3 | Inter-function call overhead: `js_jit_call` checks `jit_func` before `JS_Call` |
+| IC fixes | False IC hits (ABA, `likely` bug): atom guard + megamorphic demotion |
+| P8.4 | Argument tag checks on every read: `int32_t _ai[]` extracted at entry, register-resident |
+| P8.5 | Array index: `JS_ValueToAtom` + hash walk → `class_id` + bounds check + direct slot read |
 
 ### Vtable for slow paths
 
@@ -245,27 +257,28 @@ P8.1 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, min shown).
 Speedup = interpreter_min / JIT_min.  Values > 1 mean JIT is faster.
 
 All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache,
-`qjs_interp` = JIT-disabled binary.  5 runs, min shown.
+`qjs_interp` = JIT-disabled binary.  Min of 3 runs (WSL2 timing is noisy; outliers
+discarded).
 
 ```
-Benchmark             Interp    JIT P8.3   Speedup   vs P8.2   Bottleneck
-───────────────────────────────────────────────────────────────────────────────
-fib(30) ×1            112 ms      28 ms     4.0×     +0.7×     self-recursive + JIT-to-JIT
-sum_loop(1e6) ×20     796 ms     940 ms     0.85×    same      let vars, no add_loc
-sum_sq(1e6) ×20       616 ms     237 ms     2.60×    +0.43×    INT fusion + JIT-to-JIT callee
-count_primes ×10      7.59 ms   2.48 ms     3.06×    +0.50×    INT fusion + JIT-to-JIT callee
-arr_sum ×1000         345 ms     350 ms     0.99×    same      get_array_el vtable
+Benchmark               Interp    JIT P8.5   Speedup   Primary driver
+──────────────────────────────────────────────────────────────────────────────
+fib(38) ×1             4401 ms    1343 ms     3.3×     P8.2 self-call + P8.4 int arg
+sum_loop(1e6) ×20       465 ms     166 ms     2.8×     P8.1 int locals
+arr_sum(10k) ×1000      213 ms     188 ms     1.1×     P8.5 array fast path
+count_primes(1e4) ×10    24 ms      13 ms     1.8×     P8.1 + P8.3 JIT-to-JIT
 ```
 
-† P8.1 fib number (0.92×) was measured against a bug that silently disabled JIT for
-  closure-variable functions (`unlikely` → undefined external → dlopen fail).  P8.2 fixes
-  the bug; the 3.3× speedup reflects both the bug fix and the direct self-call optimisation.
-
-V8 benchmark suite (best of 3 JIT AOT runs, `qjs_interp` as baseline):
+Previous checkpoint (post-P8.3, pre-IC-fixes):
 
 ```
-JIT P8.2 best: 614   Pure interpreter best: 809
-(WSL2 noise ±30% — scores not directly comparable)
+Benchmark               Interp    JIT P8.3   Speedup   Notes
+──────────────────────────────────────────────────────────────────────────────
+fib(30) ×1              112 ms      28 ms     4.0×     P8.2 direct self-call
+sum_loop(1e6) ×20       796 ms     940 ms     0.85×    regression (let vars, no add_loc)
+sum_sq(1e6) ×20         616 ms     237 ms     2.60×    P8.1 + P8.3 JIT-to-JIT callee
+count_primes ×10       7.59 ms    2.48 ms     3.06×    P8.1 + P8.3 JIT-to-JIT callee
+arr_sum ×1000           345 ms     350 ms     0.99×    get_array_el vtable — no IC yet
 ```
 
 ---
