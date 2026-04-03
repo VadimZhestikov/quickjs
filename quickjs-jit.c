@@ -923,6 +923,10 @@ static uint64_t jit_hash_bytecode(const uint8_t *bc, int bc_len)
 
 static char jit_cache_dir[512];
 static int  jit_cache_enabled;
+static int  jit_aot_mode_active;
+
+void js_jit_set_aot_mode(int active) { jit_aot_mode_active = active; }
+int  js_jit_get_aot_mode(void)       { return jit_aot_mode_active; }
 
 static void jit_cache_init(void)
 {

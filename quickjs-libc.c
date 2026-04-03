@@ -75,6 +75,9 @@ typedef sig_t sighandler_t;
 #include "cutils.h"
 #include "list.h"
 #include "quickjs-libc.h"
+#ifdef CONFIG_JIT
+#include "quickjs-jit.h"
+#endif
 
 #if !defined(PATH_MAX)
 #define PATH_MAX 4096
@@ -448,8 +451,26 @@ static JSValue js_loadScript(JSContext *ctx, JSValueConst this_val,
         JS_FreeCString(ctx, filename);
         return JS_EXCEPTION;
     }
-    ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
-                  JS_EVAL_TYPE_GLOBAL);
+#ifdef CONFIG_JIT
+    if (js_jit_get_aot_mode()) {
+        /* --jit-aot / --jit-warmup: compile-only pass to discover all
+         * nested functions, pre-compile them with GCC, then execute.
+         * Mirrors eval_buf() in qjs.c so that load()'ed scripts get the
+         * same AOT treatment as the top-level script. */
+        ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
+                      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(ret)) {
+            if (JS_VALUE_GET_TAG(ret) == JS_TAG_FUNCTION_BYTECODE)
+                js_jit_compile_all(ctx, JS_VALUE_GET_PTR(ret));
+            js_jit_drain();
+            ret = JS_EvalFunction(ctx, ret);
+        }
+    } else
+#endif
+    {
+        ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
+                      JS_EVAL_TYPE_GLOBAL);
+    }
     js_free(ctx, buf);
     JS_FreeCString(ctx, filename);
     return ret;

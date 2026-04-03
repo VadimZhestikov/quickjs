@@ -388,5 +388,14 @@ void js_jit_compile_all(JSContext *ctx, JSFunctionBytecode *b);
  */
 void js_jit_drain(void);
 
+/*
+ * js_jit_set_aot_mode() / js_jit_get_aot_mode() — global flag that tells
+ * dynamic script loaders (e.g. js_loadScript / load()) to pre-compile all
+ * functions before executing the loaded script.  Set by qjs.c when
+ * --jit-aot or --jit-warmup is active.
+ */
+void js_jit_set_aot_mode(int active);
+int  js_jit_get_aot_mode(void);
+
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */

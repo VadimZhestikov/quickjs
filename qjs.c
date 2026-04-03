@@ -481,10 +481,12 @@ int main(int argc, char **argv)
 #ifdef CONFIG_JIT
             if (!strcmp(longopt, "jit-aot")) {
                 jit_aot_mode = 1;
+                js_jit_set_aot_mode(1);
                 continue;
             }
             if (!strcmp(longopt, "jit-warmup")) {
                 jit_warmup_mode = 1;
+                js_jit_set_aot_mode(1);
                 continue;
             }
 #endif
