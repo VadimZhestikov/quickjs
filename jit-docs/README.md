@@ -458,6 +458,24 @@ The combined `.so` exports a `__jit_manifest[]` table mapping `bc_hash → func_
 `js_jit_install_combined()` walks the table and atomically installs each function pointer
 into the corresponding `JSFunctionBytecode`, replacing the per-function `.so` handles.
 
+### 10.5 IC check inlining via LTO
+
+`js_jit_ic_check()` (shape + atom guard, ~3 pointer compares) is currently in
+`quickjs-jit.c`, compiled separately — GCC cannot inline it into the generated hot loop.
+The fix: extract the IC helpers into `quickjs-jit-ic.c` and add it to the `--jit-link`
+GCC command line alongside the generated `.c` files:
+
+```sh
+gcc -O2 -flto -shared -fPIC \
+    ~/.cache/qjs-jit/*.c quickjs-jit-ic.c \
+    -o combined.so
+```
+
+GCC inlines the 3-compare guard directly into every `get_field` hot path.  This removes
+the last function-call overhead from the most frequent operation in object-heavy
+benchmarks (DeltaBlue, RayTrace).  Verification: `objdump -d combined.so | grep -c
+"call.*js_jit_ic_check"` must return 0.
+
 ### Synergy with Phase 9
 
 Phase 9 typed temps (`_tsd{N}`) mean the inlined callee code contains only `double`

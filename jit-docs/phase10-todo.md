@@ -17,10 +17,10 @@ P10.1 (cache .c)       ─── independent, do first
 P10.2 (--jit-link)     ─── requires P10.1
 P10.3 (direct calls)   ─── requires P10.1 (symbol names come from bc_hash)
 P10.4 (manifest/loader)─── requires P10.2 + P10.3
-P10.5 (IC inlining)    ─── optional, requires P10.4
+P10.5 (IC inlining)    ─── requires P10.4
 ```
 
-Suggested order: P10.1 → P10.2 → P10.3 → P10.4 → P10.5 (optional)
+Suggested order: P10.1 → P10.2 → P10.3 → P10.4 → P10.5
 
 ---
 
@@ -212,16 +212,19 @@ individual per-function `.so` files.  This requires a *manifest*: a mapping from
 
 ---
 
-## P10.5 — IC Check Inlining via LTO (Optional)
+## P10.5 — IC Check Inlining via LTO
 **Estimated effort:** ~1 day  **Risk:** low–medium  **Files:** `quickjs-jit.c`, `Makefile`
 
 ### Background
 
-The inline cache check in generated code currently calls `js_jit_ic_check()` (defined
-in `quickjs-jit.c`).  Because `quickjs-jit.c` is compiled separately from the generated
-`.c` files, GCC cannot inline it.  Adding `quickjs-jit.c` (or a trimmed subset) to the
-combined LTO compilation lets GCC inline the IC check — typically 3 pointer comparisons —
-directly into the hot property-read path.
+The inline cache check in generated code calls `js_jit_ic_check()` (shape + atom guard,
+defined in `quickjs-jit.c`).  Because `quickjs-jit.c` is compiled separately from the
+generated `.c` files, GCC sees only an opaque function call — it cannot inline the 3
+pointer compares into the hot loop, and the call overhead appears on every property read.
+
+Extracting the IC helpers into a dedicated `quickjs-jit-ic.c` and adding it to the
+`--jit-link` GCC invocation is the final step to make every `get_field` hot path a
+flat inlined sequence with no function call overhead.
 
 ### Tasks
 
@@ -279,8 +282,8 @@ For development, the old per-function mode still works:
 | P10.2 --jit-link | Combined LTO `.so` | 1.5 days | medium | baseline for P10 |
 | P10.3 Direct calls | No `js_jit_call()` for known callees | 1 day | medium | +20–50% on call-heavy |
 | P10.4 Manifest/loader | Atomic install from combined `.so` | 1 day | low | enables P10.3 benefit |
-| P10.5 IC inlining (opt) | IC check inlined by LTO | 1 day | low | +5–15% on IC-heavy |
-| **Total** | | **~5 days** | | **~1.5–2.5× on top of P9** |
+| P10.5 IC inlining | IC check inlined by LTO | 1 day | low | +5–15% on IC-heavy |
+| **Total** | | **~6 days** | | **~1.5–2.5× on top of P9** |
 
 ### Per-benchmark projections (P9 → P10)
 
