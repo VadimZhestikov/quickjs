@@ -237,6 +237,8 @@ typedef struct {
     uint32_t  atom;   /* JSAtom at slot — ABA guard: if shape is freed and
                        * reallocated for a different layout, the atom at this
                        * slot will differ, preventing false IC hits. */
+    uint8_t   kind;   /* 0=general, 1=float64 typed slot (P8.6) */
+    uint8_t   _pad[3];
 } JSJITICEntry;
 
 /*

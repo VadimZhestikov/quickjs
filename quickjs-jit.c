@@ -1818,71 +1818,196 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * ---------------------------------------------------------------- */
 
         /* add: int overflow check using 64-bit arithmetic */
-        case OP_add:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
-                "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                "      } }\n");
-            break;
+        /* P8.6: float64 fast paths for arithmetic.
+         * When gen-time type stack says both operands are numeric (JIT_T_NUMBER),
+         * we know they are INT or FLOAT64 and can skip the vtable entirely.
+         * When gen-time types are unknown we still emit a runtime float64 branch
+         * so object-property arithmetic (e.g. this.x + this.y) avoids the vtable
+         * once the IC has seen float64 values. */
 
-        /* sub: int fast path */
-        case OP_sub:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
-                "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->sub(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                "      } }\n");
+        case OP_add: {
+            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            if (_bn) {
+                /* gen-time: both numeric — INT+INT kept for int32 result */
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "      } else {\n"
+                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da+_db);\n"
+                    "      } }\n");
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da+_db);\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                    "      } }\n");
+            }
             break;
+        }
 
-        /* mul: int fast path, overflow via int64 */
-        case OP_mul:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
-                "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
-                "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
-                "        else\n"
-                "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->mul(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                "      } }\n");
+        /* sub: int fast path + float64 fast path */
+        case OP_sub: {
+            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            if (_bn) {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "      } else {\n"
+                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da-_db);\n"
+                    "      } }\n");
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da-_db);\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->sub(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                    "      } }\n");
+            }
             break;
+        }
 
-        /* div: always float result; only skip vtable for int/int */
-        case OP_div:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
-                "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
-                "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->div(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                "      } }\n");
+        /* mul: int fast path + float64 fast path */
+        case OP_mul: {
+            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            if (_bn) {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
+                    "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
+                    "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
+                    "        else\n"
+                    "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "      } else {\n"
+                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da*_db);\n"
+                    "      } }\n");
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
+                    "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
+                    "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
+                    "        else\n"
+                    "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da*_db);\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->mul(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                    "      } }\n");
+            }
             break;
+        }
 
-        /* mod: int fast path */
-        case OP_mod:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
-                "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
-                "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
-                "      } else {\n"
-                "        JSValue _r=_RT->mod(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                "      } }\n");
+        /* div: float result; int/int fast path + float64 fast path */
+        case OP_div: {
+            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            if (_bn) {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
+                    "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
+                    "      } else {\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da/_db);\n"
+                    "      } }\n");
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
+                    "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
+                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,_da/_db);\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->div(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                    "      } }\n");
+            }
             break;
+        }
+
+        /* mod: int fast path + float64 fast path */
+        case OP_mod: {
+            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            if (_bn) {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
+                    "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
+                    "      } else {\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,fmod(_da,_db));\n"
+                    "      } }\n");
+            } else {
+                jit_buf_str(cb,
+                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                    "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
+                    "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
+                    "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
+                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewFloat64(ctx,fmod(_da,_db));\n"
+                    "      } else {\n"
+                    "        JSValue _r=_RT->mod(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
+                    "      } }\n");
+            }
+            break;
+        }
 
         /* Bitwise: ToInt32 already guaranteed by semantics; fast path for int */
 #define GEN_BITOP_INT(op_str, rt_name) \
@@ -1937,18 +2062,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Arithmetic (unary) with int fast paths ---- */
         case OP_neg:
             jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                "    { JSValue _a=_s[--_sp]; int _ta=JS_VALUE_GET_TAG(_a);\n"
+                "      if(_ta==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
                 "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
                 "                                 :JS_NewInt32(ctx,-ia);\n"
-                "      } else { JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "      } else if(_ta==JS_TAG_FLOAT64)\n"
+                "        _s[_sp++]=JS_NewFloat64(ctx,-JS_VALUE_GET_FLOAT64(_a));\n"
+                "      else { JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
         case OP_plus:
             jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _s[_sp++]=_a; /* int is already a number */\n"
+                "    { JSValue _a=_s[--_sp]; int _ta=JS_VALUE_GET_TAG(_a);\n"
+                "      if(_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)\n"
+                "        _s[_sp++]=_a; /* numeric — already a number, no coercion needed */\n"
                 "      else { JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
             break;
         case OP_not: /* bitwise ~ */
@@ -2127,24 +2254,38 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "      if(%s(_da " c_op " _db)) goto _L%d; }\n", \
         (fneg)?"!":"", (ftgt))
 
-/* Helper: emit fused general comparison+branch with INT fast path.
- * rt_call: full vtable call expression, e.g. "_RT->lt(ctx,_a,_b)" */
-#define GEN_CMP_FUSE_GEN(int_op, rt_call, ftgt, fneg) \
+/* Helper: emit fused general comparison+branch — INT fast path, float64 middle
+ * path (P8.6), vtable fallback. Handles object-property float64 comparisons
+ * without gen-time type info. */
+#define GEN_CMP_FUSE_GEN(int_op, c_op, rt_call, ftgt, fneg) \
     jit_buf_printf(cb, \
         "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n" \
-        "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
+        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n" \
+        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n" \
         "        _cond=(JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
-        "      else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
+        "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&" \
+                      "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n" \
+        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n" \
+        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n" \
+        "        _cond=(_da " c_op " _db);\n" \
+        "      } else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
         "      if(%s_cond) goto _L%d; }\n", \
         (fneg)?"!":"", (ftgt))
 
-/* Helper: unfused comparison (produces BOOL on stack) with INT fast path */
-#define GEN_CMP_UNFUSED(int_op, rt_call_or_expr) \
+/* Helper: unfused comparison (produces BOOL on stack) — INT fast path, float64
+ * middle path (P8.6), vtable fallback. */
+#define GEN_CMP_UNFUSED(int_op, c_op, rt_call_or_expr) \
     jit_buf_str(cb, \
         "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
-        "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
+        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n" \
+        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n" \
         "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
-        "      else { " rt_call_or_expr " } }\n")
+        "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&" \
+                      "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n" \
+        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n" \
+        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n" \
+        "        _s[_sp++]=JS_NewBool(ctx,_da " c_op " _db);\n" \
+        "      } else { " rt_call_or_expr " } }\n")
 
 /* Shared logic for comparison opcodes. Usage:
  *   DO_CMP(c_op, int_op, vtable_call_expr_normal, vtable_call_expr_if_neg_int)
@@ -2161,9 +2302,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM("<",  _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("<", "<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("<", "JSValue _r=_RT->lt(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("<", "<", "JSValue _r=_RT->lt(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2174,9 +2315,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM("<=", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("<=","_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("<=", "<=", "_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("<=","JSValue _r=_RT->lte(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("<=", "<=", "JSValue _r=_RT->lte(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2188,9 +2329,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM(">",  _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN(">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN(">", ">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED(">", "JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED(">", ">", "JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2202,9 +2343,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM(">=", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN(">=","_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN(">=", ">=", "_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED(">=","JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED(">=", ">=", "JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2216,9 +2357,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("==","_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("==", "==", "_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("==","JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("==", "==", "JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2232,18 +2373,30 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
                 else     jit_buf_printf(cb,
                     "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _cond=(_da!=_db);\n"
+                    "      } else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
                     "      if(%s_cond) goto _L%d; }\n",
                     _fi.negate?"!":"", _fi.tgt);
             } else {
                 jit_buf_str(cb,
                     "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
-                    "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,_da!=_db);\n"
+                    "      } else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
+                    "               _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2254,13 +2407,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("==","_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate);
+                else     GEN_CMP_FUSE_GEN("==", "==", "_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate);
             } else {
                 jit_buf_str(cb,
                     "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
-                    "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,_da==_db);\n"
+                    "      } else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2273,18 +2432,30 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
                 else     jit_buf_printf(cb,
                     "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _cond=(_da!=_db);\n"
+                    "      } else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
                     "      if(%s_cond) goto _L%d; }\n",
                     _fi.negate?"!":"", _fi.tgt);
             } else {
                 jit_buf_str(cb,
                     "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_VALUE_GET_TAG(_b)&&JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
-                    "             _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                    "        _s[_sp++]=JS_NewBool(ctx,_da!=_db);\n"
+                    "      } else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
+                    "               _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;

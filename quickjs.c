@@ -15977,6 +15977,7 @@ int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
     ic->shape = p->shape;
     ic->slot  = (uint32_t)(pr - p->prop);
     ic->atom  = prs->atom;
+    ic->kind  = (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_FLOAT64) ? 1 : 0;
     return 1;
 }
 
