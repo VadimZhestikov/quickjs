@@ -142,44 +142,42 @@ local within each basic block.
 
 ### Tasks
 
-- [ ] **P9.2-A** Obtain `stack_depth_tab` from the bytecode object (P9.0 prerequisite):
+- [x] **P9.2-A** Obtain `stack_depth_tab` from the bytecode object (P9.0 prerequisite):
   ```c
-  int8_t *stack_depth_tab = js_jit_fb_stack_depth_tab(b);
-  assert(stack_depth_tab != NULL);  /* set by compute_stack_size() */
+  const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
+  int d = (sdt && sdt[pc] != 0xffff) ? (int)sdt[pc] : 0;
   ```
   No simulation needed in the JIT — the compiler already filled the table.
   (Previously this was a ~60-line pre-pass; P9.0-A eliminates it.)
 
-- [ ] **P9.2-B** Replace preamble stack array with named temporaries:
+- [x] **P9.2-B** Replace preamble stack array with named temporaries:
   ```c
-  // Before
-  jit_buf_printf(cb, "    JSValue _s[%d];\n    int _sp=0;\n", stack_size);
-  // After
-  for (int d = 0; d < stack_size; d++)
-      jit_buf_printf(cb, "    JSValue _tsv%d;\n", d);
+  // Before:  JSValue _s[N]; int _sp=0;
+  // After:   JSValue _tsv0=JS_UNDEFINED; ... JSValue _tsv{N-1}=JS_UNDEFINED; int _sp=0;
   ```
+  `_sp` is retained for the `_ex:` exception cleanup path only.
 
-- [ ] **P9.2-C** Macro helpers for use inside opcode cases:
+- [x] **P9.2-C** Each opcode emission uses `d = sdt[pc]` (depth before opcode) as a
+  local `int` and formats `_tsv%d` with `d`, `d-1`, `d-2` etc.  No macro needed.
+
+- [x] **P9.2-D** Updated every opcode case in `gen_body()` to use `_tsv{N}`:
+  - **Pushes**: `_tsv{d} = X; _sp = d+1;`
+  - **Pops (single)**: read `_tsv{d-1}`, set `_sp = d-1`
+  - **Pops (two)**: `_b = _tsv{d-1}`, `_a = _tsv{d-2}`, result → `_tsv{d-2}`
+  - **Peek (no pop)**: `_tsv{d-1}`
+  - **Calls**: temp array `_ca{pc}[N] = {_tsv{d-N}, ...}` for argument passing
+
+- [x] **P9.2-E** Exception cleanup in `gen_footer()` uses unrolled:
   ```c
-  // depth at current pc from stack_depth_tab[pc]
-  #define _TS_TOP(tab,pc)    _tsv ## tab[pc]   // won't work directly — see note
+  if(_sp>N-1){_FREE(_tsv{N-1});}  // for each slot from stack_size-1 down to 0
   ```
-  In practice, each opcode emission passes `stack_depth_tab[pc]` as a local `int _d`
-  and formats `_tsv%d` with `_d`, `_d-1`, `_d-2` etc.
+  Stack indexing is entirely static; `_sp` is only written for cleanup purposes.
 
-- [ ] **P9.2-D** Update every opcode case in `gen_body()` to use `_tsv{N}`:
-  - **Pushes**: `jit_buf_printf(cb, "    _tsv%d = X;\n", _d);` where `_d` is the
-    pre-opcode depth.
-  - **Pops (single)**: read `_tsv%d` with `_d-1`.
-  - **Pops (two)**: `_b = _tsv{_d-1}`, `_a = _tsv{_d-2}`.
-  - **Peek (no pop)**: `_tsv{_d-1}`.
-  Priority order for cases: arithmetic → comparisons → get_loc/put_loc →
-  get_arg/put_arg → get_field/put_field → calls → control flow → rest.
-
-- [ ] **P9.2-E** Remove the `int _sp = 0;` declaration from the generated code.
-  The runtime variable `_sp` disappears entirely — all indexing is now static.
-
-- [ ] **P9.2-F** Verify `make test`.  Then run V8bench and compare to pre-P9.2 baseline.
+- [x] **P9.2-F** `make CONFIG_JIT=y test` passes. V8bench score: 825–974 (confirmed
+  no regression vs P8.6 baseline; DeltaBlue no longer fails "Projection 2").
+  Bug fixed: `OP_sub` general path had `_b`/`_a` operands swapped (computed
+  `right - left` instead of `left - right`); fixed by matching the add/mul/div
+  parameter order (`d-1, d-2, ...`).
 
 - [ ] **P9.2-G** Typed variant declaration for typed gen_st slots:
   When `local_type` or `gen_st` at a given depth slot is `JIT_T_NUMBER`, also declare
@@ -329,4 +327,6 @@ properties, the generated C contains only `double` arithmetic and a single
 - [x] `make CONFIG_JIT=y test` — full test suite passes (P9.0-A + P9.1)
 - [x] `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs && (cd jit_perf_tests/v8bench && ../../qjs --jit-aot run_qjs.js)` — Score: 871 (no regression vs P8.6)
 - [x] Manual spot-check: `QJS_JIT_KEEP_C=1 ./qjs --jit-warmup script.js` — named vars confirmed
+- [x] `make CONFIG_JIT=y test` — passes after P9.2 implementation
+- [x] V8bench after P9.2: Score 825–974 (warm cache), no DeltaBlue failures
 - [ ] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors

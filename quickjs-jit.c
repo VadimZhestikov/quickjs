@@ -1029,7 +1029,7 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     int status = 0;
     waitpid(pid, &status, 0);
     int gcc_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    unlink(c_path);
+    if (!getenv("QJS_JIT_KEEP_C")) unlink(c_path);
     free(c_path);
     if (!gcc_ok) { unlink(so_path); goto fail; }
 
@@ -1318,11 +1318,13 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         "{\n",
         fname_out);
 
-    /* Stack declaration */
-    if (stack_size > 0)
-        jit_buf_printf(cb, "    JSValue _s[%d];\n", stack_size);
-    else
-        jit_buf_str(cb, "    JSValue _s[1];\n"); /* avoid zero-length array */
+    /* P9.2: named temp stack slots — declare _tsv0.._tsv{stack_size-1}.
+     * Each initialized to JS_UNDEFINED so the _ex cleanup path can safely
+     * _FREE them even if they were never written. */
+    for (int j = 0; j < stack_size; j++)
+        jit_buf_printf(cb, "    JSValue _tsv%d=JS_UNDEFINED;\n", j);
+    /* _sp is still needed: updated at throw/exception sites so the _ex
+     * cleanup knows which _tsv{} slots are live. */
     jit_buf_str(cb, "    int _sp=0;\n");
     jit_buf_str(cb, "    (void)argc; (void)cpool; (void)var_refs;\n");
 
@@ -1364,15 +1366,21 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
 
 /*
  * Emit the exception-cleanup footer and closing brace.
+ * P9.2: stack cleanup is unrolled using _tsv{} names, guarded by _sp.
+ * _sp is updated at every throw/exception site so this correctly frees
+ * only live slots.
  */
 static void gen_footer(JSJITCodeBuf *cb, int var_count,
-                       int arg_count, char **varnames)
+                       int arg_count, char **varnames, int stack_size)
 {
     jit_buf_str(cb, "_ex:\n");
     for (int j = 0; j < var_count; j++)
         jit_buf_printf(cb, "    _FREE(_jsv_%s);\n", varnames[arg_count + j]);
+    /* Unrolled stack cleanup: free _tsv{stack_size-1} down to _tsv{0}
+     * but only if _sp says that slot is live. */
+    for (int j = stack_size - 1; j >= 0; j--)
+        jit_buf_printf(cb, "    if(_sp>%d){_FREE(_tsv%d);}\n", j, j);
     jit_buf_str(cb,
-        "    for(;_sp>0;) _FREE(_s[--_sp]);\n"
         "    return JS_EXCEPTION;\n"
         "}\n");
 }
@@ -1448,6 +1456,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     *unsupported_out = 0;
     int pc = 0;
 
+    /* P9.2: per-PC stack depth table (from compute_stack_size pass). */
+    const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
+
     /* P9.1: named-variable helpers — defined here so all opcode cases can use them */
 #define LNAME(idx) varnames[arg_count + (idx)]
 #define ANAME(idx) varnames[(idx)]
@@ -1491,6 +1502,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb, "_L%d:;\n", pc);
         }
 
+        /* P9.2: stack depth BEFORE this opcode.  sdt[pc]==0xffff means unreachable. */
+        int d = (sdt && sdt[pc] != 0xffff) ? (int)sdt[pc] : 0;
+
         int op = bc[pc];
         if (op >= op_sz_count || op_sz[op] == 0) {
             fprintf(stderr, "[JIT] unsupported opcode 0x%02x at pc=%d\n", op, pc);
@@ -1505,120 +1519,128 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Push immediate values ---- */
+        /* P9.2: push into _tsv{d}, then _sp = d+1. d = sdt[pc] = depth before push. */
         case OP_push_i32:
             jit_buf_printf(cb,
-                "    _s[_sp++]=JS_NewInt32(ctx,(int32_t)%uu);\n",
-                bc_u32(&bc[pc+1]));
+                "    _tsv%d=JS_NewInt32(ctx,(int32_t)%uu); _sp=%d;\n",
+                d, bc_u32(&bc[pc+1]), d+1);
             break;
         case OP_push_i8:
             jit_buf_printf(cb,
-                "    _s[_sp++]=JS_NewInt32(ctx,%d);\n",
-                (int)(int8_t)bc[pc+1]);
+                "    _tsv%d=JS_NewInt32(ctx,%d); _sp=%d;\n",
+                d, (int)(int8_t)bc[pc+1], d+1);
             break;
         case OP_push_i16:
             jit_buf_printf(cb,
-                "    _s[_sp++]=JS_NewInt32(ctx,%d);\n",
-                (int)(int16_t)bc_u16(&bc[pc+1]));
+                "    _tsv%d=JS_NewInt32(ctx,%d); _sp=%d;\n",
+                d, (int)(int16_t)bc_u16(&bc[pc+1]), d+1);
             break;
         case OP_push_minus1:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,-1);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,-1); _sp=%d;\n", d, d+1); break;
         case OP_push_0:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,0);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,0); _sp=%d;\n", d, d+1); break;
         case OP_push_1:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,1);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,1); _sp=%d;\n", d, d+1); break;
         case OP_push_2:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,2);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,2); _sp=%d;\n", d, d+1); break;
         case OP_push_3:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,3);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,3); _sp=%d;\n", d, d+1); break;
         case OP_push_4:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,4);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,4); _sp=%d;\n", d, d+1); break;
         case OP_push_5:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,5);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,5); _sp=%d;\n", d, d+1); break;
         case OP_push_6:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,6);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,6); _sp=%d;\n", d, d+1); break;
         case OP_push_7:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NewInt32(ctx,7);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,7); _sp=%d;\n", d, d+1); break;
         case OP_push_false:
-            jit_buf_str(cb, "    _s[_sp++]=JS_FALSE;\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_FALSE; _sp=%d;\n", d, d+1); break;
         case OP_push_true:
-            jit_buf_str(cb, "    _s[_sp++]=JS_TRUE;\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_TRUE; _sp=%d;\n", d, d+1); break;
         case OP_undefined:
-            jit_buf_str(cb, "    _s[_sp++]=JS_UNDEFINED;\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_UNDEFINED; _sp=%d;\n", d, d+1); break;
         case OP_null:
-            jit_buf_str(cb, "    _s[_sp++]=JS_NULL;\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=JS_NULL; _sp=%d;\n", d, d+1); break;
         case OP_push_this:
-            jit_buf_str(cb, "    _s[_sp++]=_DUP(this_val);\n"); break;
+            jit_buf_printf(cb, "    _tsv%d=_DUP(this_val); _sp=%d;\n", d, d+1); break;
         case OP_push_empty_string:
-            jit_buf_str(cb,
+            /* Has _CHK: set _sp before call (so _ex sees correct depth), then push */
+            jit_buf_printf(cb,
                 "    { JSValue _v=JS_NewStringLen(ctx,\"\",0);"
-                " _CHK(_v); _s[_sp++]=_v; }\n");
+                " _sp=%d; _CHK(_v); _tsv%d=_v; _sp=%d; }\n",
+                d, d, d+1);
             break;
 
         /* ---- Constant pool ---- */
         case OP_push_const:
             jit_buf_printf(cb,
-                "    _s[_sp++]=_DUP(cpool[%u]);\n",
-                bc_u32(&bc[pc+1]));
+                "    _tsv%d=_DUP(cpool[%u]); _sp=%d;\n",
+                d, bc_u32(&bc[pc+1]), d+1);
             break;
         case OP_push_const8:
             jit_buf_printf(cb,
-                "    _s[_sp++]=_DUP(cpool[%u]);\n",
-                (unsigned)bc[pc+1]);
+                "    _tsv%d=_DUP(cpool[%u]); _sp=%d;\n",
+                d, (unsigned)bc[pc+1], d+1);
             break;
         case OP_push_atom_value: {
             /* Push the string representation of an interned atom */
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
                 "    { JSValue _v=JS_AtomToValue(ctx,(JSAtom)%uu);"
-                " _CHK(_v); _s[_sp++]=_v; }\n", atom);
+                " _sp=%d; _CHK(_v); _tsv%d=_v; _sp=%d; }\n",
+                atom, d, d, d+1);
             break;
         }
         /* OP_fclosure / OP_fclosure8: create closure — needs stack-frame access,
          * not available in JIT.  Functions using these are kept in interpreter. */
 
         /* ---- Stack manipulation ---- */
-        case OP_drop:
-            jit_buf_str(cb, "    _FREE(_s[--_sp]);\n"); break;
-        case OP_dup:
-            jit_buf_str(cb, "    _s[_sp]=_DUP(_s[_sp-1]); _sp++;\n"); break;
-        case OP_dup1: /* a b -> a a b */
-            jit_buf_str(cb,
-                "    { JSValue _t=_DUP(_s[_sp-2]);"
-                " _s[_sp]=_s[_sp-1]; _s[_sp-1]=_t; _sp++; }\n");
+        /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
+        case OP_drop: /* pop top: depth d -> d-1 */
+            jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1); break;
+        case OP_dup: /* peek top, push copy: depth d -> d+1 */
+            jit_buf_printf(cb, "    _tsv%d=_DUP(_tsv%d); _sp=%d;\n", d, d-1, d+1); break;
+        case OP_dup1: /* a b -> a a b (insert dup of a below b): depth d -> d+1
+                       * _tsv{d-2}=a, _tsv{d-1}=b
+                       * result: _tsv{d-2}=dup(a), _tsv{d-1}=b -> shift b to d, put dup at d-1 */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_DUP(_tsv%d);"
+                " _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
+                d-2, d, d-1, d-1, d+1);
             break;
-        case OP_dup2:
-            jit_buf_str(cb,
-                "    _s[_sp]=_DUP(_s[_sp-2]);"
-                " _s[_sp+1]=_DUP(_s[_sp-1]); _sp+=2;\n");
+        case OP_dup2: /* a b -> a b a b: depth d -> d+2 */
+            jit_buf_printf(cb,
+                "    _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _sp=%d;\n",
+                d, d-2, d+1, d-1, d+2);
             break;
-        case OP_insert2: /* obj a -> a obj a (dup_x1): a is duplicated */
-            /* Interpreter: sp[-2]=JS_DupValue(sp[0]) after moving.
-             * Must dup 'a' since it appears in both new sp[-3] and sp[-1]. */
-            jit_buf_str(cb,
-                "    { JSValue _t=_DUP(_s[_sp-1]);"
-                " _s[_sp]=_s[_sp-1]; _s[_sp-1]=_s[_sp-2];"
-                " _s[_sp-2]=_t; _sp++; }\n");
+        case OP_insert2: /* obj a -> a obj a (dup_x1): depth d -> d+1
+                          * _tsv{d-2}=obj, _tsv{d-1}=a
+                          * result: _tsv{d-2}=dup(a), _tsv{d-1}=obj, _tsv{d}=a */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_DUP(_tsv%d);"
+                " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
+                d-1, d, d-1, d-1, d-2, d-2, d+1);
             break;
         /* OP_pop does not exist; OP_drop handles the pop case */
-        case OP_nip: /* a b -> b */
-            jit_buf_str(cb,
-                "    { JSValue _t=_s[--_sp]; _FREE(_s[_sp-1]);"
-                " _s[_sp-1]=_t; }\n");
+        case OP_nip: /* a b -> b: depth d -> d-1 */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _FREE(_tsv%d); _tsv%d=_t; _sp=%d; }\n",
+                d-1, d-2, d-2, d-1);
             break;
-        case OP_swap:
-            jit_buf_str(cb,
-                "    { JSValue _t=_s[_sp-1]; _s[_sp-1]=_s[_sp-2];"
-                " _s[_sp-2]=_t; }\n");
+        case OP_swap: /* a b -> b a: depth unchanged */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-1, d-1, d-2, d-2);
             break;
-        case OP_rot3l: /* a b c -> b c a */
-            jit_buf_str(cb,
-                "    { JSValue _t=_s[_sp-3]; _s[_sp-3]=_s[_sp-2];"
-                " _s[_sp-2]=_s[_sp-1]; _s[_sp-1]=_t; }\n");
+        case OP_rot3l: /* a b c -> b c a: depth unchanged */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-3, d-3, d-2, d-2, d-1, d-1);
             break;
-        case OP_rot3r: /* a b c -> c a b */
-            jit_buf_str(cb,
-                "    { JSValue _t=_s[_sp-1]; _s[_sp-1]=_s[_sp-2];"
-                " _s[_sp-2]=_s[_sp-3]; _s[_sp-3]=_t; }\n");
+        case OP_rot3r: /* a b c -> c a b: depth unchanged */
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-1, d-1, d-2, d-2, d-3, d-3);
             break;
 
         /* ---- Local variable access (Phase 5 / P8.1: type-aware) ----
@@ -1638,53 +1660,54 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     (local_type && (idx) >= 0 && (idx) < var_count && \
      local_type[(idx)] == JIT_T_NUMBER)
 
+/* P9.2: use _tsv{d} for push, _tsv{d-1} for pop/peek. d is in scope. */
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
             "    { int64_t _v=_jsi_%s;" \
-            " _s[_sp++]=((int32_t)_v==_v)?JS_NewInt32(ctx,(int32_t)_v)" \
-            ":JS_NewFloat64(ctx,(double)_v); }\n", LNAME(idx)); \
+            " _tsv%d=((int32_t)_v==_v)?JS_NewInt32(ctx,(int32_t)_v)" \
+            ":JS_NewFloat64(ctx,(double)_v); _sp=%d; }\n", LNAME(idx), d, d+1); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
-            "    { double _d=_jsd_%s;" \
-            " _s[_sp++]=(_d==(int32_t)_d)?JS_NewInt32(ctx,(int32_t)_d)" \
-            ":JS_NewFloat64(ctx,_d); }\n", LNAME(idx)); \
+            "    { double _dv=_jsd_%s;" \
+            " _tsv%d=(_dv==(int32_t)_dv)?JS_NewInt32(ctx,(int32_t)_dv)" \
+            ":JS_NewFloat64(ctx,_dv); _sp=%d; }\n", LNAME(idx), d, d+1); \
     else \
-        jit_buf_printf(cb, "    _s[_sp++]=_DUP(_jsv_%s);\n", LNAME(idx)); \
+        jit_buf_printf(cb, "    _tsv%d=_DUP(_jsv_%s); _sp=%d;\n", d, LNAME(idx), d+1); \
 } while(0)
 
 #define GEN_PUT_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
-            "    { JSValue _t=_s[--_sp];" \
+            "    { JSValue _t=_tsv%d; _sp=%d;" \
             " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
-            LNAME(idx)); \
+            d-1, d-1, LNAME(idx)); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
-            "    { JSValue _t=_s[--_sp];" \
+            "    { JSValue _t=_tsv%d; _sp=%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
-            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", LNAME(idx)); \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, d-1, LNAME(idx)); \
     else \
-        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_s[--_sp];\n", \
-                       LNAME(idx), LNAME(idx)); \
+        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_tsv%d; _sp=%d;\n", \
+                       LNAME(idx), LNAME(idx), d-1, d-1); \
 } while(0)
 
 #define GEN_SET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
-            "    { JSValue _t=_s[_sp-1];" \
+            "    { JSValue _t=_tsv%d;" \
             " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
-            LNAME(idx)); \
+            d-1, LNAME(idx)); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
-            "    { JSValue _t=_s[_sp-1];" \
+            "    { JSValue _t=_tsv%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
-            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", LNAME(idx)); \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, LNAME(idx)); \
     else \
-        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_s[_sp-1]);\n", \
-                       LNAME(idx), LNAME(idx)); \
+        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_tsv%d);\n", \
+                       LNAME(idx), LNAME(idx), d-1); \
 } while(0)
 
         case OP_get_loc:  case OP_get_loc_check:
@@ -1720,41 +1743,43 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * _aim bit i: argv[i] is a JS_TAG_INT and its value is live in _ai[i].
          * GEN_GET_ARG: prefer _ai[i] (register-friendly int32) over argv[i] load.
          * GEN_PUT/SET_ARG: keep _ai[i] and _aim consistent on arg writes. */
+/* P9.2: arg access macros use _tsv{d} for push, _tsv{d-1} for pop/peek. */
 #define _AI_VALID(idx) ((idx) < 32)
 #define GEN_GET_ARG(idx) do { \
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
-            "    _s[_sp++]=((%d)<argc&&(_aim>>%du&1u))" \
+            "    _tsv%d=((%d)<argc&&(_aim>>%du&1u))" \
             "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
-            ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", \
-            idx, (unsigned)(idx), ANAME(idx), idx, idx); \
+            ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
+            d, idx, (unsigned)(idx), ANAME(idx), idx, idx, d+1); \
     else \
         jit_buf_printf(cb, \
-            "    _s[_sp++]=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", idx, idx); \
+            "    _tsv%d=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
+            d, idx, idx, d+1); \
 } while(0)
 #define GEN_PUT_ARG(idx) do { \
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
-            "    if((%d)<argc){JSValue _t=_s[--_sp];" \
-            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
-            "_FREE(argv[%d]);argv[%d]=_t;}else _FREE(_s[--_sp]);\n", \
-            idx, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+            "    if((%d)<argc){ JSValue _t=_tsv%d; _sp=%d;\n" \
+            "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+            "      _FREE(argv[%d]);argv[%d]=_t;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
+            idx, d-1, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx, d-1, d-1); \
     else \
         jit_buf_printf(cb, \
-            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_s[--_sp];}else _FREE(_s[--_sp]);\n", \
-            idx, idx, idx); \
+            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_tsv%d; _sp=%d;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
+            idx, idx, idx, d-1, d-1, d-1, d-1); \
 } while(0)
 #define GEN_SET_ARG(idx) do { \
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
-            "    if((%d)<argc){JSValue _t=_s[_sp-1];" \
-            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
-            "_FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
-            idx, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+            "    if((%d)<argc){ JSValue _t=_tsv%d;\n" \
+            "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+            "      _FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
+            idx, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
     else \
         jit_buf_printf(cb, \
-            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_s[_sp-1]);};\n", \
-            idx, idx, idx); \
+            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_tsv%d);};\n", \
+            idx, idx, idx, d-1); \
 } while(0)
 
         case OP_get_arg: GEN_GET_ARG((int)bc_u16(&bc[pc+1])); break;
@@ -1779,17 +1804,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_SET_ARG
 
         /* ---- Closure variable access ---- */
-/* _VRV(idx) returns a pointer to the JSValue stored inside var_refs[idx].
+/* P9.2: closure var access uses _tsv{d} for push, _tsv{d-1} for pop/peek.
+ * _VRV(idx) returns a pointer to the JSValue stored inside var_refs[idx].
  * We use the vtable accessor rather than ->pvalue directly because JSVarRef
  * is defined only in quickjs.c (incomplete type in generated C). */
 #define GEN_GET_VR(idx) \
-    jit_buf_printf(cb, "    _s[_sp++]=_DUP(*_RT->var_ref_value(var_refs[%d]));\n", idx)
+    jit_buf_printf(cb, "    _tsv%d=_DUP(*_RT->var_ref_value(var_refs[%d])); _sp=%d;\n", \
+                   d, idx, d+1)
 #define GEN_PUT_VR(idx) \
     jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_s[--_sp]; }\n", idx)
+                       " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1)
 #define GEN_SET_VR(idx) \
     jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_DUP(_s[_sp-1]); }\n", idx)
+                       " _FREE(*_p); *_p=_DUP(_tsv%d); }\n", idx, d-1)
 
         case OP_get_var_ref:
         case OP_get_var_ref_check: GEN_GET_VR((int)bc_u16(&bc[pc+1])); break;
@@ -1830,13 +1857,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
              * so the slow path needs no closure_var access at runtime. */
             JSAtom cv_atom     = js_jit_fb_get_closure_var_atom(b, idx);
             int    cv_is_lex   = js_jit_fb_get_closure_var_is_lexical(b, idx);
+            /* P9.2: push into _tsv{d}; set _sp before _CHK for exception safety */
             jit_buf_printf(cb,
                 "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
                 "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED){\n"
                 "        JSValue _r=_RT->get_var_slow(ctx,%uu,%d);\n"
-                "        _CHK(_r); _s[_sp++]=_r;\n"
-                "      } else _s[_sp++]=_DUP(*_pv); }\n",
-                idx, (unsigned)cv_atom, cv_is_lex);
+                "        _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
+                "      } else { _tsv%d=_DUP(*_pv); _sp=%d; } }\n",
+                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, d+1);
             break;
         }
         case OP_put_var:
@@ -1853,15 +1881,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* lexical init: always write directly, never needs slow path */
                 jit_buf_printf(cb,
                     "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);"
-                    " _FREE(*_p); *_p=_s[--_sp]; }\n", idx);
+                    " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1);
             } else {
                 jit_buf_printf(cb,
-                    "    { JSValue _v=_s[--_sp];\n"
+                    "    { JSValue _v=_tsv%d; _sp=%d;\n"
                     "      JSValue *_p=_RT->var_ref_value(var_refs[%d]);\n"
                     "      if(js_unlikely(JS_VALUE_GET_TAG(*_p)==JS_TAG_UNINITIALIZED)){\n"
                     "        if(_RT->put_var_slow(ctx,%uu,%d,%d,_v)<0) goto _ex;\n"
                     "      } else { _FREE(*_p); *_p=_v; } }\n",
-                    idx, (unsigned)cv_atom, cv_is_lex, is_init);
+                    d-1, d-1, idx, (unsigned)cv_atom, cv_is_lex, is_init);
             }
             break;
         }
@@ -1886,38 +1914,43 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * so object-property arithmetic (e.g. this.x + this.y) avoids the vtable
          * once the IC has seen float64 values. */
 
+        /* P9.2: binary ops pop 2 (_tsv{d-2}, _tsv{d-1}), push 1 into _tsv{d-2}.
+         * Result depth = d-1.  Set _sp=d-2 before any vtable call for safety. */
         case OP_add: {
             int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
             if (_bn) {
                 /* gen-time: both numeric — INT+INT kept for int32 result */
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
                     "      } else {\n"
                     "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da+_db);\n"
-                    "      } }\n");
+                    "        _tsv%d=JS_NewFloat64(ctx,_da+_db); _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
                     "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da+_db);\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,_da+_db); _sp=%d;\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                    "      } }\n");
+                    "        _sp=%d; JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r);\n"
+                    "        _tsv%d=_r; _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
             }
             break;
         }
@@ -1926,34 +1959,37 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_sub: {
             int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
             if (_bn) {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
                     "      } else {\n"
                     "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da-_db);\n"
-                    "      } }\n");
+                    "        _tsv%d=JS_NewFloat64(ctx,_da-_db); _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                       :JS_NewFloat64(ctx,(double)_r64);\n"
+                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
                     "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da-_db);\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,_da-_db); _sp=%d;\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->sub(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                    "      } }\n");
+                    "        _sp=%d; JSValue _r=_RT->sub(ctx,_a,_b); _CHK(_r);\n"
+                    "        _tsv%d=_r; _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
             }
             break;
         }
@@ -1962,38 +1998,43 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_mul: {
             int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
             if (_bn) {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
                     "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
-                    "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
+                    "          _tsv%d=JS_NewInt32(ctx,(int32_t)_r64);\n"
                     "        else\n"
-                    "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "          _tsv%d=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "        _sp=%d;\n"
                     "      } else {\n"
                     "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da*_db);\n"
-                    "      } }\n");
+                    "        _tsv%d=JS_NewFloat64(ctx,_da*_db); _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-2, d-1, d-2, d-1);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
                     "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
-                    "          _s[_sp++]=JS_NewInt32(ctx,(int32_t)_r64);\n"
+                    "          _tsv%d=JS_NewInt32(ctx,(int32_t)_r64);\n"
                     "        else\n"
-                    "          _s[_sp++]=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "          _tsv%d=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
+                    "        _sp=%d;\n"
                     "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da*_db);\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,_da*_db); _sp=%d;\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->mul(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                    "      } }\n");
+                    "        _sp=%d; JSValue _r=_RT->mul(ctx,_a,_b); _CHK(_r);\n"
+                    "        _tsv%d=_r; _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
             }
             break;
         }
@@ -2002,34 +2043,37 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_div: {
             int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
             if (_bn) {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
-                    "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
+                    "        _tsv%d=(ib&&ia%%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
+                    "                              :JS_NewFloat64(ctx,(double)ia/(double)ib); _sp=%d;\n"
                     "      } else {\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da/_db);\n"
-                    "      } }\n");
+                    "        _tsv%d=JS_NewFloat64(ctx,_da/_db); _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=(ib&&ia%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
-                    "                                :JS_NewFloat64(ctx,(double)ia/(double)ib);\n"
+                    "        _tsv%d=(ib&&ia%%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
+                    "                              :JS_NewFloat64(ctx,(double)ia/(double)ib); _sp=%d;\n"
                     "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,_da/_db);\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,_da/_db); _sp=%d;\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->div(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                    "      } }\n");
+                    "        _sp=%d; JSValue _r=_RT->div(ctx,_a,_b); _CHK(_r);\n"
+                    "        _tsv%d=_r; _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
             }
             break;
         }
@@ -2038,63 +2082,72 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_mod: {
             int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
             if (_bn) {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
-                    "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
+                    "        _tsv%d=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%%ib)\n"
+                    "                 :JS_NewFloat64(ctx,0.0/0.0); _sp=%d;\n"
                     "      } else {\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,fmod(_da,_db));\n"
-                    "      } }\n");
+                    "        _tsv%d=JS_NewFloat64(ctx,fmod(_da,_db)); _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
                     "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _s[_sp++]=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%ib)\n"
-                    "                   :JS_NewFloat64(ctx,0.0/0.0);\n"
+                    "        _tsv%d=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%%ib)\n"
+                    "                 :JS_NewFloat64(ctx,0.0/0.0); _sp=%d;\n"
                     "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewFloat64(ctx,fmod(_da,_db));\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,fmod(_da,_db)); _sp=%d;\n"
                     "      } else {\n"
-                    "        JSValue _r=_RT->mod(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;\n"
-                    "      } }\n");
+                    "        _sp=%d; JSValue _r=_RT->mod(ctx,_a,_b); _CHK(_r);\n"
+                    "        _tsv%d=_r; _sp=%d;\n"
+                    "      } }\n",
+                    d-1, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
             }
             break;
         }
 
         /* Bitwise: ToInt32 already guaranteed by semantics; fast path for int */
+        /* P9.2: pop 2 -> push 1: result at _tsv{d-2}, new depth d-1 */
 #define GEN_BITOP_INT(op_str, rt_name) \
     jit_buf_printf(cb, \
-        "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
+        "    { JSValue _b=_tsv%d,_a=_tsv%d;\n" \
         "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n" \
-        "        _s[_sp++]=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b));\n" \
-        "      else { JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n", \
-        op_str, rt_name)
+        "        _tsv%d=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a) %s JS_VALUE_GET_INT(_b));\n" \
+        "      else { _sp=%d; JSValue _r=_RT->%s(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n" \
+        "      _sp=%d; }\n", \
+        d-1, d-2, d-2, op_str, d-2, rt_name, d-2, d-1)
 
         /* Shift operators must mask the shift count to & 31, matching the
          * JavaScript spec (ToInt32 semantics) and avoiding C UB for shifts
          * by >= 32 (e.g. 1 << 32 must equal 1, not 0). */
         case OP_shl:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewInt32(ctx,(int32_t)((uint32_t)JS_VALUE_GET_INT(_a)<<(JS_VALUE_GET_INT(_b)&31)));\n"
-                "      else { JSValue _r=_RT->shl(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=JS_NewInt32(ctx,(int32_t)((uint32_t)JS_VALUE_GET_INT(_a)<<(JS_VALUE_GET_INT(_b)&31)));\n"
+                "      else { _sp=%d; JSValue _r=_RT->shl(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-2, d-1);
             break;
         case OP_sar:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31));\n"
-                "      else { JSValue _r=_RT->sar(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31));\n"
+                "      else { _sp=%d; JSValue _r=_RT->sar(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-2, d-1);
             break;
         case OP_and: GEN_BITOP_INT("&",  "band"); break;
         case OP_or:  GEN_BITOP_INT("|",  "bor");  break;
@@ -2102,109 +2155,134 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* shr is unsigned right shift — result may exceed INT32_MAX */
         case OP_shr:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                 "        uint32_t _r=(uint32_t)JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31);\n"
-                "        _s[_sp++]=(_r<=(uint32_t)INT32_MAX)?JS_NewInt32(ctx,(int32_t)_r)\n"
-                "                                           :JS_NewFloat64(ctx,(double)_r);\n"
-                "      } else { JSValue _r=_RT->shr(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=(_r<=(uint32_t)INT32_MAX)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                "                                        :JS_NewFloat64(ctx,(double)_r);\n"
+                "      } else { _sp=%d; JSValue _r=_RT->shr(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-2, d-1);
             break;
 
 #undef GEN_BITOP_INT
 
-        /* pow and remaining ops: full vtable (rare) */
+        /* pow and remaining ops: full vtable (rare).
+         * P9.2: pop 2 -> push 1: result at _tsv{d-2}, new depth d-1 */
         case OP_pow:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp],"
-                " _r=_RT->pow(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; }\n");
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
+                "      _sp=%d; JSValue _r=_RT->pow(ctx,_a,_b); _CHK(_r);\n"
+                "      _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-1);
             break;
 
-        /* ---- Arithmetic (unary) with int fast paths ---- */
+        /* ---- Arithmetic (unary) with int fast paths ----
+         * P9.2: unary ops: pop 1 (_tsv{d-1}), push 1 back at _tsv{d-1}, depth unchanged */
         case OP_neg:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp]; int _ta=JS_VALUE_GET_TAG(_a);\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
                 "      if(_ta==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
-                "                                 :JS_NewInt32(ctx,-ia);\n"
+                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
+                "                             :JS_NewInt32(ctx,-ia);\n"
                 "      } else if(_ta==JS_TAG_FLOAT64)\n"
-                "        _s[_sp++]=JS_NewFloat64(ctx,-JS_VALUE_GET_FLOAT64(_a));\n"
-                "      else { JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=JS_NewFloat64(ctx,-JS_VALUE_GET_FLOAT64(_a));\n"
+                "      else { _sp=%d; JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
+                "    _sp=%d;\n",
+                d-1, d-1, d-1, d-1, d-1, d);
             break;
         case OP_plus:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp]; int _ta=JS_VALUE_GET_TAG(_a);\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
                 "      if(_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)\n"
-                "        _s[_sp++]=_a; /* numeric — already a number, no coercion needed */\n"
-                "      else { JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=_a; /* numeric — already a number, no coercion needed */\n"
+                "      else { _sp=%d; JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
+                "    _sp=%d;\n",
+                d-1, d-1, d-1, d-1, d);
             break;
         case OP_not: /* bitwise ~ */
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewInt32(ctx,~JS_VALUE_GET_INT(_a));\n"
-                "      else { JSValue _r=_RT->bnot(ctx,_a); _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=JS_NewInt32(ctx,~JS_VALUE_GET_INT(_a));\n"
+                "      else { _sp=%d; JSValue _r=_RT->bnot(ctx,_a); _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-1, d-1, d-1, d);
             break;
         case OP_typeof:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp],"
-                " _r=_RT->type_of(ctx,_a); _CHK(_r); _s[_sp++]=_r; }\n");
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
+                "      _sp=%d; JSValue _r=_RT->type_of(ctx,_a); _CHK(_r);\n"
+                "      _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-1, d-1, d);
             break;
         case OP_lnot:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            /* P9.2: lnot: pop 1, push 1 at same slot; depth unchanged */
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==0);\n"
+                "        _tsv%d=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==0);\n"
                 "      else if(JS_VALUE_GET_TAG(_a)==JS_TAG_BOOL)\n"
-                "        _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_a));\n"
-                "      else { _s[_sp++]=JS_NewBool(ctx,!JS_ToBool(ctx,_a)); _FREE(_a); } }\n");
+                "        _tsv%d=JS_NewBool(ctx,!JS_VALUE_GET_INT(_a));\n"
+                "      else { _tsv%d=JS_NewBool(ctx,!JS_ToBool(ctx,_a)); _FREE(_a); }\n"
+                "      _sp=%d; }\n",
+                d-1, d-1, d-1, d-1, d);
             break;
 
         /* ---- Increment / decrement ---- */
-        /* OP_inc / OP_dec: pre-increment — pop, push ±1 (int fast path) */
+        /* P9.2: inc/dec: pop 1, push 1 at same slot; depth unchanged */
         case OP_inc:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _s[_sp++]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
-                "                                 :JS_NewInt32(ctx,ia+1);\n"
-                "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                "                             :JS_NewInt32(ctx,ia+1);\n"
+                "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-1, d-1, d-1, d);
             break;
         case OP_dec:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
-                "                                 :JS_NewInt32(ctx,ia-1);\n"
-                "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _s[_sp++]=_r; } }\n");
+                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                "                             :JS_NewInt32(ctx,ia-1);\n"
+                "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _tsv%d=_r; }\n"
+                "      _sp=%d; }\n",
+                d-1, d-1, d-1, d-1, d);
             break;
-        /* OP_post_inc / OP_post_dec: post-increment — pop original, push original, push ±1 result */
+        /* OP_post_inc / OP_post_dec: pop 1, push 2: original at _tsv{d-1}, result at _tsv{d}; depth d -> d+1 */
         case OP_post_inc:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _s[_sp++]=_a; /* original */\n"
-                "        _s[_sp++]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
-                "                                 :JS_NewInt32(ctx,ia+1);\n"
-                "      } else { JSValue _r=_RT->add(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _s[_sp++]=_a; _s[_sp++]=_r; } }\n");
+                "        _tsv%d=_a; /* original stays */\n"
+                "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                "                             :JS_NewInt32(ctx,ia+1);\n"
+                "        _sp=%d;\n"
+                "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
+                d-1, d-1, d, d+1, d, d-1, d, d+1);
             break;
         case OP_post_dec:
-            jit_buf_str(cb,
-                "    { JSValue _a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                 "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _s[_sp++]=_a; /* original */\n"
-                "        _s[_sp++]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
-                "                                 :JS_NewInt32(ctx,ia-1);\n"
-                "      } else { JSValue _r=_RT->sub(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _s[_sp++]=_a; _s[_sp++]=_r; } }\n");
+                "        _tsv%d=_a; /* original stays */\n"
+                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                "                             :JS_NewInt32(ctx,ia-1);\n"
+                "        _sp=%d;\n"
+                "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
+                d-1, d-1, d, d+1, d, d-1, d, d+1);
             break;
         /* OP_inc_loc / OP_dec_loc: in-place ±1 on local variable (1-byte index) */
         case OP_inc_loc: {
@@ -2247,7 +2325,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             }
             break;
         }
-        /* OP_add_loc: pop stack top and add it in-place to local (1-byte index) */
+        /* OP_add_loc: pop stack top and add it in-place to local (1-byte index).
+         * P9.2: pop _tsv{d-1}, update _sp to d-1. */
         case OP_add_loc: {
             int idx = bc[pc + 1];
             if (local_type && idx < var_count && local_type[idx] == JIT_T_INT) {
@@ -2255,36 +2334,36 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                  * add directly — no refcount ops, no boxing on store.
                  * Inference guarantees stack top is numeric when local is INT. */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_s[--_sp];\n"
+                    "    { JSValue _b=_tsv%d; _sp=%d;\n"
                     "      _jsi_%s+=(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
                     "              ?(int64_t)JS_VALUE_GET_INT(_b)\n"
                     "              :(int64_t)JS_VALUE_GET_FLOAT64(_b); }\n",
-                    LNAME(idx));
+                    d-1, d-1, LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
                 /* NUMBER local: direct double add.  Inference guarantees the stack
                  * top is INT or FLOAT64 (both immediate — no _FREE needed). GCC
                  * CSE will collapse get_loc(j)+add_loc(i) → _jsd_name+=_jsd_other. */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_s[--_sp];\n"
+                    "    { JSValue _b=_tsv%d; _sp=%d;\n"
                     "      if(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
                     "        _jsd_%s+=(double)JS_VALUE_GET_INT(_b);\n"
                     "      else _jsd_%s+=JS_VALUE_GET_FLOAT64(_b); }\n",
-                    LNAME(idx), LNAME(idx));
+                    d-1, d-1, LNAME(idx), LNAME(idx));
             } else {
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_s[--_sp], *_pv=&_jsv_%s;\n"
+                    "    { JSValue _b=_tsv%d; _sp=%d; JSValue *_pv=&_jsv_%s;\n"
                     "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                     "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
                     "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
                     "                              :JS_NewFloat64(ctx,(double)_r);\n"
                     "      } else {\n"
-                    /* _RT->add consumes both inputs (same ownership as interpreter\n"
-                     * stack ops). Move *_pv out first and clear the slot so the\n"
+                    /* _RT->add consumes both inputs (same ownership as interpreter
+                     * stack ops). Move *_pv out first and clear the slot so the
                      * exception path (_ex) does not double-free it.              */
                     "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
                     "        JSValue _r=_RT->add(ctx,_old,_b); _CHK(_r); *_pv=_r;\n"
                     "      } }\n",
-                    LNAME(idx));
+                    d-1, d-1, LNAME(idx));
             }
             break;
         }
@@ -2303,24 +2382,26 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * values and handles FLOAT64 operands that the old INT-only fast path
          * could not reach.                                                     */
 
-/* Helper: emit fused NUMBER×NUMBER comparison+branch.
- * _va = first pushed (left operand), _vb = second pushed (right operand). */
+/* P9.2: comparison macros use d (depth before opcode).
+ * Fused comparisons: pop 2 (_tsv{d-2}, _tsv{d-1}), no push; _sp=d-2.
+ * Unfused comparisons: pop 2, push 1 at _tsv{d-2}; _sp=d-1. */
+
+/* Helper: emit fused NUMBER×NUMBER comparison+branch. */
 #define GEN_CMP_FUSE_NUM(c_op, ftgt, fneg) \
     jit_buf_printf(cb, \
-        "    { JSValue _va=_s[_sp-2],_vb=_s[_sp-1]; _sp-=2;\n" \
+        "    { JSValue _va=_tsv%d,_vb=_tsv%d; _sp=%d;\n" \
         "      double _da=(JS_VALUE_GET_TAG(_va)==JS_TAG_INT)" \
                          "?(double)JS_VALUE_GET_INT(_va):JS_VALUE_GET_FLOAT64(_va);\n" \
         "      double _db=(JS_VALUE_GET_TAG(_vb)==JS_TAG_INT)" \
                          "?(double)JS_VALUE_GET_INT(_vb):JS_VALUE_GET_FLOAT64(_vb);\n" \
         "      if(%s(_da " c_op " _db)) goto _L%d; }\n", \
-        (fneg)?"!":"", (ftgt))
+        d-2, d-1, d-2, (fneg)?"!":"", (ftgt))
 
 /* Helper: emit fused general comparison+branch — INT fast path, float64 middle
- * path (P8.6), vtable fallback. Handles object-property float64 comparisons
- * without gen-time type info. */
+ * path (P8.6), vtable fallback. */
 #define GEN_CMP_FUSE_GEN(int_op, c_op, rt_call, ftgt, fneg) \
     jit_buf_printf(cb, \
-        "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n" \
+        "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n" \
         "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n" \
         "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n" \
         "        _cond=(JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
@@ -2331,22 +2412,25 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "        _cond=(_da " c_op " _db);\n" \
         "      } else{JSValue _r=" rt_call "; _CHK(_r); _cond=JS_VALUE_GET_INT(_r);}\n" \
         "      if(%s_cond) goto _L%d; }\n", \
-        (fneg)?"!":"", (ftgt))
+        d-2, d-1, d-2, (fneg)?"!":"", (ftgt))
 
-/* Helper: unfused comparison (produces BOOL on stack) — INT fast path, float64
- * middle path (P8.6), vtable fallback. */
-#define GEN_CMP_UNFUSED(int_op, c_op, rt_call_or_expr) \
-    jit_buf_str(cb, \
-        "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n" \
+/* Helper: unfused comparison (produces BOOL on stack).
+ * P9.2: pop 2, push 1 at _tsv{d-2}; _sp = d-1.
+ * rt_vt is the vtable call expression producing the result JSValue _r. */
+#define GEN_CMP_UNFUSED(int_op, c_op, rt_vt) \
+    jit_buf_printf(cb, \
+        "    { JSValue _b=_tsv%d,_a=_tsv%d;\n" \
         "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n" \
         "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n" \
-        "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
+        "        _tsv%d=JS_NewBool(ctx,JS_VALUE_GET_INT(_a) " int_op " JS_VALUE_GET_INT(_b));\n" \
         "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&" \
                       "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n" \
         "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n" \
         "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n" \
-        "        _s[_sp++]=JS_NewBool(ctx,_da " c_op " _db);\n" \
-        "      } else { " rt_call_or_expr " } }\n")
+        "        _tsv%d=JS_NewBool(ctx,_da " c_op " _db);\n" \
+        "      } else { _sp=%d; JSValue _r=" rt_vt "; _CHK(_r); _tsv%d=_r; }\n" \
+        "      _sp=%d; }\n", \
+        d-1, d-2, d-2, d-2, d-2, d-2, d-1)
 
 /* Shared logic for comparison opcodes. Usage:
  *   DO_CMP(c_op, int_op, vtable_call_expr_normal, vtable_call_expr_if_neg_int)
@@ -2365,7 +2449,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("<",  _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN("<", "<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("<", "<", "JSValue _r=_RT->lt(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("<", "<", "_RT->lt(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2378,7 +2462,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("<=", _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN("<=", "<=", "_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("<=", "<=", "JSValue _r=_RT->lte(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("<=", "<=", "_RT->lte(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2392,7 +2476,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM(">",  _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN(">", ">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED(">", ">", "JSValue _r=_RT->lt(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED(">", ">", "_RT->lt(ctx,_b,_a)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2406,7 +2490,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM(">=", _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN(">=", ">=", "_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED(">=", ">=", "JSValue _r=_RT->lte(ctx,_b,_a); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED(">=", ">=", "_RT->lte(ctx,_b,_a)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2420,7 +2504,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN("==", "==", "_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate);
             } else {
-                GEN_CMP_UNFUSED("==", "==", "JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r;");
+                GEN_CMP_UNFUSED("==", "==", "_RT->eq(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2433,7 +2517,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* neq fused: "!=" is the comparison; negate inverts it */
                 if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
                 else     jit_buf_printf(cb,
-                    "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
+                    "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
@@ -2444,20 +2528,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "        _cond=(_da!=_db);\n"
                     "      } else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
                     "      if(%s_cond) goto _L%d; }\n",
-                    _fi.negate?"!":"", _fi.tgt);
+                    d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "        _tsv%d=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
                     "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,_da!=_db);\n"
-                    "      } else { JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
-                    "               _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+                    "        _tsv%d=JS_NewBool(ctx,_da!=_db);\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->eq(ctx,_a,_b); _CHK(_r);\n"
+                    "               _tsv%d=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-2, d-2, d-2, d-2, d-2, d-1);
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2470,17 +2556,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
                 else     GEN_CMP_FUSE_GEN("==", "==", "_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)==JS_VALUE_GET_INT(_b));\n"
-                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
-                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,_da==_db);\n"
-                    "      } else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r); _s[_sp++]=_r; } }\n");
+                GEN_CMP_UNFUSED("==", "==", "_RT->strict_eq(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2492,7 +2568,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 sz += _fi.extra_sz;
                 if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
                 else     jit_buf_printf(cb,
-                    "    { JSValue _a=_s[_sp-2],_b=_s[_sp-1]; _sp-=2; int _cond;\n"
+                    "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
                     "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
@@ -2503,20 +2579,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "        _cond=(_da!=_db);\n"
                     "      } else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
                     "      if(%s_cond) goto _L%d; }\n",
-                    _fi.negate?"!":"", _fi.tgt);
+                    d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
             } else {
-                jit_buf_str(cb,
-                    "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
                     "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                    "        _tsv%d=JS_NewBool(ctx,JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
                     "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
                              "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
                     "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
                     "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _s[_sp++]=JS_NewBool(ctx,_da!=_db);\n"
-                    "      } else { JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
-                    "               _s[_sp++]=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); } }\n");
+                    "        _tsv%d=JS_NewBool(ctx,_da!=_db);\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->strict_eq(ctx,_a,_b); _CHK(_r);\n"
+                    "               _tsv%d=JS_NewBool(ctx,!JS_VALUE_GET_INT(_r)); _FREE(_r); }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-2, d-2, d-2, d-2, d-2, d-1);
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
             break;
@@ -2527,38 +2605,42 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_CMP_UNFUSED
 
         /* ---- instanceof / in ---- */
+        /* P9.2: pop 2, push 1 at _tsv{d-2}; result depth d-1 */
         case OP_instanceof:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d; _sp=%d;\n"
                 "      int _r=JS_OrdinaryIsInstanceOf(ctx,_a,_b);\n"
                 "      _FREE(_a); _FREE(_b);\n"
                 "      if(_r<0) goto _ex;\n"
-                "      _s[_sp++]=JS_NewBool(ctx,_r); }\n");
+                "      _tsv%d=JS_NewBool(ctx,_r); _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-1);
             break;
         case OP_in:
-            jit_buf_str(cb,
-                "    { JSValue _b=_s[--_sp],_a=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _b=_tsv%d,_a=_tsv%d; _sp=%d;\n"
                 "      int _r=JS_HasProperty(ctx,_b,JS_ValueToAtom(ctx,_a));\n"
                 "      _FREE(_a); _FREE(_b);\n"
                 "      if(_r<0) goto _ex;\n"
-                "      _s[_sp++]=JS_NewBool(ctx,_r); }\n");
+                "      _tsv%d=JS_NewBool(ctx,_r); _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-1);
             break;
 
         /* ---- Control flow ---- */
+        /* P9.2: if_false/if_true: pop 1 from _tsv{d-1}; _sp = d-1 */
         case OP_if_false: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
-                " _FREE(_v); if(!_b) goto _L%d; }\n", tgt);
+                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_if_true: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
-                " _FREE(_v); if(_b) goto _L%d; }\n", tgt);
+                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_goto: {
@@ -2570,15 +2652,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_if_false8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
-                " _FREE(_v); if(!_b) goto _L%d; }\n", tgt);
+                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_if_true8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp]; int _b=_BOOL(_v);"
-                " _FREE(_v); if(_b) goto _L%d; }\n", tgt);
+                "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             break;
         }
         case OP_goto8: {
@@ -2593,81 +2675,93 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
 
         /* ---- Property access (with inline property cache) ---- */
+        /* P9.2: get_field: pop obj, push result; depth unchanged (d->d) */
         case OP_get_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
-                "      JSValue _o=_s[--_sp], _r;\n"
+                "      JSValue _o=_tsv%d, _r;\n"
                 "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
                 "          _r=js_jit_ic_read(ctx,_o,_ic%d.slot);\n"
                 "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
-                "      _FREE(_o); _CHK(_r); _s[_sp++]=_r; }\n",
-                pc, pc, pc, atom, atom, pc);
+                "      _FREE(_o); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                pc, d-1, pc, pc, atom, atom, pc, d-1, d-1, d);
             break;
         }
-        case OP_get_field2: { /* keep object on stack */
+        case OP_get_field2: { /* keep object on stack; push result: depth d -> d+1 */
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
-                "      if (js_likely(js_jit_ic_check(_s[_sp-1],&_ic%d)))\n"
-                "          _r=js_jit_ic_read(ctx,_s[_sp-1],_ic%d.slot);\n"
-                "      else { _r=_RT->get_prop(ctx,_s[_sp-1],(JSAtom)%uu);\n"
-                "             js_jit_ic_fill_get(ctx,_s[_sp-1],(JSAtom)%uu,&_ic%d); }\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n",
-                pc, pc, pc, atom, atom, pc);
+                "      if (js_likely(js_jit_ic_check(_tsv%d,&_ic%d)))\n"
+                "          _r=js_jit_ic_read(ctx,_tsv%d,_ic%d.slot);\n"
+                "      else { _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
+                "             js_jit_ic_fill_get(ctx,_tsv%d,(JSAtom)%uu,&_ic%d); }\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                pc, d-1, pc, d-1, pc, d-1, atom, d-1, atom, pc, d, d, d+1);
             break;
         }
-        case OP_put_field: {
+        case OP_put_field: { /* pop val, pop obj; depth d -> d-2 */
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
-                "      JSValue _v=_s[--_sp], _o=_s[--_sp]; int _ret;\n"
+                "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
                 "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
                 "          _ret=js_jit_ic_write(ctx,_o,_v,_ic%d.slot);\n"
                 "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
                 "             js_jit_ic_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
                 "      _FREE(_o); if(_ret<0) goto _ex; }\n",
-                pc, pc, pc, atom, atom, pc);
+                pc, d-1, d-2, d-2, pc, pc, atom, atom, pc);
             break;
         }
         /* P8.5: dense array element fast path.
          * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT.
          * Fast path: js_jit_array_get/set hit the u.array.values[] directly.
-         * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty. */
+         * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty.
+         * P9.2: get_array_el: pop idx(_tsv{d-1}), pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
         case OP_get_array_el:
-            jit_buf_str(cb,
-                "    { JSValue _idx=_s[--_sp],_o=_s[--_sp];\n"
+            jit_buf_printf(cb,
+                "    { JSValue _idx=_tsv%d,_o=_tsv%d;\n"
                 "      JSValue _r;\n"
                 "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
                                "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
                 "         &&js_jit_array_get(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),&_r))\n"
                 "          ;/* fast hit */\n"
                 "      else _r=_RT->get_array_el(ctx,_o,_idx);\n"
-                "      _FREE(_o);_FREE(_idx);_CHK(_r);_s[_sp++]=_r; }\n");
+                "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-2, d-2, d-2, d-1);
             break;
+        /* P9.2: put_array_el: pop v(_tsv{d-1}), idx(_tsv{d-2}), obj(_tsv{d-3}); depth d->d-3 */
         case OP_put_array_el:
-            jit_buf_str(cb,
-                "    { JSValue _v=_s[--_sp],_idx=_s[--_sp],_o=_s[--_sp];\n"
-                "      int _ret;\n"
+            jit_buf_printf(cb,
+                "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d;\n"
+                "      _sp=%d; int _ret;\n"
                 "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
                                "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
                 "         &&js_jit_array_set(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),_v))\n"
                 "          _ret=0;/* fast hit, _v consumed */\n"
                 "      else _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                "      _FREE(_o);_FREE(_idx);if(_ret<0) goto _ex; }\n");
+                "      _FREE(_o);_FREE(_idx);if(_ret<0) goto _ex; }\n",
+                d-1, d-2, d-3, d-3);
             break;
+        /* P9.2: get_length: peek obj at _tsv{d-1}, replace with result; depth unchanged */
         case OP_get_length:
             jit_buf_printf(cb,
-                "    { JSValue _obj=_s[_sp-1];"
-                " JSValue _r=_RT->get_prop(ctx,_obj,(JSAtom)%uu);"
-                " _CHK(_r);"
-                " _FREE(_s[--_sp]); _s[_sp++]=_r; }\n",
-                (unsigned)JS_ATOM_length);
+                "    { JSValue _obj=_tsv%d;\n"
+                "      JSValue _r=_RT->get_prop(ctx,_obj,(JSAtom)%uu);\n"
+                "      _sp=%d; _CHK(_r); _FREE(_tsv%d); _tsv%d=_r; _sp=%d; }\n",
+                d-1, (unsigned)JS_ATOM_length, d-1, d-1, d-1, d);
             break;
 
         /* ---- Function calls ---- */
+        /* P9.2: calls use named _tsv{} slots.
+         * stack layout at depth d:
+         *   OP_call N:          func=_tsv{d-N-1}, args=_tsv{d-N}.._tsv{d-1}
+         *   OP_call_method N:   this=_tsv{d-N-2}, func=_tsv{d-N-1}, args=_tsv{d-N}.._tsv{d-1}
+         *   OP_call_constructor N: ctor=_tsv{d-N-2}, new_target=_tsv{d-N-1}, args=_tsv{d-N}.._tsv{d-1}
+         * Since _tsv are separate C variables (not an array), we build a temp array
+         * in the generated C for passing args to the call. */
         case OP_call:
         case OP_call0:
         case OP_call1:
@@ -2678,71 +2772,124 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 nargs = (int)bc_u16(&bc[pc+1]);
             else
                 nargs = op - OP_call0;
-            /* stack: func arg0 arg1 ... argN-1
-             * After call: func and args consumed, result pushed.
-             *
-             * P8.2: If the function slot in gen_st is JIT_T_SELF_FUNC, emit a
-             * direct C call to self rather than going through _RT->call.
-             * We still poll interrupts to honour JS_SetInterruptHandler.       */
+            /* func at _tsv{d-nargs-1}, args at _tsv{d-nargs}.._tsv{d-1}
+             * result at _tsv{d-nargs-1}, new depth = d-nargs */
             {
                 int func_slot = gen_sp - 1 - nargs;
                 int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
-                if (is_self) {
-                    jit_buf_printf(cb,
-                        "    { int _n=%d;\n"
-                        "      JSValue _f=_s[_sp-1-_n];\n"
-                        "      if(_RT->poll_interrupts(ctx)) goto _ex;\n"
-                        "      JSValue _r=%s(ctx,JS_UNDEFINED,_n,&_s[_sp-_n],cpool,var_refs);\n"
-                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                        "      _sp -= _n+1; _FREE(_f);\n"
-                        "      _CHK(_r); _s[_sp++]=_r; }\n",
-                        nargs, self_jit_sym);
-                } else {
-                    jit_buf_printf(cb,
-                        "    { int _n=%d;\n"
-                        "      JSValue _f=_s[_sp-1-_n];\n"
-                        "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
-                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                        "      _sp -= _n+1; _FREE(_f);\n"
-                        "      _CHK(_r); _s[_sp++]=_r; }\n",
-                        nargs);
+                int fslot = d - nargs - 1; /* absolute slot index of func */
+                jit_buf_printf(cb, "    { JSValue _f=_tsv%d;\n", fslot);
+                /* Build args array */
+                if (nargs > 0) {
+                    jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
+                    for (int _aj = 0; _aj < nargs; _aj++) {
+                        if (_aj) jit_buf_str(cb, ",");
+                        jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
+                    }
+                    jit_buf_str(cb, "};\n");
                 }
+                if (is_self) {
+                    jit_buf_str(cb, "      if(_RT->poll_interrupts(ctx)) goto _ex;\n");
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "      JSValue _r=%s(ctx,JS_UNDEFINED,%d,_ca%d,cpool,var_refs);\n",
+                            self_jit_sym, nargs, pc);
+                    else
+                        jit_buf_printf(cb,
+                            "      JSValue _r=%s(ctx,JS_UNDEFINED,0,NULL,cpool,var_refs);\n",
+                            self_jit_sym);
+                } else {
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n",
+                            nargs, pc);
+                    else
+                        jit_buf_str(cb,
+                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n");
+                }
+                /* Free args */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
+                jit_buf_printf(cb,
+                    "      _sp=%d; _FREE(_f);\n"
+                    "      _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                    fslot, fslot, fslot+1);
             }
             break;
         }
         case OP_call_method: {
             int nargs = (int)bc_u16(&bc[pc+1]);
-            /* stack: this func arg0 ... argN-1 */
-            jit_buf_printf(cb,
-                "    { int _n=%d;\n"
-                "      JSValue _f=_s[_sp-1-_n];\n"
-                "      JSValue _t=_s[_sp-2-_n];\n"
-                "      JSValue _r=_RT->call(ctx,_f,_t,_n,&_s[_sp-_n]);\n"
-                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                "      _sp -= _n+2; _FREE(_f); _FREE(_t);\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n",
-                nargs);
+            /* stack: this(_tsv{d-N-2}) func(_tsv{d-N-1}) arg0.._N-1(_tsv{d-N}.._tsv{d-1})
+             * result at _tsv{d-N-2}, new depth = d-N-1 */
+            {
+                int tslot = d - nargs - 2; /* this */
+                int fslot = d - nargs - 1; /* func */
+                jit_buf_printf(cb,
+                    "    { JSValue _f=_tsv%d;\n"
+                    "      JSValue _t=_tsv%d;\n",
+                    fslot, tslot);
+                if (nargs > 0) {
+                    jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
+                    for (int _aj = 0; _aj < nargs; _aj++) {
+                        if (_aj) jit_buf_str(cb, ",");
+                        jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
+                    }
+                    jit_buf_str(cb, "};\n");
+                    jit_buf_printf(cb,
+                        "      JSValue _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n",
+                        nargs, pc);
+                } else {
+                    jit_buf_str(cb,
+                        "      JSValue _r=_RT->call(ctx,_f,_t,0,NULL);\n");
+                }
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
+                jit_buf_printf(cb,
+                    "      _sp=%d; _FREE(_f); _FREE(_t);\n"
+                    "      _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                    tslot, tslot, tslot+1);
+            }
             break;
         }
         case OP_tail_call_method: {
             int nargs = (int)bc_u16(&bc[pc+1]);
-            /* tail call: perform the call and return the result directly
-             * (no OP_return follows in the bytecode stream) */
-            jit_buf_printf(cb,
-                "    { int _n=%d;\n"
-                "      JSValue _f=_s[_sp-1-_n];\n"
-                "      JSValue _t=_s[_sp-2-_n];\n"
-                "      JSValue _r=_RT->call(ctx,_f,_t,_n,&_s[_sp-_n]);\n"
-                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                "      _sp -= _n+2; _FREE(_f); _FREE(_t);\n"
-                "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
-                nargs);
+            /* tail call: perform call and return directly */
+            {
+                int tslot = d - nargs - 2;
+                int fslot = d - nargs - 1;
+                jit_buf_printf(cb,
+                    "    { JSValue _f=_tsv%d;\n"
+                    "      JSValue _t=_tsv%d;\n",
+                    fslot, tslot);
+                if (nargs > 0) {
+                    jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
+                    for (int _aj = 0; _aj < nargs; _aj++) {
+                        if (_aj) jit_buf_str(cb, ",");
+                        jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
+                    }
+                    jit_buf_str(cb, "};\n");
+                    jit_buf_printf(cb,
+                        "      JSValue _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n",
+                        nargs, pc);
+                } else {
+                    jit_buf_str(cb,
+                        "      JSValue _r=_RT->call(ctx,_f,_t,0,NULL);\n");
+                }
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
+                jit_buf_printf(cb,
+                    "      _sp=%d; _FREE(_f); _FREE(_t);\n"
+                    "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                    tslot);
+            }
+            /* Free remaining stack slots and locals, then return */
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
-            jit_buf_str(cb,
-                "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return _r; }\n");
+            /* Free _tsv{0} down to _tsv{d-nargs-3} (below this/func slots) */
+            for (int _j = d-nargs-3; _j >= 0; _j--)
+                jit_buf_printf(cb, "      _FREE(_tsv%d);\n", _j);
+            jit_buf_str(cb, "      return _r; }\n");
             break;
         }
         case OP_tail_call: {
@@ -2751,110 +2898,155 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             {
                 int func_slot = gen_sp - 1 - nargs;
                 int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
-                if (is_self) {
-                    jit_buf_printf(cb,
-                        "    { int _n=%d;\n"
-                        "      JSValue _f=_s[_sp-1-_n];\n"
-                        "      if(_RT->poll_interrupts(ctx)) goto _ex;\n"
-                        "      JSValue _r=%s(ctx,JS_UNDEFINED,_n,&_s[_sp-_n],cpool,var_refs);\n"
-                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                        "      _sp -= _n+1; _FREE(_f);\n"
-                        "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
-                        nargs, self_jit_sym);
-                } else {
-                    jit_buf_printf(cb,
-                        "    { int _n=%d;\n"
-                        "      JSValue _f=_s[_sp-1-_n];\n"
-                        "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,_n,&_s[_sp-_n]);\n"
-                        "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                        "      _sp -= _n+1; _FREE(_f);\n"
-                        "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
-                        nargs);
+                int fslot = d - nargs - 1;
+                jit_buf_printf(cb, "    { JSValue _f=_tsv%d;\n", fslot);
+                if (nargs > 0) {
+                    jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
+                    for (int _aj = 0; _aj < nargs; _aj++) {
+                        if (_aj) jit_buf_str(cb, ",");
+                        jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
+                    }
+                    jit_buf_str(cb, "};\n");
                 }
+                if (is_self) {
+                    jit_buf_str(cb, "      if(_RT->poll_interrupts(ctx)) goto _ex;\n");
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "      JSValue _r=%s(ctx,JS_UNDEFINED,%d,_ca%d,cpool,var_refs);\n",
+                            self_jit_sym, nargs, pc);
+                    else
+                        jit_buf_printf(cb,
+                            "      JSValue _r=%s(ctx,JS_UNDEFINED,0,NULL,cpool,var_refs);\n",
+                            self_jit_sym);
+                } else {
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n",
+                            nargs, pc);
+                    else
+                        jit_buf_str(cb,
+                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n");
+                }
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
+                jit_buf_printf(cb,
+                    "      _sp=%d; _FREE(_f);\n"
+                    "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
+                    fslot);
             }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
-            jit_buf_str(cb,
-                "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return _r; }\n");
+            /* Free any remaining stack below the func slot */
+            for (int _j = d-nargs-2; _j >= 0; _j--)
+                jit_buf_printf(cb, "      _FREE(_tsv%d);\n", _j);
+            jit_buf_str(cb, "      return _r; }\n");
             break;
         }
         case OP_call_constructor: {
             int nargs = (int)bc_u16(&bc[pc+1]);
-            /* stack: ctor new_target arg0 ... argN-1 */
-            jit_buf_printf(cb,
-                "    { int _n=%d;\n"
-                "      JSValue _nt=_s[_sp-1-_n];\n"
-                "      JSValue _ctor=_s[_sp-2-_n];\n"
-                "      JSValue _r=_RT->call_constructor(ctx,_ctor,_nt,_n,&_s[_sp-_n]);\n"
-                "      for(int _j=0;_j<_n;_j++) _FREE(_s[_sp-1-_j]);\n"
-                "      _sp -= _n+2; _FREE(_ctor); _FREE(_nt);\n"
-                "      _CHK(_r); _s[_sp++]=_r; }\n",
-                nargs);
+            /* stack: ctor(_tsv{d-N-2}) new_target(_tsv{d-N-1}) arg0.._N-1(_tsv{d-N}.._tsv{d-1}) */
+            {
+                int cslot = d - nargs - 2; /* ctor */
+                int nslot = d - nargs - 1; /* new_target */
+                jit_buf_printf(cb,
+                    "    { JSValue _nt=_tsv%d;\n"
+                    "      JSValue _ctor=_tsv%d;\n",
+                    nslot, cslot);
+                if (nargs > 0) {
+                    jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
+                    for (int _aj = 0; _aj < nargs; _aj++) {
+                        if (_aj) jit_buf_str(cb, ",");
+                        jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
+                    }
+                    jit_buf_str(cb, "};\n");
+                    jit_buf_printf(cb,
+                        "      JSValue _r=_RT->call_constructor(ctx,_ctor,_nt,%d,_ca%d);\n",
+                        nargs, pc);
+                } else {
+                    jit_buf_str(cb,
+                        "      JSValue _r=_RT->call_constructor(ctx,_ctor,_nt,0,NULL);\n");
+                }
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
+                jit_buf_printf(cb,
+                    "      _sp=%d; _FREE(_ctor); _FREE(_nt);\n"
+                    "      _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                    cslot, cslot, cslot+1);
+            }
             break;
         }
         /* OP_new does not exist; call_constructor handles 'new' expressions */
 
         /* ---- Return ---- */
+        /* P9.2: OP_return: pop return value at _tsv{d-1}, free remaining stack _tsv{0}.._tsv{d-2} */
         case OP_return: {
-            jit_buf_str(cb, "    { JSValue _r=_s[--_sp];\n");
+            jit_buf_printf(cb, "    { JSValue _r=_tsv%d; _sp=%d;\n", d-1, d-1);
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
-            jit_buf_str(cb,
-                "      while(_sp>0) _FREE(_s[--_sp]);\n"
-                "      return _r; }\n");
+            for (int _j = d-2; _j >= 0; _j--)
+                jit_buf_printf(cb, "      _FREE(_tsv%d);\n", _j);
+            jit_buf_str(cb, "      return _r; }\n");
             break;
         }
+        /* P9.2: OP_return_undef: free _tsv{0}.._tsv{d-1} and all locals */
         case OP_return_undef: {
             jit_buf_str(cb, "    {");
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, " _FREE(_jsv_%s);",
                                varnames[arg_count+_jf]); }
-            jit_buf_str(cb,
-                " while(_sp>0) _FREE(_s[--_sp]); return JS_UNDEFINED; }\n");
+            for (int _j = d-1; _j >= 0; _j--)
+                jit_buf_printf(cb, " _FREE(_tsv%d);", _j);
+            jit_buf_str(cb, " return JS_UNDEFINED; }\n");
             break;
         }
 
         /* ---- Throw ---- */
+        /* P9.2: pop value at _tsv{d-1}, update _sp, then throw */
         case OP_throw:
-            jit_buf_str(cb,
-                "    { JSValue _v=_s[--_sp]; _RT->throw_val(ctx,_v);"
-                " goto _ex; }\n");
+            jit_buf_printf(cb,
+                "    { JSValue _v=_tsv%d; _sp=%d; _RT->throw_val(ctx,_v);"
+                " goto _ex; }\n",
+                d-1, d-1);
             break;
 
         /* OP_typeof_undef does not exist; OP_typeof handles typeof */
 
         /* ---- Object/Array creation ---- */
+        /* P9.2: push new object at _tsv{d}; depth d -> d+1 */
         case OP_object:
-            jit_buf_str(cb,
-                "    { JSValue _r=JS_NewObject(ctx); _CHK(_r);"
-                " _s[_sp++]=_r; }\n");
+            jit_buf_printf(cb,
+                "    { JSValue _r=JS_NewObject(ctx);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d, d, d+1);
             break;
-        /* OP_define_field: obj val -> obj   (obj stays on stack, val consumed)
-         * Used in object literals: { key: val } sequences.
-         * JS_PROP_C_W_E = configurable | writable | enumerable */
+        /* OP_define_field: obj(_tsv{d-2}) val(_tsv{d-1}) -> obj stays at _tsv{d-2}; depth d -> d-1 */
         case OP_define_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
             jit_buf_printf(cb,
-                "    { JSValue _v=_s[--_sp];\n"
-                "      int _r=JS_DefinePropertyValue(ctx,_s[_sp-1],(JSAtom)%uu,_v,"
+                "    { JSValue _v=_tsv%d; _sp=%d;\n"
+                "      int _r=JS_DefinePropertyValue(ctx,_tsv%d,(JSAtom)%uu,_v,"
                 "JS_PROP_C_W_E|JS_PROP_THROW);\n"
                 "      if(_r<0) goto _ex; }\n",
-                atom);
+                d-1, d-1, d-2, atom);
             break;
         }
+        /* P9.2: array_from N: pop N items, push array; result at _tsv{d-N}, depth d -> d-N+1 */
         case OP_array_from: {
             int nargs = (int)bc_u16(&bc[pc+1]);
             jit_buf_printf(cb,
-                "    { JSValue _r=JS_NewArray(ctx); _CHK(_r);\n"
-                "      for(int _j=%d-1;_j>=0;_j--) {\n"
-                "        JSValue _v=_s[--_sp];\n"
-                "        JS_SetPropertyUint32(ctx,_r,(uint32_t)_j,_v);\n"
-                "      }\n"
-                "      _s[_sp++]=_r; }\n",
-                nargs);
+                "    { JSValue _r=JS_NewArray(ctx);\n"
+                "      _sp=%d; _CHK(_r);\n",
+                d-nargs);
+            /* JS_SetPropertyUint32 takes ownership of the value */
+            for (int _aj = 0; _aj < nargs; _aj++)
+                jit_buf_printf(cb,
+                    "      JS_SetPropertyUint32(ctx,_r,(uint32_t)%d,_tsv%d);\n",
+                    _aj, d-nargs+_aj);
+            jit_buf_printf(cb,
+                "      _tsv%d=_r; _sp=%d; }\n",
+                d-nargs, d-nargs+1);
             break;
         }
 
@@ -3105,7 +3297,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    gen_footer(cb, var_count, arg_count, varnames);
+    gen_footer(cb, var_count, arg_count, varnames, stack_size);
 
     scan_result_free(&sr);
     free(local_type);
