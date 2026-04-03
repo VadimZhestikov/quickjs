@@ -28,6 +28,7 @@ C as the intermediate representation.
 | [phase8-p85-array-fast.md](phase8-p85-array-fast.md) | P8.5: dense array element fast path, bypass `JS_ValueToAtom` + hash walk |
 | [phase8-p86-float64-arith.md](phase8-p86-float64-arith.md) | P8.6: `JSJITICEntry.kind`, float64 arithmetic/comparison fast paths |
 | [phase9-todo.md](phase9-todo.md) | Phase 9 plan: stackless IR, CF structuring, variable names, typed temporaries |
+| [phase10-todo.md](phase10-todo.md) | Phase 10 plan: combined .so, LTO inter-procedural inlining, direct C calls |
 
 ---
 
@@ -154,9 +155,13 @@ JSFunctionBytecode
         │
         ▼
    jit_cache_put()                      ← Phase 7.3: copy to ~/.cache/qjs-jit/<hash>.so
-        │
+        │                                  [P10.1] also writes <hash>.c
         ▼
    .so  →  dlopen  →  dlsym("__jit_f_<hash>")   ← hash-stable symbol (Phase 7.3)
+        │
+        │  [P10.2] --jit-link: gcc -O2 -flto <all .c> -o combined.so
+        │  [P10.3] emits direct extern __jit_f_<hash>() calls in gen_body()
+        │  [P10.4] manifest: bc_hash → func_ptr; atomic install from combined.so
         │
         ▼
    js_jit_fb_set_func()   ← atomic RELEASE store
@@ -197,6 +202,8 @@ Every optimisation phase targets one aspect of JSValue boxing overhead:
 | **P9.2** | **Stackless IR: `_s[]` array → named `_ts{N}` locals; GCC keeps temporaries in registers** |
 | **P9.3** | **CF structuring: goto spaghetti → `if/while/for`; enables GCC loop optimisations** |
 | **P9.4** | **Typed stack temporaries: `double _tsd{N}` for provably float64 stack slots; zero tag checks** |
+| **P10.3** | **Direct C calls: `extern __jit_f_<hash>()` bypasses `js_jit_call()` indirect + atomic read** |
+| **P10.5** | **IC check inlining: LTO inlines `js_jit_ic_check()` (3 pointer compares) into hot loop** |
 
 ### Vtable for slow paths
 
@@ -400,6 +407,76 @@ remaining gap requires emitting native machine code directly.
 
 ---
 
+## Phase 10 — Planned: Combined .so + LTO Inter-procedural Optimisation
+
+Phase 9 makes each function's generated C as clean as possible for GCC within a single
+function.  Phase 10 removes the remaining barrier: today each function is compiled to its
+own `.so`, so GCC cannot inline `dot()` into its callers or propagate constants across
+function boundaries.
+
+### 10.1 Cache `.c` source
+
+`jit_cache_put()` writes `<hash>.so` today; P10.1 also writes `<hash>.c`.  Zero change to
+the hot path.
+
+### 10.2 `--jit-link` combiner
+
+A new execution mode that collects all `.c` files for a script and invokes GCC once:
+
+```sh
+gcc -O2 -flto -shared -fPIC \
+    ~/.cache/qjs-jit/aabbcc.c \
+    ~/.cache/qjs-jit/ddeeff.c \
+    ...
+    -o ~/.cache/qjs-jit/combined_<run_hash>.so
+```
+
+GCC sees all JIT-compiled functions simultaneously: inlining, IPO, constant propagation,
+and vectorisation across call boundaries become possible.
+
+### 10.3 Direct C calls
+
+When the callee's `bc_hash` is known at code-generation time, emit a direct `extern`
+declaration and call instead of `js_jit_call()`:
+
+```c
+// Before P10.3 — indirect through runtime pointer
+_r = js_jit_call(ctx, _callee_obj, argc, argv);
+
+// After P10.3 — direct call, visible to GCC inliner
+extern JSValue __jit_f_aabbcc0011223344(
+    JSContext*, JSValue, int, JSValue*, JSValue*, JSValue**);
+_r = __jit_f_aabbcc0011223344(ctx, _this, argc, argv, _cpool, _var_refs);
+```
+
+When caller and callee land in the same combined `.so`, GCC inlines small callees
+(dot, add, normalize, etc.) automatically.
+
+### 10.4 Manifest and combined loader
+
+The combined `.so` exports a `__jit_manifest[]` table mapping `bc_hash → func_ptr`.
+`js_jit_install_combined()` walks the table and atomically installs each function pointer
+into the corresponding `JSFunctionBytecode`, replacing the per-function `.so` handles.
+
+### Synergy with Phase 9
+
+Phase 9 typed temps (`_tsd{N}`) mean the inlined callee code contains only `double`
+arithmetic — no JSValue boxing at the inlined boundary.  The combination of P9.4 +
+P10.3 is what enables GCC to produce tight XMM loops for float-heavy benchmarks
+(RayTrace, DeltaBlue).
+
+### Expected performance (P9 → P10 additional gain)
+
+| Benchmark | After P9 | After P10 | P10 gain |
+|---|---:|---:|---|
+| RayTrace | 3000–5000 | 8000–15000 | **2–3×** |
+| DeltaBlue | 1600–2300 | 2200–4600 | **1.4–2×** |
+| Crypto | 2200–3800 | 3000–5000 | **1.3–1.5×** |
+| Richards | 1100–1450 | 1400–1800 | **1.2–1.4×** |
+| **V8bench score** | **~1800–3000** | **~3000–5500** | **~1.7–2×** |
+
+---
+
 ## Build flags
 
 ```sh
@@ -411,12 +488,17 @@ make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs  # threshold=2 (benchmark mode)
 Lower = JIT fires sooner (useful for benchmarks); higher = only truly hot functions
 are compiled (good for startup-sensitive workloads).
 
-## CLI flags (Phase 7)
+## CLI flags
 
 ```sh
-./qjs --jit-warmup script.js   # compile all functions → cache, then exit
-./qjs --jit-aot    script.js   # compile all functions → cache (or hit), then execute
+./qjs --jit-warmup script.js   # compile all functions → cache, then exit   (Phase 7)
+./qjs --jit-aot    script.js   # compile all functions → cache (or hit), then execute (Phase 7)
 ./qjs              script.js   # normal: JIT triggers at threshold during execution
+
+# Phase 10 workflow (planned):
+./qjs --jit-warmup script.js   # Step 1: warm all functions, write .so + .c to cache
+./qjs --jit-link   script.js   # Step 2: combine .c files with GCC -O2 -flto
+./qjs --jit-aot    script.js   # Step 3: execute with combined .so (inlined callees)
 ```
 
 Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
