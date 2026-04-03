@@ -124,6 +124,10 @@ typedef struct JSJITRuntime {
     int     (*set_prop)(JSContext *, JSValue obj, JSAtom atom, JSValue val);
     /* Slow path for OP_get_var when value is JS_UNINITIALIZED (deleted global or TDZ) */
     JSValue (*get_var_slow)(JSContext *, JSAtom atom, int is_lexical);
+    /* Slow path for OP_put_var when value is JS_UNINITIALIZED (implicit global or TDZ).
+     * is_put_init=1 if opcode is OP_put_var_init (allows writing to uninit lexical).
+     * val is consumed (freed or stored) on success; on exception val is freed too. */
+    int     (*put_var_slow)(JSContext *, JSAtom atom, int is_lexical, int is_put_init, JSValue val);
     JSValue (*get_array_el)(JSContext *, JSValue obj, JSValue idx);
     int     (*set_array_el)(JSContext *, JSValue obj, JSValue idx, JSValue val);
 
@@ -289,6 +293,7 @@ JSValue js_jit_op_div(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_mod(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_pow(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_get_var_slow(JSContext *, JSAtom atom, int is_lexical);
+int     js_jit_op_put_var_slow(JSContext *, JSAtom atom, int is_lexical, int is_put_init, JSValue val);
 JSValue js_jit_op_shl(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_sar(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_shr(JSContext *, JSValue, JSValue);

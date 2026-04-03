@@ -214,6 +214,7 @@ const JSJITRuntime js_jit_rt = {
     .get_prop         = jit_rt_get_prop,
     .set_prop         = jit_rt_set_prop,
     .get_var_slow     = js_jit_op_get_var_slow,
+    .put_var_slow     = js_jit_op_put_var_slow,
     .get_array_el     = jit_rt_get_array_el,
     .set_array_el     = jit_rt_set_array_el,
     /* calls — P8.3: js_jit_call checks jit_func before falling to JS_Call */
@@ -1780,9 +1781,27 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_put_var:
         case OP_put_var_init: {
             int idx = (int)bc_u16(&bc[pc+1]);
-            jit_buf_printf(cb,
-                "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);"
-                " _FREE(*_p); *_p=_s[--_sp]; }\n", idx);
+            JSAtom cv_atom   = js_jit_fb_get_closure_var_atom(b, idx);
+            int    cv_is_lex = js_jit_fb_get_closure_var_is_lexical(b, idx);
+            int    is_init   = (op == OP_put_var_init) ? 1 : 0;
+            /* OP_put_var_init on a lexical slot is the normal initialisation
+             * path (let x = expr): write directly even if UNINITIALIZED.
+             * For all other cases, check UNINITIALIZED and call the slow path
+             * (implicit global → JS_SetPropertyInternal; lexical TDZ → throw). */
+            if (is_init && cv_is_lex) {
+                /* lexical init: always write directly, never needs slow path */
+                jit_buf_printf(cb,
+                    "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);"
+                    " _FREE(*_p); *_p=_s[--_sp]; }\n", idx);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_s[--_sp];\n"
+                    "      JSValue *_p=_RT->var_ref_value(var_refs[%d]);\n"
+                    "      if(js_unlikely(JS_VALUE_GET_TAG(*_p)==JS_TAG_UNINITIALIZED)){\n"
+                    "        if(_RT->put_var_slow(ctx,%uu,%d,%d,_v)<0) goto _ex;\n"
+                    "      } else { _FREE(*_p); *_p=_v; } }\n",
+                    idx, (unsigned)cv_atom, cv_is_lex, is_init);
+            }
             break;
         }
 

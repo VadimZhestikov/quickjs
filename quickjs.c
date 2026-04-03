@@ -15675,6 +15675,30 @@ JSValue js_jit_op_get_var_slow(JSContext *ctx, JSAtom atom, int is_lexical)
                                          ctx->global_obj, TRUE);
     return val;
 }
+/* Slow path for OP_put_var / OP_put_var_init when *var_ref->pvalue is
+ * JS_UNINITIALIZED.  Mirrors the interpreter's OP_put_var branch exactly:
+ *   is_lexical && !is_put_init → TDZ / const throw
+ *   is_lexical &&  is_put_init → caller should write directly (not called here)
+ *   !is_lexical                → JS_SetPropertyInternal on global_obj
+ * val is always consumed (freed on error, stored/transferred on success).
+ * Returns 0 on success, -1 on exception. */
+int js_jit_op_put_var_slow(JSContext *ctx, JSAtom atom, int is_lexical,
+                           int is_put_init, JSValue val)
+{
+    int ret;
+    if (is_lexical) {
+        /* OP_put_var_init into an uninit lexical slot is handled by the caller
+         * (direct write); we only get here for OP_put_var on a lexical TDZ. */
+        JS_FreeValue(ctx, val);
+        JS_ThrowReferenceErrorUninitialized(ctx, atom);
+        return -1;
+    }
+    /* Non-lexical implicit global: set on global_obj */
+    ret = JS_SetPropertyInternal(ctx, ctx->global_obj, atom, val,
+                                 ctx->global_obj, JS_PROP_THROW_STRICT);
+    /* val was consumed by JS_SetPropertyInternal regardless of ret */
+    return (ret < 0) ? -1 : 0;
+}
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
 JSAtom   js_jit_fb_get_func_atom(JSFunctionBytecode *b)  { return b->func_name; }
 /* P8.2: interrupt poll wrapper — also checks C stack depth.
@@ -15719,6 +15743,33 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
             if (jf) {
                 if (js_jit_poll_interrupts(ctx))
                     return JS_EXCEPTION;
+                /* Mirror the interpreter: pad argv to arg_count when fewer
+                 * arguments were provided.  The JIT function's GEN_PUT_ARG
+                 * uses argc as a bounds check — without padding it would
+                 * discard writes to "excess" parameter slots (e.g. p=default
+                 * when called as f(x) but f(x,p) has arg_count=2).
+                 *
+                 * Each argv[i] is DUP'd into padded[i] so the JIT owns its
+                 * own reference (GEN_PUT_ARG may _FREE(argv[i]) then store a
+                 * new value; without DUP that would corrupt the caller's
+                 * stack slot and cause a double-free).  After the JIT returns
+                 * we free all padded slots (the JIT has already freed/replaced
+                 * each slot it touched). */
+                if (unlikely(argc < b->arg_count)) {
+                    int n = b->arg_count;
+                    JSValue *padded = alloca(sizeof(JSValue) * n);
+                    JSValue ret;
+                    int i;
+                    for (i = 0; i < argc; i++)
+                        padded[i] = JS_DupValue(ctx, argv[i]);
+                    for (; i < n; i++)
+                        padded[i] = JS_UNDEFINED;
+                    ret = jf(ctx, this_val, n, padded,
+                             b->cpool, p->u.func.var_refs);
+                    for (i = 0; i < n; i++)
+                        JS_FreeValue(ctx, padded[i]);
+                    return ret;
+                }
                 return jf(ctx, this_val, argc, argv,
                           b->cpool, p->u.func.var_refs);
             }
