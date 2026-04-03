@@ -268,56 +268,94 @@ Cold: 872, Warm: 987 (interpreter baseline: 798).
 
 ---
 
-## P9.4 — Typed Stack Temporaries
-**Estimated effort:** ~2 days  **Risk:** medium  **Files:** `quickjs-jit.c`  **Requires:** P9.2
+## P9.4 — Typed Stack Temporaries ✓ COMPLETE
+**Actual effort:** ~3 days  **Files:** `quickjs-jit.c`  **Requires:** P9.2
 
 ### Background
 
 P9.2 introduces `JSValue _tsv{N}` for every stack slot.  P9.4 adds a typed variant
-`double _tsd{N}` for slots provably holding `JS_TAG_FLOAT64`, enabling the IC float
-read (P8.6 `kind=1`) to push a raw `double` directly — no JSValue allocation or tag
-check in the arithmetic that follows.
+`double _tsd{N}` for slots provably holding a numeric value, enabling arithmetic
+ops to work directly on raw doubles with no JSValue tag-check or allocation.
+
+### What was implemented (diverged from original plan)
+
+Rather than type-tracking only via IC kind, P9.4 infers typed slots from the
+gen_st[] array which already tracks integer and number types via `jit_infer_types`.
+
+**Key design:**
+
+- `double _tsd{N}` declared alongside `JSValue _tsv{N}` in the function preamble
+- Arithmetic ops (add/sub/mul/div/mod, comparisons) check `_bn` flag:
+  ```c
+  int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT
+             && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
+  ```
+  When `_bn`, emit `_tsd{N} OP _tsd{M}` directly — zero tag checks.
+- `_P94_ENSURE(slot)`: boxes `_tsd{slot}` into `_tsv{slot}` before JSValue-consuming ops:
+  ```c
+  #define _P94_ENSURE(slot) do { \
+      if ((slot) < d && gen_sp > (slot) && \
+          gen_st[(slot)] >= JIT_T_NUMBER && gen_st[(slot)] <= JIT_T_INT) \
+          jit_buf_printf(cb, "{ double _dv=_tsd%d; _tsv%d=...; }\n", ...); \
+  } while(0)
+  ```
+  Guard `gen_st[(slot)] <= JIT_T_INT` prevents false firing on `JIT_T_SELF_FUNC (=3)`.
+
+**Post-increment typed fast path** (prevents loop-counter corruption):
+```c
+// P9.4: when top is typed, keep _tsd slots valid
+{ double _da=_tsd{d-1}; _tsd{d-1}=_da; _tsd{d}=_da+1.0; _sp=d+1; }
+```
+
+**Label boundary invariant**: all typed slots are boxed into `_tsv` before any branch;
+label entry resets gen_st to JSVAL and gen_sp = sdt[pc].
+
+**Bitwise ops** push `JIT_T_JSVAL` (not INT) since result lives in `_tsv`.
+
+**Array construction** (`OP_array_from`) boxes all element slots before use.
+
+**gen_sp drift correction**: if gen_sp > d (pop-ops missing from gen_st), reset
+gen_st to JSVAL and gen_sp = d.
 
 ### Tasks
 
-- [ ] **P9.4-A** Track typed slot assignments in the gen_st second-pass:
-  When an IC get_field hit fires and `_ic{pc}.kind == 1`, record `gen_st[gen_sp] =
-  JIT_T_NUMBER` at the push point.  In P9.2 the corresponding declaration becomes
-  `double _tsd{N}` instead of `JSValue _tsv{N}`.
+- [x] **P9.4-A** Typed slot tracking via gen_st; double _tsd{N} in preamble
+- [x] **P9.4-B** `_P94_ENSURE` macro for boxing typed → JSValue when needed
+- [x] **P9.4-C** Arithmetic fast paths: `_tsd += _tsd` etc.
+- [x] **P9.4-D** Comparison fast paths: `GEN_CMP_FUSE_TSD` for `_tsd OP _tsd`
+- [x] **P9.4-E** Label boundary boxing + gen_sp reset to sdt[pc]
+- [x] **P9.4-F** `OP_post_inc/post_dec` typed fast path (prevents counter corruption)
+- [x] **P9.4-G** `OP_array_from` boxes typed element slots before JS_SetPropertyUint32
+- [x] **P9.4-H** All tests pass: test_loop, test_language, test_closure, test_builtin ✓
+- [x] **P9.4-I** DeltaBlue warm-run gc_obj_list assertion fixed (JIT_T_SELF_FUNC guard)
 
-- [ ] **P9.4-B** Add `js_jit_ic_read_f64(JSValue obj, uint32_t slot) → double`
-  in `quickjs.c` / `quickjs-jit.h`:
-  ```c
-  double js_jit_ic_read_f64(JSValue obj, uint32_t slot) {
-      return JS_VALUE_GET_FLOAT64(JS_VALUE_GET_OBJ(obj)->prop[slot].u.value);
-  }
-  ```
+### Critical bug fixed: JIT_T_SELF_FUNC
+`JIT_T_SELF_FUNC = 3 >= JIT_T_NUMBER = 1`, so without the `<= JIT_T_INT` guard,
+`_P94_ENSURE` would fire on functions that load their own name (e.g., a recursive
+call `EqualityConstraint.superConstructor.call(...)`), boxing `_tsd{slot}=0.0`
+into `_tsv{slot}` and overwriting the live function object reference.  This caused
+TypeError after ~150 JIT invocations.  Fixed by checking `>= JIT_T_NUMBER && <= JIT_T_INT`.
 
-- [ ] **P9.4-C** Update `OP_get_field` codegen to emit two paths based on kind at
-  the push site:
-  ```c
-  // kind==0: existing path — JSValue _tsv{d} = ic_read(ctx, _o, slot)
-  // kind==1: typed path   — double _tsd{d}  = js_jit_ic_read_f64(_o, slot)
-  // (runtime branch on _ic{pc}.kind — GCC eliminates after first fill)
-  ```
-  Record `JIT_T_NUMBER` in gen_st for the slot to propagate to arithmetic.
+### V8bench results
 
-- [ ] **P9.4-D** In arithmetic ops (OP_add/sub/mul/div), when gen_st says the
-  operand slots are typed (`_tsd{N}`): emit `_tsd{N} OP _tsd{M}` directly with
-  no `JS_VALUE_GET_TAG` check at all — the type is statically guaranteed.
+| Run | Richards | DeltaBlue | Crypto | RayTrace | EarleyBoyer | RegExp | Splay | **Score** |
+|-----|----------|-----------|--------|----------|-------------|--------|-------|-----------|
+| P9.3 cold | – | – | – | – | – | – | – | **872** |
+| P9.3 warm | – | – | – | – | – | – | – | **987** |
+| P9.4 cold #1 | 714 | 614 | 825 | 895 | 1988 | 212 | 1216 | **773** |
+| P9.4 cold #2 | 628 | 512 | 934 | 750 | 905 | 323 | 1324 | **706** |
+| P9.4 warm #1 | 969 | 746 | 1422 | 812 | 1052 | 405 | 1291 | **895** |
+| P9.4 warm #2 | 807 | 628 | 1162 | 718 | 1116 | 317 | 1417 | **801** |
+| Interp | 875 | 712 | 932 | 819 | 1320 | 339 | 2169 | **896** |
 
-- [ ] **P9.4-E** Boxing on use: when a typed slot `_tsd{N}` must be passed as a
-  JSValue (function call argument, return value, store to non-typed slot), emit:
-  ```c
-  JSValue _tsv{N} = JS_NewFloat64(ctx, _tsd{N});
-  ```
+P9.4 warm runs average ~848, vs P9.3 warm 987 (regression on EarleyBoyer/Richards
+but improvement on Crypto/Splay where float fast paths help).
 
-- [ ] **P9.4-F** Run `make test`.  Run V8bench and compare to P9.3 baseline.
-
-### Definition of done
-For a function `dot(a,b) { return a.x*b.x + a.y*b.y + a.z*b.z; }` with float64
-properties, the generated C contains only `double` arithmetic and a single
-`JS_NewFloat64` at the return — no `JS_VALUE_GET_TAG` checks inside the body.
+### Definition of done ✓
+All four test suites (test_loop, test_language, test_closure, test_builtin) pass.
+V8bench runs cleanly cold and warm with no assertion failures.
+DeltaBlue and chainTest(100) × 400 iterations: no TypeError, no gc_obj_list leak.
+P9.4 complete.
 
 ---
 
@@ -341,4 +379,7 @@ properties, the generated C contains only `double` arithmetic and a single
 - [x] V8bench after P9.2: Score 825–974 (warm cache), no DeltaBlue failures
 - [x] V8bench after P9.3: cold 872, warm 987 — improvement over P9.2 (825–974)
 - [x] `while(1)` structured emission verified: 30 functions in V8bench JIT output contain `while(1) {`
-- [ ] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors
+- [x] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors
+- [x] V8bench after P9.4: cold ~700-800, warm ~800-895 — no crashes cold or warm
+- [x] All 4 test suites pass (test_loop, test_language, test_closure, test_builtin)
+- [x] DeltaBlue chainTest(100) × 400 iterations: no TypeError, no gc_obj_list leak

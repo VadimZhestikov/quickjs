@@ -1323,6 +1323,10 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
      * _FREE them even if they were never written. */
     for (int j = 0; j < stack_size; j++)
         jit_buf_printf(cb, "    JSValue _tsv%d=JS_UNDEFINED;\n", j);
+    /* P9.4: raw double temporaries for typed stack slots.
+     * When gen_st[slot] >= JIT_T_NUMBER the value lives here, not in _tsv{}. */
+    for (int j = 0; j < stack_size; j++)
+        jit_buf_printf(cb, "    double _tsd%d=0.0;\n", j);
     /* _sp is still needed: updated at throw/exception sites so the _ex
      * cleanup knows which _tsv{} slots are live. */
     jit_buf_str(cb, "    int _sp=0;\n");
@@ -1488,6 +1492,23 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #define _GS_TOP2()  (gen_sp > 1 ? gen_st[gen_sp-2]   : (uint8_t)JIT_T_JSVAL)
 #define _GS_DROP(n) do { gen_sp -= (n); if (gen_sp < 0) gen_sp = 0; } while(0)
 
+/* P9.4: ensure _tsv{slot} has valid JSValue when gen_st says it may be typed.
+ * JS_NewFloat64/Int32 on 64-bit are inline struct assignments — no heap alloc.
+ * Guard: (slot) < d ensures we only box within the real runtime stack depth;
+ * gen_sp may drift above d when some pop-ops are not tracked in gen_st, so
+ * checking gen_sp alone can incorrectly fire on stale gen_st entries. */
+/* JIT_T_SELF_FUNC (=3) must NOT trigger boxing — it marks a JSValue (function
+ * object), not a typed double.  Only JIT_T_NUMBER (1) and JIT_T_INT (2) hold
+ * their value in _tsd and need to be boxed into _tsv. */
+#define _P94_ENSURE(slot) do { \
+    if ((slot) < d && gen_sp > (slot) && \
+        gen_st[(slot)] >= JIT_T_NUMBER && gen_st[(slot)] <= JIT_T_INT) \
+        jit_buf_printf(cb, \
+            "    { double _dv=_tsd%d; " \
+            "_tsv%d=((double)(int32_t)_dv==_dv)?JS_NewInt32(ctx,(int32_t)_dv)" \
+            ":JS_NewFloat64(ctx,_dv); }\n", (slot), (slot)); \
+} while(0)
+
     /* P8.2: self-recursive direct call detection.
      * self_func_atom is the function's own name atom.  When OP_get_var loads a
      * closure var whose atom matches self_func_atom, the gen_st slot is marked
@@ -1500,12 +1521,25 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
              (unsigned long long)bc_hash);
 
     while (pc < bc_len) {
+        /* P9.2: stack depth BEFORE this opcode.  sdt[pc]==0xffff means unreachable.
+         * Computed early so _P94_ENSURE (which uses d) works in the label block. */
+        int d = (sdt && sdt[pc] != 0xffff) ? (int)sdt[pc] : 0;
+
         /* Emit label if this offset is a branch target.
          * Also reset gen_st conservatively — multiple control-flow paths merge
          * here so we cannot assume the type stack is consistent. */
         if (scan_is_target(sr, pc)) {
+            /* P9.4: box any typed stack slots before the label boundary.
+             * Values in _tsd slots (never boxed) must be written to _tsv
+             * because post-label code may take the JSVAL path. */
+            for (int _s = 0; _s < gen_sp; _s++)
+                _P94_ENSURE(_s);
+            /* Set gen_sp to the actual bytecode stack depth at this label so that
+             * _P94_ENSURE(slot) checks remain valid for all live slots after the
+             * reset.  All types are JSVAL since we can't know which path we came from. */
             memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
-            gen_sp = 0;
+            gen_sp = (sdt != NULL) ? (int)sdt[pc] : 0;
+            if (gen_sp < 0 || gen_sp > gen_stk_cap) gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
             /* P9.3: if this PC is a while/do-while loop header, open while(1){ */
             if (n_cf > 0 && p93_depth < 16) {
@@ -1523,8 +1557,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             }
         }
 
-        /* P9.2: stack depth BEFORE this opcode.  sdt[pc]==0xffff means unreachable. */
-        int d = (sdt && sdt[pc] != 0xffff) ? (int)sdt[pc] : 0;
+        /* P9.4: if gen_sp has drifted above d (due to pop-ops missing from gen_st),
+         * reset conservatively so stale INT entries can't cause false _bn=true or
+         * spurious boxing in _P94_ENSURE. */
+        if (gen_sp > d) {
+            memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
+            gen_sp = d;
+        }
 
         int op = bc[pc];
         if (op >= op_sz_count || op_sz[op] == 0) {
@@ -1540,40 +1579,41 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Push immediate values ---- */
-        /* P9.2: push into _tsv{d}, then _sp = d+1. d = sdt[pc] = depth before push. */
+        /* P9.4: push into _tsd{d} (raw double), skip boxing; _sp = d+1.
+         * d = sdt[pc] = depth before push. */
         case OP_push_i32:
             jit_buf_printf(cb,
-                "    _tsv%d=JS_NewInt32(ctx,(int32_t)%uu); _sp=%d;\n",
+                "    _tsd%d=(double)(int32_t)%uu; _sp=%d;\n",
                 d, bc_u32(&bc[pc+1]), d+1);
             break;
         case OP_push_i8:
             jit_buf_printf(cb,
-                "    _tsv%d=JS_NewInt32(ctx,%d); _sp=%d;\n",
+                "    _tsd%d=(double)%d; _sp=%d;\n",
                 d, (int)(int8_t)bc[pc+1], d+1);
             break;
         case OP_push_i16:
             jit_buf_printf(cb,
-                "    _tsv%d=JS_NewInt32(ctx,%d); _sp=%d;\n",
+                "    _tsd%d=(double)%d; _sp=%d;\n",
                 d, (int)(int16_t)bc_u16(&bc[pc+1]), d+1);
             break;
         case OP_push_minus1:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,-1); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=-1.0; _sp=%d;\n", d, d+1); break;
         case OP_push_0:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,0); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=0.0; _sp=%d;\n", d, d+1); break;
         case OP_push_1:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,1); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=1.0; _sp=%d;\n", d, d+1); break;
         case OP_push_2:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,2); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=2.0; _sp=%d;\n", d, d+1); break;
         case OP_push_3:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,3); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=3.0; _sp=%d;\n", d, d+1); break;
         case OP_push_4:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,4); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=4.0; _sp=%d;\n", d, d+1); break;
         case OP_push_5:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,5); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=5.0; _sp=%d;\n", d, d+1); break;
         case OP_push_6:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,6); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=6.0; _sp=%d;\n", d, d+1); break;
         case OP_push_7:
-            jit_buf_printf(cb, "    _tsv%d=JS_NewInt32(ctx,7); _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _tsd%d=7.0; _sp=%d;\n", d, d+1); break;
         case OP_push_false:
             jit_buf_printf(cb, "    _tsv%d=JS_FALSE; _sp=%d;\n", d, d+1); break;
         case OP_push_true:
@@ -1618,9 +1658,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Stack manipulation ---- */
         /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
         case OP_drop: /* pop top: depth d -> d-1 */
-            jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1); break;
+            /* P9.4: typed slot lives in _tsd — no refcount, no _FREE needed */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER)
+                jit_buf_printf(cb, "    _sp=%d;\n", d-1);
+            else
+                jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1);
+            break;
         case OP_dup: /* peek top, push copy: depth d -> d+1 */
-            jit_buf_printf(cb, "    _tsv%d=_DUP(_tsv%d); _sp=%d;\n", d, d-1, d+1); break;
+            /* P9.4: typed slot — copy _tsd directly, no _DUP */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER)
+                jit_buf_printf(cb, "    _tsd%d=_tsd%d; _sp=%d;\n", d, d-1, d+1);
+            else
+                jit_buf_printf(cb, "    _tsv%d=_DUP(_tsv%d); _sp=%d;\n", d, d-1, d+1);
+            break;
         case OP_dup1: /* a b -> a a b (insert dup of a below b): depth d -> d+1
                        * _tsv{d-2}=a, _tsv{d-1}=b
                        * result: _tsv{d-2}=dup(a), _tsv{d-1}=b -> shift b to d, put dup at d-1 */
@@ -1649,6 +1699,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-2, d-2, d-1);
             break;
         case OP_swap: /* a b -> b a: depth unchanged */
+            /* P9.4: box any typed slots before performing the JSValue swap */
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
                 d-1, d-1, d-2, d-2);
@@ -1681,54 +1734,66 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     (local_type && (idx) >= 0 && (idx) < var_count && \
      local_type[(idx)] == JIT_T_NUMBER)
 
-/* P9.2: use _tsv{d} for push, _tsv{d-1} for pop/peek. d is in scope. */
+/* P9.4: use _tsd{d} for typed locals, _tsv{d} for JSVAL locals. d is in scope. */
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
-            "    { int64_t _v=_jsi_%s;" \
-            " _tsv%d=((int32_t)_v==_v)?JS_NewInt32(ctx,(int32_t)_v)" \
-            ":JS_NewFloat64(ctx,(double)_v); _sp=%d; }\n", LNAME(idx), d, d+1); \
+            "    _tsd%d=(double)_jsi_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
-            "    { double _dv=_jsd_%s;" \
-            " _tsv%d=(_dv==(int32_t)_dv)?JS_NewInt32(ctx,(int32_t)_dv)" \
-            ":JS_NewFloat64(ctx,_dv); _sp=%d; }\n", LNAME(idx), d, d+1); \
+            "    _tsd%d=_jsd_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
     else \
         jit_buf_printf(cb, "    _tsv%d=_DUP(_jsv_%s); _sp=%d;\n", d, LNAME(idx), d+1); \
 } while(0)
 
 #define GEN_PUT_LOC(idx) do { \
-    if (_IS_INT(idx)) \
+    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
+        /* P9.4: typed source → read _tsd directly, no unboxing */ \
+        jit_buf_printf(cb, "    _jsi_%s=(int64_t)_tsd%d; _sp=%d;\n", LNAME(idx), d-1, d-1); \
+    } else if (_IS_INT(idx)) { \
         jit_buf_printf(cb, \
             "    { JSValue _t=_tsv%d; _sp=%d;" \
             " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
             d-1, d-1, LNAME(idx)); \
-    else if (_IS_NUM(idx)) \
+    } else if (_IS_NUM(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
+        /* P9.4: typed source → read _tsd directly */ \
+        jit_buf_printf(cb, "    _jsd_%s=_tsd%d; _sp=%d;\n", LNAME(idx), d-1, d-1); \
+    } else if (_IS_NUM(idx)) { \
         jit_buf_printf(cb, \
             "    { JSValue _t=_tsv%d; _sp=%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, d-1, LNAME(idx)); \
-    else \
+    } else { \
+        _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_tsv%d; _sp=%d;\n", \
                        LNAME(idx), LNAME(idx), d-1, d-1); \
+    } \
 } while(0)
 
 #define GEN_SET_LOC(idx) do { \
-    if (_IS_INT(idx)) \
+    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
+        /* P9.4: typed source → read _tsd directly, non-destructive peek */ \
+        jit_buf_printf(cb, "    _jsi_%s=(int64_t)_tsd%d;\n", LNAME(idx), d-1); \
+    } else if (_IS_INT(idx)) { \
         jit_buf_printf(cb, \
             "    { JSValue _t=_tsv%d;" \
             " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
             d-1, LNAME(idx)); \
-    else if (_IS_NUM(idx)) \
+    } else if (_IS_NUM(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
+        /* P9.4: typed source → read _tsd directly, non-destructive peek */ \
+        jit_buf_printf(cb, "    _jsd_%s=_tsd%d;\n", LNAME(idx), d-1); \
+    } else if (_IS_NUM(idx)) { \
         jit_buf_printf(cb, \
             "    { JSValue _t=_tsv%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, LNAME(idx)); \
-    else \
+    } else { \
+        _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_tsv%d);\n", \
                        LNAME(idx), LNAME(idx), d-1); \
+    } \
 } while(0)
 
         case OP_get_loc:  case OP_get_loc_check:
@@ -1779,6 +1844,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             d, idx, idx, d+1); \
 } while(0)
 #define GEN_PUT_ARG(idx) do { \
+    _P94_ENSURE(d-1); \
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){ JSValue _t=_tsv%d; _sp=%d;\n" \
@@ -1791,6 +1857,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             idx, idx, idx, d-1, d-1, d-1, d-1); \
 } while(0)
 #define GEN_SET_ARG(idx) do { \
+    _P94_ENSURE(d-1); \
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){ JSValue _t=_tsv%d;\n" \
@@ -1832,12 +1899,16 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #define GEN_GET_VR(idx) \
     jit_buf_printf(cb, "    _tsv%d=_DUP(*_RT->var_ref_value(var_refs[%d])); _sp=%d;\n", \
                    d, idx, d+1)
-#define GEN_PUT_VR(idx) \
+#define GEN_PUT_VR(idx) do { \
+    _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
     jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1)
-#define GEN_SET_VR(idx) \
+                       " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1); \
+} while(0)
+#define GEN_SET_VR(idx) do { \
+    _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
     jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_DUP(_tsv%d); }\n", idx, d-1)
+                       " _FREE(*_p); *_p=_DUP(_tsv%d); }\n", idx, d-1); \
+} while(0)
 
         case OP_get_var_ref:
         case OP_get_var_ref_check: GEN_GET_VR((int)bc_u16(&bc[pc+1])); break;
@@ -1890,6 +1961,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_put_var:
         case OP_put_var_init: {
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */
             int idx = (int)bc_u16(&bc[pc+1]);
             JSAtom cv_atom   = js_jit_fb_get_closure_var_atom(b, idx);
             int    cv_is_lex = js_jit_fb_get_closure_var_is_lexical(b, idx);
@@ -1938,23 +2010,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* P9.2: binary ops pop 2 (_tsv{d-2}, _tsv{d-1}), push 1 into _tsv{d-2}.
          * Result depth = d-1.  Set _sp=d-2 before any vtable call for safety. */
         case OP_add: {
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* gen-time: both numeric — INT+INT kept for int32 result */
+                /* P9.4: both typed — pure double add on _tsd */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
-                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
-                    "      } else {\n"
-                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,_da+_db); _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-1, d-2, d-1);
+                    "    _tsd%d+=_tsd%d; _sp=%d;\n",
+                    d-2, d-1, d-1);
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -1978,22 +2041,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* sub: int fast path + float64 fast path */
         case OP_sub: {
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
+                /* P9.4: both typed — pure double sub on _tsd */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)-JS_VALUE_GET_INT(_b);\n"
-                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
-                    "      } else {\n"
-                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,_da-_db); _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-1, d-2, d-1);
+                    "    _tsd%d-=_tsd%d; _sp=%d;\n",
+                    d-2, d-1, d-1);
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2017,25 +2072,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* mul: int fast path + float64 fast path */
         case OP_mul: {
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
+                /* P9.4: both typed — pure double mul on _tsd */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
-                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)*JS_VALUE_GET_INT(_b);\n"
-                    "        if((int32_t)_r64==_r64 && !(_r64==0 && ((JS_VALUE_GET_INT(_a)^JS_VALUE_GET_INT(_b))>>31)))\n"
-                    "          _tsv%d=JS_NewInt32(ctx,(int32_t)_r64);\n"
-                    "        else\n"
-                    "          _tsv%d=JS_NewFloat64(ctx,(double)JS_VALUE_GET_INT(_a)*(double)JS_VALUE_GET_INT(_b));\n"
-                    "        _sp=%d;\n"
-                    "      } else {\n"
-                    "        int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,_da*_db); _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-2, d-1, d-2, d-1);
+                    "    _tsd%d*=_tsd%d; _sp=%d;\n",
+                    d-2, d-1, d-1);
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2062,22 +2106,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* div: float result; int/int fast path + float64 fast path */
         case OP_div: {
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
+                /* P9.4: both typed — pure double div on _tsd */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
-                    "        int32_t ia=JS_VALUE_GET_INT(_a),ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _tsv%d=(ib&&ia%%ib==0)?JS_NewInt32(ctx,ia/ib)\n"
-                    "                              :JS_NewFloat64(ctx,(double)ia/(double)ib); _sp=%d;\n"
-                    "      } else {\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,_da/_db); _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-1, d-2, d-1);
+                    "    _tsd%d/=_tsd%d; _sp=%d;\n",
+                    d-2, d-1, d-1);
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2101,22 +2137,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* mod: int fast path + float64 fast path */
         case OP_mod: {
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
+                /* P9.4: both typed — fmod on raw _tsd */
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
-                    "        int32_t ib=JS_VALUE_GET_INT(_b);\n"
-                    "        _tsv%d=ib?JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)%%ib)\n"
-                    "                 :JS_NewFloat64(ctx,0.0/0.0); _sp=%d;\n"
-                    "      } else {\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,fmod(_da,_db)); _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-1, d-2, d-1);
+                    "    _tsd%d=fmod(_tsd%d,_tsd%d); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2153,6 +2181,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * JavaScript spec (ToInt32 semantics) and avoiding C UB for shifts
          * by >= 32 (e.g. 1 << 32 must equal 1, not 0). */
         case OP_shl:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
@@ -2162,6 +2191,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-2, d-2, d-2, d-2, d-1);
             break;
         case OP_sar:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
@@ -2170,12 +2200,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _sp=%d; }\n",
                 d-1, d-2, d-2, d-2, d-2, d-1);
             break;
-        case OP_and: GEN_BITOP_INT("&",  "band"); break;
-        case OP_or:  GEN_BITOP_INT("|",  "bor");  break;
-        case OP_xor: GEN_BITOP_INT("^",  "bxor"); break;
+        case OP_and: _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("&",  "band"); break;
+        case OP_or:  _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("|",  "bor");  break;
+        case OP_xor: _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("^",  "bxor"); break;
 
         /* shr is unsigned right shift — result may exceed INT32_MAX */
         case OP_shr:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
@@ -2192,6 +2223,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* pow and remaining ops: full vtable (rare).
          * P9.2: pop 2 -> push 1: result at _tsv{d-2}, new depth d-1 */
         case OP_pow:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                 "      _sp=%d; JSValue _r=_RT->pow(ctx,_a,_b); _CHK(_r);\n"
@@ -2202,28 +2234,39 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Arithmetic (unary) with int fast paths ----
          * P9.2: unary ops: pop 1 (_tsv{d-1}), push 1 back at _tsv{d-1}, depth unchanged */
         case OP_neg:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
-                "      if(_ta==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
-                "                             :JS_NewInt32(ctx,-ia);\n"
-                "      } else if(_ta==JS_TAG_FLOAT64)\n"
-                "        _tsv%d=JS_NewFloat64(ctx,-JS_VALUE_GET_FLOAT64(_a));\n"
-                "      else { _sp=%d; JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
-                "    _sp=%d;\n",
-                d-1, d-1, d-1, d-1, d-1, d);
+            /* P9.4: typed fast path — negate raw double in _tsd */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                jit_buf_printf(cb, "    _tsd%d=-_tsd%d; _sp=%d;\n", d-1, d-1, d);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
+                    "      if(_ta==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,-(double)ia)\n"
+                    "                             :JS_NewInt32(ctx,-ia);\n"
+                    "      } else if(_ta==JS_TAG_FLOAT64)\n"
+                    "        _tsv%d=JS_NewFloat64(ctx,-JS_VALUE_GET_FLOAT64(_a));\n"
+                    "      else { _sp=%d; JSValue _r=_RT->neg(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
+                    "    _sp=%d;\n",
+                    d-1, d-1, d-1, d-1, d-1, d);
+            }
             break;
         case OP_plus:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
-                "      if(_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)\n"
-                "        _tsv%d=_a; /* numeric — already a number, no coercion needed */\n"
-                "      else { _sp=%d; JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
-                "    _sp=%d;\n",
-                d-1, d-1, d-1, d-1, d);
+            /* P9.4: typed fast path — already a double, no-op besides _sp update */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                jit_buf_printf(cb, "    /* plus: typed no-op */ _sp=%d;\n", d);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d; int _ta=JS_VALUE_GET_TAG(_a);\n"
+                    "      if(_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)\n"
+                    "        _tsv%d=_a; /* numeric — already a number, no coercion needed */\n"
+                    "      else { _sp=%d; JSValue _r=_RT->plus(ctx,_a); _CHK(_r); _tsv%d=_r; } }\n"
+                    "    _sp=%d;\n",
+                    d-1, d-1, d-1, d-1, d);
+            }
             break;
         case OP_not: /* bitwise ~ */
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before JSValue read */
             jit_buf_printf(cb,
                 "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
@@ -2233,6 +2276,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-1, d-1, d-1, d);
             break;
         case OP_typeof:
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before JSValue read */
             jit_buf_printf(cb,
                 "    { JSValue _a=_tsv%d;\n"
                 "      _sp=%d; JSValue _r=_RT->type_of(ctx,_a); _CHK(_r);\n"
@@ -2240,7 +2284,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-1, d-1, d);
             break;
         case OP_lnot:
-            /* P9.2: lnot: pop 1, push 1 at same slot; depth unchanged */
+            /* P9.4/P9.2: lnot: box typed slot, pop 1, push 1 at same slot; depth unchanged */
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before JSValue read */
             jit_buf_printf(cb,
                 "    { JSValue _a=_tsv%d;\n"
                 "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
@@ -2253,57 +2298,81 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Increment / decrement ---- */
-        /* P9.2: inc/dec: pop 1, push 1 at same slot; depth unchanged */
+        /* P9.4/P9.2: inc/dec: pop 1, push 1 at same slot; depth unchanged */
         case OP_inc:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
-                "                             :JS_NewInt32(ctx,ia+1);\n"
-                "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _tsv%d=_r; }\n"
-                "      _sp=%d; }\n",
-                d-1, d-1, d-1, d-1, d);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — increment raw double */
+                jit_buf_printf(cb, "    _tsd%d+=1.0; _sp=%d;\n", d-1, d);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                    "                             :JS_NewInt32(ctx,ia+1);\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _tsv%d=_r; }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-1, d-1, d-1, d);
+            }
             break;
         case OP_dec:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
-                "                             :JS_NewInt32(ctx,ia-1);\n"
-                "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _tsv%d=_r; }\n"
-                "      _sp=%d; }\n",
-                d-1, d-1, d-1, d-1, d);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — decrement raw double */
+                jit_buf_printf(cb, "    _tsd%d-=1.0; _sp=%d;\n", d-1, d);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                    "                             :JS_NewInt32(ctx,ia-1);\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _tsv%d=_r; }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-1, d-1, d-1, d);
+            }
             break;
-        /* OP_post_inc / OP_post_dec: pop 1, push 2: original at _tsv{d-1}, result at _tsv{d}; depth d -> d+1 */
+        /* OP_post_inc / OP_post_dec: pop 1, push 2: original at slot{d-1}, result at slot{d}; depth d -> d+1 */
         case OP_post_inc:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _tsv%d=_a; /* original stays */\n"
-                "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
-                "                             :JS_NewInt32(ctx,ia+1);\n"
-                "        _sp=%d;\n"
-                "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
-                d-1, d-1, d, d+1, d, d-1, d, d+1);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — keep _tsd slots valid, no boxing */
+                jit_buf_printf(cb,
+                    "    { double _da=_tsd%d; _tsd%d=_da; _tsd%d=_da+1.0; _sp=%d; }\n",
+                    d-1, d-1, d, d+1);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _tsv%d=_a; /* original stays */\n"
+                    "        _tsv%d=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                    "                             :JS_NewInt32(ctx,ia+1);\n"
+                    "        _sp=%d;\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->add(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
+                    d-1, d-1, d, d+1, d, d-1, d, d+1);
+            }
             break;
         case OP_post_dec:
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
-                "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                "        _tsv%d=_a; /* original stays */\n"
-                "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
-                "                             :JS_NewInt32(ctx,ia-1);\n"
-                "        _sp=%d;\n"
-                "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
-                "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
-                d-1, d-1, d, d+1, d, d-1, d, d+1);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — keep _tsd slots valid, no boxing */
+                jit_buf_printf(cb,
+                    "    { double _da=_tsd%d; _tsd%d=_da; _tsd%d=_da-1.0; _sp=%d; }\n",
+                    d-1, d-1, d, d+1);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _tsv%d=_a; /* original stays */\n"
+                    "        _tsv%d=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                    "                             :JS_NewInt32(ctx,ia-1);\n"
+                    "        _sp=%d;\n"
+                    "      } else { _sp=%d; JSValue _r=_RT->sub(ctx,_DUP(_a),JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _tsv%d=_a; _tsv%d=_r; _sp=%d; } }\n",
+                    d-1, d-1, d, d+1, d, d-1, d, d+1);
+            }
             break;
         /* OP_inc_loc / OP_dec_loc: in-place ±1 on local variable (1-byte index) */
         case OP_inc_loc: {
@@ -2351,26 +2420,41 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_add_loc: {
             int idx = bc[pc + 1];
             if (local_type && idx < var_count && local_type[idx] == JIT_T_INT) {
-                /* INT local: extract int64 from immediate stack value (INT or FLOAT64),
-                 * add directly — no refcount ops, no boxing on store.
-                 * Inference guarantees stack top is numeric when local is INT. */
-                jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d; _sp=%d;\n"
-                    "      _jsi_%s+=(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                    "              ?(int64_t)JS_VALUE_GET_INT(_b)\n"
-                    "              :(int64_t)JS_VALUE_GET_FLOAT64(_b); }\n",
-                    d-1, d-1, LNAME(idx));
+                if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                    /* P9.4: typed source — read _tsd directly */
+                    jit_buf_printf(cb,
+                        "    _jsi_%s+=(int64_t)_tsd%d; _sp=%d;\n",
+                        LNAME(idx), d-1, d-1);
+                } else {
+                    /* INT local: extract int64 from immediate stack value (INT or FLOAT64),
+                     * add directly — no refcount ops, no boxing on store.
+                     * Inference guarantees stack top is numeric when local is INT. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _b=_tsv%d; _sp=%d;\n"
+                        "      _jsi_%s+=(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                        "              ?(int64_t)JS_VALUE_GET_INT(_b)\n"
+                        "              :(int64_t)JS_VALUE_GET_FLOAT64(_b); }\n",
+                        d-1, d-1, LNAME(idx));
+                }
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
-                /* NUMBER local: direct double add.  Inference guarantees the stack
-                 * top is INT or FLOAT64 (both immediate — no _FREE needed). GCC
-                 * CSE will collapse get_loc(j)+add_loc(i) → _jsd_name+=_jsd_other. */
-                jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d; _sp=%d;\n"
-                    "      if(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                    "        _jsd_%s+=(double)JS_VALUE_GET_INT(_b);\n"
-                    "      else _jsd_%s+=JS_VALUE_GET_FLOAT64(_b); }\n",
-                    d-1, d-1, LNAME(idx), LNAME(idx));
+                if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                    /* P9.4: typed source — read _tsd directly */
+                    jit_buf_printf(cb,
+                        "    _jsd_%s+=_tsd%d; _sp=%d;\n",
+                        LNAME(idx), d-1, d-1);
+                } else {
+                    /* NUMBER local: direct double add.  Inference guarantees the stack
+                     * top is INT or FLOAT64 (both immediate — no _FREE needed). GCC
+                     * CSE will collapse get_loc(j)+add_loc(i) → _jsd_name+=_jsd_other. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _b=_tsv%d; _sp=%d;\n"
+                        "      if(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                        "        _jsd_%s+=(double)JS_VALUE_GET_INT(_b);\n"
+                        "      else _jsd_%s+=JS_VALUE_GET_FLOAT64(_b); }\n",
+                        d-1, d-1, LNAME(idx), LNAME(idx));
+                }
             } else {
+                _P94_ENSURE(d-1); /* P9.4: box typed slot before use as JSValue */
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d; _sp=%d; JSValue *_pv=&_jsv_%s;\n"
                     "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
@@ -2428,6 +2512,24 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                          "?(double)JS_VALUE_GET_INT(_vb):JS_VALUE_GET_FLOAT64(_vb);\n" \
         "      if(%s(_da " c_op " _db)) break; }\n", \
         d-2, d-1, d-2, (fneg)?"!":"")
+
+/* P9.4: typed fused comparison — both operands are raw doubles in _tsd.
+ * Box any typed slots BELOW the two comparison operands before the branch so
+ * that the branch-target label (which resets gen_st to JSVAL) sees valid _tsv. */
+#define GEN_CMP_FUSE_TSD(c_op, ftgt, fneg) do { \
+    { int _bx; for (_bx=0; _bx < d-2 && _bx < gen_sp; _bx++) _P94_ENSURE(_bx); } \
+    jit_buf_printf(cb, \
+        "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) goto _L%d; }\n", \
+        d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+} while(0)
+
+/* P9.4: break-emitting variant of GEN_CMP_FUSE_TSD */
+#define GEN_CMP_FUSE_TSD_BRK(c_op, fneg) do { \
+    { int _bx; for (_bx=0; _bx < d-2 && _bx < gen_sp; _bx++) _P94_ENSURE(_bx); } \
+    jit_buf_printf(cb, \
+        "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) break; }\n", \
+        d-2, (fneg)?"!":"", d-2, d-1); \
+} while(0)
 
 /* Helper: emit fused general comparison+branch — INT fast path, float64 middle
  * path (P8.6), vtable fallback. */
@@ -2491,12 +2593,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         case OP_lt: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM("<",  _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("<", "<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD("<",  _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN("<", "<", "_RT->lt(ctx,_a,_b)",  _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED("<", "<", "_RT->lt(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2504,12 +2608,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_lte: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM("<=", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("<=", "<=", "_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD("<=", _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN("<=", "<=", "_RT->lte(ctx,_a,_b)", _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED("<=", "<=", "_RT->lte(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2518,12 +2624,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_gt: {
             /* a > b  ≡  b < a  (strict):  vtable uses lt(b,a) */
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM(">",  _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN(">", ">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD(">",  _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN(">", ">", "_RT->lt(ctx,_b,_a)",  _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED(">", ">", "_RT->lt(ctx,_b,_a)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2532,12 +2640,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_gte: {
             /* a >= b  ≡  b <= a  (inclusive): vtable uses lte(b,a) */
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM(">=", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN(">=", ">=", "_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD(">=", _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN(">=", ">=", "_RT->lte(ctx,_b,_a)", _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED(">=", ">=", "_RT->lte(ctx,_b,_a)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2546,12 +2656,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         case OP_eq: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("==", "==", "_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD("==", _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN("==", "==", "_RT->eq(ctx,_a,_b)",  _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED("==", "==", "_RT->eq(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2559,25 +2671,29 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_neq: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
                 /* neq fused: "!=" is the comparison; negate inverts it */
-                if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
-                else     jit_buf_printf(cb,
-                    "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
-                    "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
-                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _cond=(_da!=_db);\n"
-                    "      } else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
-                    "      if(%s_cond) goto _L%d; }\n",
-                    d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
+                if (_bn) GEN_CMP_FUSE_TSD("!=", _fi.tgt, _fi.negate);
+                else {
+                    _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                    jit_buf_printf(cb,
+                        "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
+                        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
+                        "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                        "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                                 "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                        "        _cond=(_da!=_db);\n"
+                        "      } else{JSValue _r=_RT->eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                        "      if(%s_cond) goto _L%d; }\n",
+                        d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
+                }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2598,12 +2714,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_strict_eq: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM("==", _fi.tgt, _fi.negate);
-                else     GEN_CMP_FUSE_GEN("==", "==", "_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate);
+                if (_bn) GEN_CMP_FUSE_TSD("==", _fi.tgt, _fi.negate);
+                else { _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                       GEN_CMP_FUSE_GEN("==", "==", "_RT->strict_eq(ctx,_a,_b)", _fi.tgt, _fi.negate); }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 GEN_CMP_UNFUSED("==", "==", "_RT->strict_eq(ctx,_a,_b)");
             }
             _GS_DROP(2); if (!_fi.fuse) _GS_PUSH(JIT_T_JSVAL);
@@ -2611,24 +2729,28 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_strict_neq: {
             JitFuseInfo _fi = jit_check_fuse(bc, pc+sz, bc_len, op_sz, sr);
-            int _bn = (_GS_TOP2()>=JIT_T_NUMBER && _GS_TOP()>=JIT_T_NUMBER);
+            int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_fi.fuse) {
                 sz += _fi.extra_sz;
-                if (_bn) GEN_CMP_FUSE_NUM("!=", _fi.tgt, _fi.negate);
-                else     jit_buf_printf(cb,
-                    "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
-                    "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
-                    "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
-                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _cond=(_da!=_db);\n"
-                    "      } else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
-                    "      if(%s_cond) goto _L%d; }\n",
-                    d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
+                if (_bn) GEN_CMP_FUSE_TSD("!=", _fi.tgt, _fi.negate);
+                else {
+                    _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                    jit_buf_printf(cb,
+                        "    { JSValue _a=_tsv%d,_b=_tsv%d; _sp=%d; int _cond;\n"
+                        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT)\n"
+                        "        _cond=(JS_VALUE_GET_INT(_a)!=JS_VALUE_GET_INT(_b));\n"
+                        "      else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                                 "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                        "        _cond=(_da!=_db);\n"
+                        "      } else{JSValue _r=_RT->strict_eq(ctx,_a,_b);_CHK(_r);_cond=!JS_VALUE_GET_INT(_r);}\n"
+                        "      if(%s_cond) goto _L%d; }\n",
+                        d-2, d-1, d-2, _fi.negate?"!":"", _fi.tgt);
+                }
             } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
                     "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
                     "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
@@ -2649,12 +2771,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
 
 #undef GEN_CMP_FUSE_NUM
+#undef GEN_CMP_FUSE_NUM_BRK
+#undef GEN_CMP_FUSE_TSD
+#undef GEN_CMP_FUSE_TSD_BRK
 #undef GEN_CMP_FUSE_GEN
+#undef GEN_CMP_FUSE_GEN_BRK
 #undef GEN_CMP_UNFUSED
 
         /* ---- instanceof / in ---- */
-        /* P9.2: pop 2, push 1 at _tsv{d-2}; result depth d-1 */
+        /* P9.4/P9.2: pop 2, push 1 at _tsv{d-2}; result depth d-1 */
         case OP_instanceof:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d; _sp=%d;\n"
                 "      int _r=JS_OrdinaryIsInstanceOf(ctx,_a,_b);\n"
@@ -2664,6 +2791,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-2, d-2, d-2, d-1);
             break;
         case OP_in:
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
             jit_buf_printf(cb,
                 "    { JSValue _b=_tsv%d,_a=_tsv%d; _sp=%d;\n"
                 "      int _r=JS_HasProperty(ctx,_b,JS_ValueToAtom(ctx,_a));\n"
@@ -2674,33 +2802,63 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Control flow ---- */
-        /* P9.2: if_false/if_true: pop 1 from _tsv{d-1}; _sp = d-1 */
+        /* P9.4/P9.2: if_false/if_true: pop 1 from _tsv{d-1}/_tsd{d-1}; _sp = d-1 */
         case OP_if_false: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
-            /* P9.3: emit break instead of goto if target is loop exit */
-            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
-            else
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — 0.0 or NaN is falsy.
+                 * Box any typed slots below the condition before branching. */
+                { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) break; }\n",
+                        d-1, d-1, d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
+                        d-1, d-1, d-1, d-1, tgt);
+            } else {
+                /* P9.3: emit break instead of goto if target is loop exit */
+                _P94_ENSURE(d-1);
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            }
             break;
         }
         case OP_if_true: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
-            /* P9.3: emit break instead of goto if target is loop exit */
-            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(_b) break; }\n", d-1, d-1);
-            else
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — non-zero and non-NaN is truthy.
+                 * Box any typed slots below the condition before branching. */
+                { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) break; }\n",
+                        d-1, d-1, d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
+                        d-1, d-1, d-1, d-1, tgt);
+            } else {
+                /* P9.3: emit break instead of goto if target is loop exit */
+                _P94_ENSURE(d-1);
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(_b) break; }\n", d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            }
             break;
         }
         case OP_goto: {
@@ -2720,33 +2878,63 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     break;
                 }
             }
+            /* P9.4: box typed surviving slots before goto — target label resets gen_st */
+            { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
         case OP_if_false8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
-            /* P9.3: emit break instead of goto if target is loop exit */
-            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
-            else
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — box surviving slots below condition */
+                { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) break; }\n",
+                        d-1, d-1, d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
+                        d-1, d-1, d-1, d-1, tgt);
+            } else {
+                /* P9.3: emit break instead of goto if target is loop exit */
+                _P94_ENSURE(d-1);
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+            }
             break;
         }
         case OP_if_true8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
-            /* P9.3: emit break instead of goto if target is loop exit */
-            if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(_b) break; }\n", d-1, d-1);
-            else
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+                /* P9.4: typed fast path — box surviving slots below condition */
+                { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) break; }\n",
+                        d-1, d-1, d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
+                        d-1, d-1, d-1, d-1, tgt);
+            } else {
+                /* P9.3: emit break instead of goto if target is loop exit */
+                _P94_ENSURE(d-1);
+                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(_b) break; }\n", d-1, d-1);
+                else
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                        " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+            }
             break;
         }
         case OP_goto8: {
@@ -2764,6 +2952,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     break;
                 }
             }
+            /* P9.4: box typed surviving slots before goto */
+            { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
@@ -2782,14 +2972,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     break;
                 }
             }
+            /* P9.4: box typed surviving slots before goto */
+            { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
             break;
         }
 
         /* ---- Property access (with inline property cache) ---- */
-        /* P9.2: get_field: pop obj, push result; depth unchanged (d->d) */
+        /* P9.4/P9.2: get_field: pop obj, push result; depth unchanged (d->d) */
         case OP_get_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
+            _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _o=_tsv%d, _r;\n"
@@ -2803,6 +2996,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_get_field2: { /* keep object on stack; push result: depth d -> d+1 */
             uint32_t atom = bc_u32(&bc[pc+1]);
+            _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
@@ -2816,6 +3010,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_put_field: { /* pop val, pop obj; depth d -> d-2 */
             uint32_t atom = bc_u32(&bc[pc+1]);
+            _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
@@ -2831,8 +3026,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT.
          * Fast path: js_jit_array_get/set hit the u.array.values[] directly.
          * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty.
-         * P9.2: get_array_el: pop idx(_tsv{d-1}), pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
+         * P9.4/P9.2: get_array_el: box typed idx, pop idx(_tsv{d-1}), pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
         case OP_get_array_el:
+            _P94_ENSURE(d-1); /* P9.4: box typed idx slot before index check */
             jit_buf_printf(cb,
                 "    { JSValue _idx=_tsv%d,_o=_tsv%d;\n"
                 "      JSValue _r;\n"
@@ -2844,8 +3040,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
                 d-1, d-2, d-2, d-2, d-1);
             break;
-        /* P9.2: put_array_el: pop v(_tsv{d-1}), idx(_tsv{d-2}), obj(_tsv{d-3}); depth d->d-3 */
+        /* P9.4/P9.2: put_array_el: box typed slots, pop v(_tsv{d-1}), idx(_tsv{d-2}), obj(_tsv{d-3}); depth d->d-3 */
         case OP_put_array_el:
+            _P94_ENSURE(d-3); /* P9.4: box typed obj slot (unlikely but safe) */
+            _P94_ENSURE(d-2); /* P9.4: box typed idx slot before index check */
+            _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             jit_buf_printf(cb,
                 "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d;\n"
                 "      _sp=%d; int _ret;\n"
@@ -2857,8 +3056,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _FREE(_o);_FREE(_idx);if(_ret<0) goto _ex; }\n",
                 d-1, d-2, d-3, d-3);
             break;
-        /* P9.2: get_length: peek obj at _tsv{d-1}, replace with result; depth unchanged */
+        /* P9.4/P9.2: get_length: box typed slot, peek obj at _tsv{d-1}, replace with result; depth unchanged */
         case OP_get_length:
+            _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
             jit_buf_printf(cb,
                 "    { JSValue _obj=_tsv%d;\n"
                 "      JSValue _r=_RT->get_prop(ctx,_obj,(JSAtom)%uu);\n"
@@ -2890,6 +3090,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 int func_slot = gen_sp - 1 - nargs;
                 int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
                 int fslot = d - nargs - 1; /* absolute slot index of func */
+                /* P9.4: box any typed arg slots before building the args array */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    _P94_ENSURE(d-nargs+_aj);
                 jit_buf_printf(cb, "    { JSValue _f=_tsv%d;\n", fslot);
                 /* Build args array */
                 if (nargs > 0) {
@@ -2936,6 +3139,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             {
                 int tslot = d - nargs - 2; /* this */
                 int fslot = d - nargs - 1; /* func */
+                /* P9.4: box any typed arg slots before building the args array */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    _P94_ENSURE(d-nargs+_aj);
                 jit_buf_printf(cb,
                     "    { JSValue _f=_tsv%d;\n"
                     "      JSValue _t=_tsv%d;\n",
@@ -2969,6 +3175,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             {
                 int tslot = d - nargs - 2;
                 int fslot = d - nargs - 1;
+                /* P9.4: box any typed arg slots before building the args array */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    _P94_ENSURE(d-nargs+_aj);
                 jit_buf_printf(cb,
                     "    { JSValue _f=_tsv%d;\n"
                     "      JSValue _t=_tsv%d;\n",
@@ -3011,6 +3220,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 int func_slot = gen_sp - 1 - nargs;
                 int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
                 int fslot = d - nargs - 1;
+                /* P9.4: box any typed arg slots before building the args array */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    _P94_ENSURE(d-nargs+_aj);
                 jit_buf_printf(cb, "    { JSValue _f=_tsv%d;\n", fslot);
                 if (nargs > 0) {
                     jit_buf_printf(cb, "      JSValue _ca%d[%d]={", pc, nargs);
@@ -3061,6 +3273,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             {
                 int cslot = d - nargs - 2; /* ctor */
                 int nslot = d - nargs - 1; /* new_target */
+                /* P9.4: box any typed arg slots before building the args array */
+                for (int _aj = 0; _aj < nargs; _aj++)
+                    _P94_ENSURE(d-nargs+_aj);
                 jit_buf_printf(cb,
                     "    { JSValue _nt=_tsv%d;\n"
                     "      JSValue _ctor=_tsv%d;\n",
@@ -3091,8 +3306,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* OP_new does not exist; call_constructor handles 'new' expressions */
 
         /* ---- Return ---- */
-        /* P9.2: OP_return: pop return value at _tsv{d-1}, free remaining stack _tsv{0}.._tsv{d-2} */
+        /* P9.2/P9.4: OP_return: box typed slot, pop return value, free remaining stack */
         case OP_return: {
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before reading as JSValue */
             jit_buf_printf(cb, "    { JSValue _r=_tsv%d; _sp=%d;\n", d-1, d-1);
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
@@ -3115,8 +3331,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
 
         /* ---- Throw ---- */
-        /* P9.2: pop value at _tsv{d-1}, update _sp, then throw */
+        /* P9.2/P9.4: pop value at _tsv{d-1}, update _sp, then throw */
         case OP_throw:
+            _P94_ENSURE(d-1); /* P9.4: box typed slot before throw */
             jit_buf_printf(cb,
                 "    { JSValue _v=_tsv%d; _sp=%d; _RT->throw_val(ctx,_v);"
                 " goto _ex; }\n",
@@ -3136,6 +3353,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* OP_define_field: obj(_tsv{d-2}) val(_tsv{d-1}) -> obj stays at _tsv{d-2}; depth d -> d-1 */
         case OP_define_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
+            _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             jit_buf_printf(cb,
                 "    { JSValue _v=_tsv%d; _sp=%d;\n"
                 "      int _r=JS_DefinePropertyValue(ctx,_tsv%d,(JSAtom)%uu,_v,"
@@ -3147,6 +3365,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* P9.2: array_from N: pop N items, push array; result at _tsv{d-N}, depth d -> d-N+1 */
         case OP_array_from: {
             int nargs = (int)bc_u16(&bc[pc+1]);
+            /* P9.4: box any typed slots used as array elements */
+            for (int _aj = 0; _aj < nargs; _aj++)
+                _P94_ENSURE(d-nargs+_aj);
             jit_buf_printf(cb,
                 "    { JSValue _r=JS_NewArray(ctx);\n"
                 "      _sp=%d; _CHK(_r);\n",
@@ -3223,8 +3444,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_get_var_ref2: case OP_get_var_ref3:
                 _gs_push = JIT_T_JSVAL; break;
 
-            /* --- get_length: NUMBER (array length is always a non-neg int) --- */
-            case OP_get_length: _gs_drop=1; _gs_push=JIT_T_NUMBER; break;
+            /* --- get_length: JSVAL (result stored in _tsv via _RT->get_prop, not _tsd) --- */
+            case OP_get_length: _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+
+            /* --- pow: always JSVAL result (calls runtime, no typed fast path) --- */
+            case OP_pow: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
 
             /* --- Arithmetic: INT if both INT, NUMBER if both >=NUMBER, else JSVAL --- */
             case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod: {
@@ -3235,10 +3459,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                            : JIT_T_JSVAL;
                 break;
             }
-            /* --- Bitwise: always produces an INT --- */
+            /* --- Bitwise: result is an int32 stored in _tsv, not _tsd → JSVAL --- */
             case OP_shl: case OP_sar: case OP_shr:
-            case OP_and: case OP_or:  case OP_xor: _gs_drop=2; _gs_push=JIT_T_INT; break;
-            case OP_not:                            _gs_drop=1; _gs_push=JIT_T_INT; break;
+            case OP_and: case OP_or:  case OP_xor: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_not:                            _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
 
             /* --- Unary numeric: INT/NUMBER if operand was numeric, else JSVAL --- */
             case OP_neg: case OP_plus: case OP_inc: case OP_dec:
@@ -3280,6 +3504,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_put_var_ref2: case OP_put_var_ref3:
             case OP_put_var: case OP_put_var_init:
                 _gs_drop = 1; break;
+
+            /* --- dup: propagate the typed type of top slot (P9.4) --- */
+            case OP_dup: _gs_push = _GS_TOP(); break;
 
             /* --- drop: pop 1 --- */
             case OP_drop: _gs_drop=1; break;
@@ -3337,6 +3564,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef _GS_TOP
 #undef _GS_TOP2
 #undef _GS_DROP
+#undef _P94_ENSURE
 #undef LNAME
 #undef ANAME
 
