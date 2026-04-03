@@ -674,6 +674,7 @@ typedef struct JSFunctionBytecode {
     int               jit_call_count; /* incremented on every JS_CallInternal */
     JSJITFunc         jit_func;       /* NULL → interpreter, else JIT entry  */
     void             *jit_handle;     /* dlopen handle for compiled .so      */
+    uint16_t         *stack_depth_tab; /* [byte_code_len] stack depth before each opcode; P9.0 */
 #endif
     struct {
         /* debug info, move to separate structure to save memory? */
@@ -15701,6 +15702,23 @@ int js_jit_op_put_var_slow(JSContext *ctx, JSAtom atom, int is_lexical,
 }
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
 JSAtom   js_jit_fb_get_func_atom(JSFunctionBytecode *b)  { return b->func_name; }
+/* P9.1: atom-to-string helper for codegen name table building */
+const char *js_jit_atom_get_str(JSRuntime *rt, char *buf, int buf_size, JSAtom atom) {
+    return JS_AtomGetStrRT(rt, buf, buf_size, atom);
+}
+/* P9.0: per-PC stack depth table (0xffff = unreachable/unexplored) */
+const uint16_t *js_jit_fb_get_stack_depth_tab(JSFunctionBytecode *b) {
+    return b->stack_depth_tab;
+}
+/* P9.1: original JS identifier atoms for locals and arguments */
+JSAtom js_jit_fb_get_local_atom(JSFunctionBytecode *b, int local_idx) {
+    if (!b->vardefs) return JS_ATOM_NULL;
+    return b->vardefs[b->arg_count + local_idx].var_name;
+}
+JSAtom js_jit_fb_get_arg_atom(JSFunctionBytecode *b, int arg_idx) {
+    if (!b->vardefs) return JS_ATOM_NULL;
+    return b->vardefs[arg_idx].var_name;
+}
 /* P8.2: interrupt poll wrapper — also checks C stack depth.
  * Direct P8.2/P8.3 JIT calls bypass JS_CallInternal's stack overflow check,
  * so we combine the interrupt poll with a stack check here.                  */
@@ -35683,7 +35701,8 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
 
 static __exception int compute_stack_size(JSContext *ctx,
                                           JSFunctionDef *fd,
-                                          int *pstack_size)
+                                          int *pstack_size,
+                                          uint16_t **ptab)
 {
     StackSizeState s_s, *s = &s_s;
     int i, diff, n_pop, pos_next, stack_len, pos, op, catch_pos, catch_level;
@@ -35871,7 +35890,11 @@ static __exception int compute_stack_size(JSContext *ctx,
     }
     js_free(ctx, s->pc_stack);
     js_free(ctx, s->catch_pos_tab);
-    js_free(ctx, s->stack_level_tab);
+    /* P9.0: save per-PC depth table instead of freeing it */
+    if (ptab)
+        *ptab = s->stack_level_tab;
+    else
+        js_free(ctx, s->stack_level_tab);
     *pstack_size = s->stack_len_max;
     return 0;
  fail:
@@ -35961,6 +35984,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
     BOOL strip_var_debug;
+#ifdef CONFIG_JIT
+    uint16_t *sdt = NULL; /* stack_depth_tab output from compute_stack_size; P9.0 */
+#endif
     
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
@@ -36046,7 +36072,11 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_labels(ctx, fd))
         goto fail;
 
-    if (compute_stack_size(ctx, fd, &stack_size) < 0)
+#ifdef CONFIG_JIT
+    if (compute_stack_size(ctx, fd, &stack_size, &sdt) < 0)
+#else
+    if (compute_stack_size(ctx, fd, &stack_size, NULL) < 0)
+#endif
         goto fail;
 
     if (fd->strip_debug) {
@@ -36130,6 +36160,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     fd->cpool = NULL;
 
     b->stack_size = stack_size;
+#ifdef CONFIG_JIT
+    b->stack_depth_tab = sdt;
+    sdt = NULL; /* ownership transferred to b */
+#endif
 
     if (fd->strip_debug) {
         JS_FreeAtom(ctx, fd->filename);
@@ -36207,6 +36241,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
  fail:
+#ifdef CONFIG_JIT
+    js_free(ctx, sdt);
+#endif
     js_free_function_def(ctx, fd);
     return JS_EXCEPTION;
 }
@@ -36249,6 +36286,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
     remove_gc_object(&b->header);
 #ifdef CONFIG_JIT
+    js_free_rt(rt, b->stack_depth_tab);
     js_jit_free_bytecode(b);
 #endif
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {

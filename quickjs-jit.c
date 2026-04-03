@@ -31,6 +31,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <assert.h>
+#include <ctype.h>
 #include <dlfcn.h>
 
 #include <pthread.h>
@@ -862,7 +863,8 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
 /* Forward declaration: js_jit_gen_c is defined in the Phase 2 section below */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                          char *fname_out, size_t fname_sz, int *unsupported,
-                         const char *js_func_name, uint64_t bc_hash);
+                         const char *js_func_name, uint64_t bc_hash,
+                         JSRuntime *rt);
 
 typedef struct JITGCCJob {
     JSFunctionBytecode *b;
@@ -1163,7 +1165,7 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     int unsupported = 0;
     const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
     if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported,
-                     js_name, bc_hash) < 0) {
+                     js_name, bc_hash, JS_GetRuntime(ctx)) < 0) {
         return;
     }
 
@@ -1191,11 +1193,14 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
  * string in *cb.  The generated function has the JSJITFunc signature.
  *
  * Generated code model:
- *   JSValue _s[STACK_SIZE]  — evaluation stack (indexed by _sp)
- *   JSValue _l[VAR_COUNT]   — local variables (lN in JS)
- *   JSValue *_a             — aliases argv (arg variables)
- *   JSVarRef **_vr          — aliases var_refs (closure variables)
- *   int _sp                 — runtime stack pointer
+ *   JSValue _s[STACK_SIZE]       — evaluation stack (indexed by _sp)
+ *   JSValue _jsv_<name>_<i>      — local variables (one per local, P9.1)
+ *   int64_t _jsi_<name>_<i>      — INT-typed locals (P8.1/P9.1)
+ *   double  _jsd_<name>_<i>      — NUMBER-typed locals (P5/P9.1)
+ *   int32_t _jai_<name>_<i>      — integer arg fast-path (P8.4/P9.1)
+ *   uint32_t _aim                 — arg-is-int bitmask (P8.4)
+ *   JSVarRef **_vr               — aliases var_refs (closure variables)
+ *   int _sp                      — runtime stack pointer
  *
  * Every operation that can throw appends "if(_sp_ok){goto _ex;}" via
  * the _CHK macro inside the generated code.  The _ex label frees all
@@ -1203,6 +1208,57 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
  *
  * Branch targets from the scan pass become C labels "_L<offset>:".
  * ======================================================================= */
+
+/* P9.1 — Build variable name table.
+ *
+ * Returns a malloc'd array of (arg_count + var_count) C strings.
+ * Entry [i] for i < arg_count: base name for argument i, e.g. "ax_0".
+ * Entry [arg_count + j]: base name for local j, e.g. "count_3".
+ * Non-ASCII, JS_ATOM_NULL, or keyword-colliding atoms fall back to
+ * the numeric index, e.g. "3".
+ * Caller must free each string and the array.  Returns NULL on malloc failure.
+ */
+static char **jit_build_varnames(JSRuntime *rt, JSFunctionBytecode *b,
+                                  int arg_count, int var_count)
+{
+    int total = arg_count + var_count;
+    char **names = (char **)calloc((size_t)total, sizeof(char *));
+    if (!names) return NULL;
+    char atom_buf[64];
+    char buf[128];
+    for (int i = 0; i < total; i++) {
+        JSAtom atom = (i < arg_count)
+            ? js_jit_fb_get_arg_atom(b, i)
+            : js_jit_fb_get_local_atom(b, i - arg_count);
+        const char *aname = NULL;
+        if (atom != JS_ATOM_NULL)
+            aname = js_jit_atom_get_str(rt, atom_buf, sizeof(atom_buf), atom);
+        int valid = 0;
+        if (aname && aname[0] && (isalpha((unsigned char)aname[0]) || aname[0] == '_')) {
+            valid = 1;
+            for (const char *p = aname + 1; *p; p++)
+                if (!isalnum((unsigned char)*p) && *p != '_') { valid = 0; break; }
+        }
+        if (valid)
+            snprintf(buf, sizeof(buf), "%s_%d", aname, i);
+        else
+            snprintf(buf, sizeof(buf), "%d", i);
+        names[i] = strdup(buf);
+        if (!names[i]) {
+            for (int j = 0; j < i; j++) free(names[j]);
+            free(names);
+            return NULL;
+        }
+    }
+    return names;
+}
+
+static void jit_free_varnames(char **names, int total)
+{
+    if (!names) return;
+    for (int i = 0; i < total; i++) free(names[i]);
+    free(names);
+}
 
 /*
  * Emit the C preamble: type definitions and the function signature.
@@ -1214,7 +1270,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          int closure_var_count, int cpool_count,
                          char *fname_out, size_t fname_sz,
                          const uint8_t *local_type,
-                         const char *js_func_name)
+                         const char *js_func_name,
+                         char **varnames)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -1250,73 +1307,59 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         "{\n",
         fname_out);
 
-    /* Stack and local variable declarations */
+    /* Stack declaration */
     if (stack_size > 0)
         jit_buf_printf(cb, "    JSValue _s[%d];\n", stack_size);
     else
         jit_buf_str(cb, "    JSValue _s[1];\n"); /* avoid zero-length array */
-    if (var_count > 0)
-        jit_buf_printf(cb, "    JSValue _l[%d];\n", var_count);
-    if (var_count > 0)
-        jit_buf_str(cb, "    int _sp=0, _i;\n");
-    else
-        jit_buf_str(cb, "    int _sp=0;\n");
+    jit_buf_str(cb, "    int _sp=0;\n");
     jit_buf_str(cb, "    (void)argc; (void)cpool; (void)var_refs;\n");
-    if (var_count > 0)
-        jit_buf_printf(cb,
-            "    for(_i=0;_i<%d;_i++) _l[_i]=JS_UNDEFINED;\n", var_count);
 
-    /* Phase 5/P8.1: typed locals.
-     *   JIT_T_INT    → int64_t _li[idx]: branch-free integer arithmetic
-     *   JIT_T_NUMBER → double  _ld[idx]: float arithmetic (GCC CSE/vectorise)
-     * _l[idx] stays JS_UNDEFINED for both → _FREE(_l[idx]) in footer is a no-op. */
-    if (local_type && var_count > 0) {
-        int nhave_int = 0, nhave_num = 0;
+    /* P9.1: named local variable declarations (one scalar per local, not arrays).
+     * JSValue  _jsv_<name>_<i>  — always (initialised to JS_UNDEFINED)
+     * int64_t  _jsi_<name>_<i>  — INT locals only  (Phase 5/P8.1)
+     * double   _jsd_<name>_<i>  — NUMBER locals only (Phase 5)
+     * _jsv stays JS_UNDEFINED for typed locals → _FREE in footer is a no-op. */
+    for (int j = 0; j < var_count; j++)
+        jit_buf_printf(cb, "    JSValue _jsv_%s=JS_UNDEFINED;\n",
+                       varnames[arg_count + j]);
+    if (local_type) {
         for (int j = 0; j < var_count; j++) {
-            if (local_type[j] == JIT_T_INT)    nhave_int++;
-            if (local_type[j] == JIT_T_NUMBER) nhave_num++;
-        }
-        if (nhave_int > 0) {
-            jit_buf_printf(cb, "    int64_t _li[%d];\n", var_count);
-            for (int j = 0; j < var_count; j++)
-                if (local_type[j] == JIT_T_INT)
-                    jit_buf_printf(cb, "    _li[%d]=0;\n", j);
-        }
-        if (nhave_num > 0) {
-            jit_buf_printf(cb, "    double _ld[%d];\n", var_count);
-            for (int j = 0; j < var_count; j++)
-                if (local_type[j] == JIT_T_NUMBER)
-                    jit_buf_printf(cb, "    _ld[%d]=0.0;\n", j);
+            if (local_type[j] == JIT_T_INT)
+                jit_buf_printf(cb, "    int64_t _jsi_%s=0;\n",
+                               varnames[arg_count + j]);
+            else if (local_type[j] == JIT_T_NUMBER)
+                jit_buf_printf(cb, "    double _jsd_%s=0.0;\n",
+                               varnames[arg_count + j]);
         }
     }
 
-    /* P8.4: integer argument fast-path.
-     * _ai[i]  — int32_t holding the extracted integer value for arg i
-     * _aim    — bitmask: bit i is set iff argv[i] is JS_TAG_INT and valid in _ai[i]
-     * GEN_GET_ARG uses _ai[i] when the bit is set, avoiding repeated argv[] loads
-     * and enabling GCC to keep the value in a register across reads.
-     * GEN_PUT/SET_ARG keeps _aim consistent on writes. */
+    /* P8.4 / P9.1: named integer argument fast-path variables.
+     * _jai_<name>_<i> — int32_t for arg i when it is JS_TAG_INT
+     * _aim            — bitmask: bit i set iff argv[i] is INT and _jai_ is valid */
     if (arg_count > 0) {
         int n = arg_count < 32 ? arg_count : 32;
-        jit_buf_printf(cb, "    int32_t _ai[%d]; uint32_t _aim=0;\n", n);
+        jit_buf_str(cb, "    uint32_t _aim=0;\n");
+        for (int j = 0; j < n; j++)
+            jit_buf_printf(cb, "    int32_t _jai_%s=0;\n", varnames[j]);
         for (int j = 0; j < n; j++)
             jit_buf_printf(cb,
                 "    if(%d<argc&&JS_VALUE_GET_TAG(argv[%d])==JS_TAG_INT)"
-                "{_ai[%d]=JS_VALUE_GET_INT(argv[%d]);_aim|=%uu;}\n",
-                j, j, j, j, 1u << j);
-        jit_buf_str(cb, "    (void)_ai; (void)_aim;\n");
+                "{_jai_%s=JS_VALUE_GET_INT(argv[%d]);_aim|=%uu;}\n",
+                j, j, varnames[j], j, 1u << j);
+        jit_buf_str(cb, "    (void)_aim;\n");
     }
 }
 
 /*
  * Emit the exception-cleanup footer and closing brace.
  */
-static void gen_footer(JSJITCodeBuf *cb, int var_count)
+static void gen_footer(JSJITCodeBuf *cb, int var_count,
+                       int arg_count, char **varnames)
 {
     jit_buf_str(cb, "_ex:\n");
-    if (var_count > 0)
-        jit_buf_printf(cb,
-            "    for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+    for (int j = 0; j < var_count; j++)
+        jit_buf_printf(cb, "    _FREE(_jsv_%s);\n", varnames[arg_count + j]);
     jit_buf_str(cb,
         "    for(;_sp>0;) _FREE(_s[--_sp]);\n"
         "    return JS_EXCEPTION;\n"
@@ -1388,10 +1431,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     int *unsupported_out,
                     const uint8_t *local_type,
                     JSFunctionBytecode *b,
-                    uint64_t bc_hash)
+                    uint64_t bc_hash,
+                    char **varnames)
 {
     *unsupported_out = 0;
     int pc = 0;
+
+    /* P9.1: named-variable helpers — defined here so all opcode cases can use them */
+#define LNAME(idx) varnames[arg_count + (idx)]
+#define ANAME(idx) varnames[(idx)]
 
     /* Phase 6.1: gen-time type stack.  Tracks the abstract type (JIT_T_NUMBER
      * or JIT_T_JSVAL) of each slot on the value stack during code generation.
@@ -1582,48 +1630,50 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
-            "    { int64_t _v=_li[%d];" \
+            "    { int64_t _v=_jsi_%s;" \
             " _s[_sp++]=((int32_t)_v==_v)?JS_NewInt32(ctx,(int32_t)_v)" \
-            ":JS_NewFloat64(ctx,(double)_v); }\n", (idx)); \
+            ":JS_NewFloat64(ctx,(double)_v); }\n", LNAME(idx)); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
-            "    { double _d=_ld[%d];" \
+            "    { double _d=_jsd_%s;" \
             " _s[_sp++]=(_d==(int32_t)_d)?JS_NewInt32(ctx,(int32_t)_d)" \
-            ":JS_NewFloat64(ctx,_d); }\n", (idx)); \
+            ":JS_NewFloat64(ctx,_d); }\n", LNAME(idx)); \
     else \
-        jit_buf_printf(cb, "    _s[_sp++]=_DUP(_l[%d]);\n", (idx)); \
+        jit_buf_printf(cb, "    _s[_sp++]=_DUP(_jsv_%s);\n", LNAME(idx)); \
 } while(0)
 
 #define GEN_PUT_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
             "    { JSValue _t=_s[--_sp];" \
-            " _li[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
-            (idx)); \
+            LNAME(idx)); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
             "    { JSValue _t=_s[--_sp];" \
-            " _ld[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
-            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", (idx)); \
+            " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", LNAME(idx)); \
     else \
-        jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_s[--_sp];\n", (idx), (idx)); \
+        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_s[--_sp];\n", \
+                       LNAME(idx), LNAME(idx)); \
 } while(0)
 
 #define GEN_SET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
             "    { JSValue _t=_s[_sp-1];" \
-            " _li[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            " _jsi_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(int64_t)JS_VALUE_GET_INT(_t):(int64_t)JS_VALUE_GET_FLOAT64(_t); }\n", \
-            (idx)); \
+            LNAME(idx)); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
             "    { JSValue _t=_s[_sp-1];" \
-            " _ld[%d]=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
-            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", (idx)); \
+            " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
+            "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", LNAME(idx)); \
     else \
-        jit_buf_printf(cb, "    _FREE(_l[%d]); _l[%d]=_DUP(_s[_sp-1]);\n", (idx), (idx)); \
+        jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_s[_sp-1]);\n", \
+                       LNAME(idx), LNAME(idx)); \
 } while(0)
 
         case OP_get_loc:  case OP_get_loc_check:
@@ -1664,9 +1714,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    _s[_sp++]=((%d)<argc&&(_aim>>%du&1u))" \
-            "?JS_MKVAL(JS_TAG_INT,_ai[%d])" \
+            "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
             ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", \
-            idx, (unsigned)(idx), idx, idx, idx); \
+            idx, (unsigned)(idx), ANAME(idx), idx, idx); \
     else \
         jit_buf_printf(cb, \
             "    _s[_sp++]=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED);\n", idx, idx); \
@@ -1675,9 +1725,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){JSValue _t=_s[--_sp];" \
-            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_ai[%d]=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
+            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
             "_FREE(argv[%d]);argv[%d]=_t;}else _FREE(_s[--_sp]);\n", \
-            idx, idx, 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+            idx, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
     else \
         jit_buf_printf(cb, \
             "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_s[--_sp];}else _FREE(_s[--_sp]);\n", \
@@ -1687,9 +1737,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){JSValue _t=_s[_sp-1];" \
-            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_ai[%d]=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
+            "if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}" \
             "_FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
-            idx, idx, 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+            idx, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
     else \
         jit_buf_printf(cb, \
             "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_s[_sp-1]);};\n", \
@@ -2150,19 +2200,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             int idx = bc[pc + 1];
             if (local_type && idx < var_count && local_type[idx] == JIT_T_INT) {
                 /* INT local: branch-free int64 increment — no boxing, no refcount */
-                jit_buf_printf(cb, "    _li[%d]++;\n", idx);
+                jit_buf_printf(cb, "    _jsi_%s++;\n", LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
-                jit_buf_printf(cb, "    _ld[%d]+=1.0;\n", idx);
+                jit_buf_printf(cb, "    _jsd_%s+=1.0;\n", LNAME(idx));
             } else {
                 jit_buf_printf(cb,
-                    "    { JSValue _a=_l[%d];\n"
+                    "    { JSValue _a=_jsv_%s;\n"
                     "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                     "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                    "        _l[%d]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                    "        _jsv_%s=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
                     "                              :JS_NewInt32(ctx,ia+1);\n"
                     "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
-                    "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
-                    idx, idx, idx, idx);
+                    "               _CHK(_r); _FREE(_jsv_%s); _jsv_%s=_r; } }\n",
+                    LNAME(idx), LNAME(idx), LNAME(idx), LNAME(idx));
             }
             break;
         }
@@ -2170,19 +2220,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             int idx = bc[pc + 1];
             if (local_type && idx < var_count && local_type[idx] == JIT_T_INT) {
                 /* INT local: branch-free int64 decrement — no boxing, no refcount */
-                jit_buf_printf(cb, "    _li[%d]--;\n", idx);
+                jit_buf_printf(cb, "    _jsi_%s--;\n", LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
-                jit_buf_printf(cb, "    _ld[%d]-=1.0;\n", idx);
+                jit_buf_printf(cb, "    _jsd_%s-=1.0;\n", LNAME(idx));
             } else {
                 jit_buf_printf(cb,
-                    "    { JSValue _a=_l[%d];\n"
+                    "    { JSValue _a=_jsv_%s;\n"
                     "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
                     "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
-                    "        _l[%d]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                    "        _jsv_%s=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
                     "                              :JS_NewInt32(ctx,ia-1);\n"
                     "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
-                    "               _CHK(_r); _FREE(_l[%d]); _l[%d]=_r; } }\n",
-                    idx, idx, idx, idx);
+                    "               _CHK(_r); _FREE(_jsv_%s); _jsv_%s=_r; } }\n",
+                    LNAME(idx), LNAME(idx), LNAME(idx), LNAME(idx));
             }
             break;
         }
@@ -2195,23 +2245,23 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                  * Inference guarantees stack top is numeric when local is INT. */
                 jit_buf_printf(cb,
                     "    { JSValue _b=_s[--_sp];\n"
-                    "      _li[%d]+=(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "      _jsi_%s+=(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
                     "              ?(int64_t)JS_VALUE_GET_INT(_b)\n"
                     "              :(int64_t)JS_VALUE_GET_FLOAT64(_b); }\n",
-                    idx);
+                    LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
                 /* NUMBER local: direct double add.  Inference guarantees the stack
                  * top is INT or FLOAT64 (both immediate — no _FREE needed). GCC
-                 * CSE will collapse get_loc(j)+add_loc(i) → _ld[i]+=_ld[j]. */
+                 * CSE will collapse get_loc(j)+add_loc(i) → _jsd_name+=_jsd_other. */
                 jit_buf_printf(cb,
                     "    { JSValue _b=_s[--_sp];\n"
                     "      if(JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                    "        _ld[%d]+=(double)JS_VALUE_GET_INT(_b);\n"
-                    "      else _ld[%d]+=JS_VALUE_GET_FLOAT64(_b); }\n",
-                    idx, idx);
+                    "        _jsd_%s+=(double)JS_VALUE_GET_INT(_b);\n"
+                    "      else _jsd_%s+=JS_VALUE_GET_FLOAT64(_b); }\n",
+                    LNAME(idx), LNAME(idx));
             } else {
                 jit_buf_printf(cb,
-                    "    { JSValue _b=_s[--_sp], *_pv=&_l[%d];\n"
+                    "    { JSValue _b=_s[--_sp], *_pv=&_jsv_%s;\n"
                     "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
                     "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
                     "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
@@ -2223,7 +2273,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
                     "        JSValue _r=_RT->add(ctx,_old,_b); _CHK(_r); *_pv=_r;\n"
                     "      } }\n",
-                    idx);
+                    LNAME(idx));
             }
             break;
         }
@@ -2676,9 +2726,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _sp -= _n+2; _FREE(_f); _FREE(_t);\n"
                 "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
                 nargs);
-            if (var_count > 0)
-                jit_buf_printf(cb,
-                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            { int _jf; for (_jf=0; _jf<var_count; _jf++)
+                jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
+                               varnames[arg_count+_jf]); }
             jit_buf_str(cb,
                 "      while(_sp>0) _FREE(_s[--_sp]);\n"
                 "      return _r; }\n");
@@ -2711,9 +2761,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         nargs);
                 }
             }
-            if (var_count > 0)
-                jit_buf_printf(cb,
-                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            { int _jf; for (_jf=0; _jf<var_count; _jf++)
+                jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
+                               varnames[arg_count+_jf]); }
             jit_buf_str(cb,
                 "      while(_sp>0) _FREE(_s[--_sp]);\n"
                 "      return _r; }\n");
@@ -2738,9 +2788,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Return ---- */
         case OP_return: {
             jit_buf_str(cb, "    { JSValue _r=_s[--_sp];\n");
-            if (var_count > 0)
-                jit_buf_printf(cb,
-                    "      for(_i=0;_i<%d;_i++) _FREE(_l[_i]);\n", var_count);
+            { int _jf; for (_jf=0; _jf<var_count; _jf++)
+                jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
+                               varnames[arg_count+_jf]); }
             jit_buf_str(cb,
                 "      while(_sp>0) _FREE(_s[--_sp]);\n"
                 "      return _r; }\n");
@@ -2748,9 +2798,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_return_undef: {
             jit_buf_str(cb, "    {");
-            if (var_count > 0)
-                jit_buf_printf(cb,
-                    " for(_i=0;_i<%d;_i++) _FREE(_l[_i]);", var_count);
+            { int _jf; for (_jf=0; _jf<var_count; _jf++)
+                jit_buf_printf(cb, " _FREE(_jsv_%s);",
+                               varnames[arg_count+_jf]); }
             jit_buf_str(cb,
                 " while(_sp>0) _FREE(_s[--_sp]); return JS_UNDEFINED; }\n");
             break;
@@ -2972,6 +3022,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef _GS_TOP
 #undef _GS_TOP2
 #undef _GS_DROP
+#undef LNAME
+#undef ANAME
 
     free(gen_st);
     return 0;
@@ -2984,7 +3036,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  */
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                         char *fname_out, size_t fname_sz, int *unsupported,
-                        const char *js_func_name, uint64_t bc_hash)
+                        const char *js_func_name, uint64_t bc_hash,
+                        JSRuntime *rt)
 {
     *unsupported = 0;
 
@@ -3010,30 +3063,42 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
 
+    /* P9.1: build named variable table (fallback to numeric on alloc failure) */
+    char **varnames = jit_build_varnames(rt, b, arg_count, var_count);
+    if (!varnames && (arg_count + var_count) > 0) {
+        scan_result_free(&sr);
+        free(local_type);
+        return -1;
+    }
+
     if (jit_buf_init(cb) < 0) {
         scan_result_free(&sr);
         free(local_type);
+        jit_free_varnames(varnames, arg_count + var_count);
         return -1;
     }
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
-                 local_type, js_func_name);
+                 local_type, js_func_name, varnames);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
-                 var_count, arg_count, stack_size, &unsup, local_type, b, bc_hash) < 0) {
+                 var_count, arg_count, stack_size, &unsup, local_type, b,
+                 bc_hash, varnames) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);
         free(local_type);
+        jit_free_varnames(varnames, arg_count + var_count);
         return -1;
     }
 
-    gen_footer(cb, var_count);
+    gen_footer(cb, var_count, arg_count, varnames);
 
     scan_result_free(&sr);
     free(local_type);
+    jit_free_varnames(varnames, arg_count + var_count);
 
     if (cb->error) {
         jit_buf_free(cb);

@@ -198,6 +198,13 @@ int            js_jit_fb_get_closure_var_count(JSFunctionBytecode *b);
 JSAtom         js_jit_fb_get_closure_var_atom(JSFunctionBytecode *b, int idx);
 int            js_jit_fb_get_closure_var_is_lexical(JSFunctionBytecode *b, int idx);
 int            js_jit_fb_get_cpool_count(JSFunctionBytecode *b);
+/* P9.0: per-PC stack depth table; value 0xffff = unreachable */
+const uint16_t *js_jit_fb_get_stack_depth_tab(JSFunctionBytecode *b);
+/* P9.1: atom → C string helper (wraps JS_AtomGetStrRT) */
+const char *js_jit_atom_get_str(JSRuntime *rt, char *buf, int buf_size, JSAtom atom);
+/* P9.1: JS identifier atoms for locals and arguments */
+JSAtom         js_jit_fb_get_local_atom(JSFunctionBytecode *b, int local_idx);
+JSAtom         js_jit_fb_get_arg_atom  (JSFunctionBytecode *b, int arg_idx);
 /* Opcode size table: opcode_size[opcode] = instruction length in bytes */
 const uint8_t *js_jit_get_opcode_size_table(int *count);
 /* Function name as a C string (static buf — for debug/logging only) */

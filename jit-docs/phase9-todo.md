@@ -43,18 +43,15 @@ Suggested order: P9.0 + P9.1 (parallel) → P9.2 → P9.3 → P9.4
 `compute_stack_size()` (~line 35128 in `quickjs.c`) already simulates the opcode
 stream to find the maximum stack depth.  Extend it to save the per-PC depths.
 
-- [ ] Add field to `JSFunctionBytecode`:
+- [x] Add field to `JSFunctionBytecode`:
   ```c
-  int8_t *stack_depth_tab;   /* [bc_len] depth before each opcode; NULL if stripped */
+  uint16_t *stack_depth_tab;   /* [bc_len] depth before each opcode; 0xffff=unreachable */
   ```
-- [ ] In `compute_stack_size()`, allocate `js_malloc(ctx, bc_len)` and store depth
-  before applying each opcode's net effect.  Free in `js_free_function_def()` and
-  `free_function_bytecode()`.
-- [ ] Add accessor in `quickjs-jit.h`:
+- [x] In `compute_stack_size()`, save the existing `stack_level_tab` BFS result into
+  `b->stack_depth_tab` instead of freeing it.  Free in `free_function_bytecode()`.
+- [x] Add accessor in `quickjs-jit.h`:
   ```c
-  static inline int8_t *js_jit_fb_stack_depth_tab(JSFunctionBytecode *b) {
-      return b->stack_depth_tab;
-  }
+  const uint16_t *js_jit_fb_get_stack_depth_tab(JSFunctionBytecode *b);
   ```
 
 ### P9.0-B — Control flow annotation table
@@ -83,13 +80,13 @@ this into a side-table stored in `JSFunctionBytecode`.
 
 ### P9.0-C — Tests
 
-- [ ] `make CONFIG_JIT=y test` — verify no leaks, no crashes.
+- [x] `make CONFIG_JIT=y test` — verify no leaks, no crashes.
 - [ ] Manual check: `--jit-dump` on a function with a `for` loop; confirm
   `stack_depth_tab` non-NULL and `cf_annotations` contains a `JIT_CF_LOOP` entry.
 
 ### Definition of done
-`JSFunctionBytecode` carries `stack_depth_tab` and `cf_annotations` after compilation.
-No existing tests regress.
+`JSFunctionBytecode` carries `stack_depth_tab` (done) and `cf_annotations` (P9.0-B, deferred).
+No existing tests regress. ✓ P9.0-A complete.
 
 ---
 
@@ -105,28 +102,29 @@ non-stripped builds (stripped only when embedder sets `JS_STRIP_DEBUG`).
 
 ### Tasks
 
-- [ ] **P9.1-A** Add accessors in `quickjs.c` + declarations in `quickjs-jit.h`:
+- [x] **P9.1-A** Add accessors in `quickjs.c` + declarations in `quickjs-jit.h`:
   ```c
   JSAtom js_jit_fb_get_local_atom(JSFunctionBytecode *b, int local_idx);
   JSAtom js_jit_fb_get_arg_atom  (JSFunctionBytecode *b, int arg_idx);
+  const char *js_jit_atom_get_str(JSRuntime *rt, char *buf, int buf_size, JSAtom atom);
   ```
-  Implementation: `b->vardefs[b->arg_count + idx].var_name` and `b->vardefs[idx].var_name`.
 
-- [ ] **P9.1-B** In `gen_body()`, before the main opcode loop, build a name table:
-  - For each local `i` and each arg `j`, call `JS_AtomToCString`, validate ASCII,
+- [x] **P9.1-B** In `js_jit_gen_c()`, build `varnames[]` via `jit_build_varnames()`:
+  - For each local `i` and each arg `j`, call `js_jit_atom_get_str`, validate ASCII,
     produce `_jsv_{name}_{i}` / `_jsi_{name}_{i}` / `_jsd_{name}_{i}`.
-  - Non-ASCII or `JS_ATOM_NULL` falls back to `_jsv_{i}`.
-  - Store in `char **local_cnames` and `char **arg_cnames` (freed after codegen).
+  - Non-ASCII or `JS_ATOM_NULL` falls back to numeric index.
+  - `LNAME(idx)` / `ANAME(idx)` macros thread names into gen_preamble/gen_body.
 
-- [ ] **P9.1-C** Replace all `_l[%d]`, `_li[%d]`, `_ld[%d]` format strings in
-  `gen_preamble()` and `gen_body()` with `%s` using `local_cnames[i]`.
-  Likewise for argument names wherever `_a[%d]` / `_ai[%d]` / `_aim` are used.
+- [x] **P9.1-C** Replaced all `_l[%d]`, `_li[%d]`, `_ld[%d]` array-style declarations
+  in `gen_preamble()` with individual named variables.  `gen_body()` uses LNAME/ANAME
+  macros throughout.  Argument names use `_jai_{name}_{i}` format.
 
-- [ ] **P9.1-D** Run `make test` and `make CONFIG_JIT=y test`.
+- [x] **P9.1-D** Run `make test` and `make CONFIG_JIT=y test`. ✓
 
 ### Definition of done
-Generated C for a function `function dot(ax,ay,bx,by)` contains
-`double _jsd_ax_0, _jsd_ay_1, _jsd_bx_2, _jsd_by_3;` instead of `double _ld[4];`.
+Generated C for a function `function dot(ax,ay,bx,by)` contains individual named
+variables (`_jai_ax_0`, `_jai_ay_1`, `_jsv_s_4`, etc.) instead of `_l[N]`/`_ld[N]`.
+✓ P9.1 complete — verified with `QJS_JIT_KEEP_C=1` spot-check.
 
 ---
 
@@ -328,7 +326,7 @@ properties, the generated C contains only `double` arithmetic and a single
 
 ## Testing checklist (run after each sub-phase)
 
-- [ ] `make CONFIG_JIT=y test` — full test suite passes
-- [ ] `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs && (cd jit_perf_tests/v8bench && ../../qjs --jit-aot run_qjs.js)` — 3 runs, record best
-- [ ] Manual spot-check: `./qjs --jit-dump script.js` — generated C looks correct
+- [x] `make CONFIG_JIT=y test` — full test suite passes (P9.0-A + P9.1)
+- [x] `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs && (cd jit_perf_tests/v8bench && ../../qjs --jit-aot run_qjs.js)` — Score: 871 (no regression vs P8.6)
+- [x] Manual spot-check: `QJS_JIT_KEEP_C=1 ./qjs --jit-warmup script.js` — named vars confirmed
 - [ ] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors
