@@ -26,6 +26,8 @@ C as the intermediate representation.
 | [phase8-ic-fixes.md](phase8-ic-fixes.md) | IC correctness: `likely`→`js_likely` fix, atom ABA guard, megamorphic demotion |
 | [phase8-p84-int-args.md](phase8-p84-int-args.md) | P8.4: `_ai[]`/`_aim` integer argument fast-path, register-resident args |
 | [phase8-p85-array-fast.md](phase8-p85-array-fast.md) | P8.5: dense array element fast path, bypass `JS_ValueToAtom` + hash walk |
+| [phase8-p86-float64-arith.md](phase8-p86-float64-arith.md) | P8.6: `JSJITICEntry.kind`, float64 arithmetic/comparison fast paths |
+| [phase9-todo.md](phase9-todo.md) | Phase 9 plan: stackless IR, CF structuring, variable names, typed temporaries |
 
 ---
 
@@ -128,15 +130,20 @@ JSFunctionBytecode
         │  → emits #include, macros, function signature
         │
         ▼
-   gen_body()                           ← Phase 2, extended in P5/6/8
+   gen_body()                           ← Phase 2, extended in P5/6/8/9
         │  opcode loop with:
-        │    - gen-time type stack gen_st[]  (Phase 6.1)
-        │    - double _ld[] for NUMBER locals (Phase 5)
-        │    - int64_t _li[] for INT locals   (P8.1)
-        │    - comparison fusion              (Phase 6.1)
-        │    - IC for get/put_field           (Phase 6.2, fixed in IC-fixes)
-        │    - int32_t _ai[]/_aim arg fast path (P8.4)
-        │    - array element fast path        (P8.5)
+        │    - gen-time type stack gen_st[]      (Phase 6.1)
+        │    - double _ld[] for NUMBER locals     (Phase 5)
+        │    - int64_t _li[] for INT locals       (P8.1)
+        │    - comparison fusion                  (Phase 6.1)
+        │    - IC for get/put_field               (Phase 6.2, fixed in IC-fixes)
+        │    - int32_t _ai[]/_aim arg fast path   (P8.4)
+        │    - array element fast path            (P8.5)
+        │    - float64 arith/cmp fast paths       (P8.6)
+        │    - [P9.1] JS variable names in locals
+        │    - [P9.2] stackless: _ts{N} instead of _s[]
+        │    - [P9.3] structured CF: if/while/for instead of goto
+        │    - [P9.4] typed stack temporaries: double _tsd{N}
         │
         ▼
    JSJITCodeBuf (char* C source)
@@ -185,6 +192,11 @@ Every optimisation phase targets one aspect of JSValue boxing overhead:
 | IC fixes | False IC hits (ABA, `likely` bug): atom guard + megamorphic demotion |
 | P8.4 | Argument tag checks on every read: `int32_t _ai[]` extracted at entry, register-resident |
 | P8.5 | Array index: `JS_ValueToAtom` + hash walk → `class_id` + bounds check + direct slot read |
+| P8.6 | Float64 arithmetic/comparison: `(INT\|F64)×(INT\|F64)` fast path avoids vtable for object-property float math |
+| **P9.1** | **Variable names: JS identifier names in generated C locals (debuggability)** |
+| **P9.2** | **Stackless IR: `_s[]` array → named `_ts{N}` locals; GCC keeps temporaries in registers** |
+| **P9.3** | **CF structuring: goto spaghetti → `if/while/for`; enables GCC loop optimisations** |
+| **P9.4** | **Typed stack temporaries: `double _tsd{N}` for provably float64 stack slots; zero tag checks** |
 
 ### Vtable for slow paths
 
@@ -280,6 +292,111 @@ sum_sq(1e6) ×20         616 ms     237 ms     2.60×    P8.1 + P8.3 JIT-to-JIT 
 count_primes ×10       7.59 ms    2.48 ms     3.06×    P8.1 + P8.3 JIT-to-JIT callee
 arr_sum ×1000           345 ms     350 ms     0.99×    get_array_el vtable — no IC yet
 ```
+
+---
+
+## Phase 9 — Planned architecture evolution
+
+Phase 9 addresses the two remaining structural inefficiencies in the generated C that no
+amount of opcode-level tuning can fix: the explicit value stack and the goto-based control
+flow.
+
+### 9.1 Variable names (debuggability)
+
+`JSFunctionBytecode::vardefs[i].var_name` holds the original JS identifier as a `JSAtom`.
+Before the codegen loop, build a name table and use it in all local/argument declarations:
+
+```c
+// Before P9.1          After P9.1
+double _ld[3];     →    double _jsd_x_0, _jsd_y_1, _jsd_z_2;
+int64_t _li[1];    →    int64_t _jsi_count_0;
+```
+
+Names are always present in non-stripped builds; non-ASCII falls back to `_jsv_{idx}`.
+Zero runtime cost; C keyword collisions avoided by the type prefix.
+
+### 9.2 Stackless value stack
+
+The explicit `JSValue _s[N]` array forces GCC to treat every push/pop as a memory
+operation through an aliased pointer.  The key insight: **the value stack is provably
+empty at every basic-block boundary** for all JIT-eligible functions (for-in/for-of,
+which keep iterator state on the stack across loop headers, are already excluded).
+
+Therefore no spilling is needed at block boundaries.  The transform is purely local:
+
+```
+Before                       After
+──────────────────────────   ──────────────────────────────────────
+JSValue _s[8]; int _sp=0;    JSValue _tsv0,_tsv1,_tsv2; // max depth=3
+_s[_sp++] = ic_read(...);    _tsv0 = ic_read(...);
+_s[_sp++] = ic_read(...);    _tsv1 = ic_read(...);
+JSValue _b=_s[--_sp],        double _da = F64(_tsv0);
+         _a=_s[--_sp];       double _db = F64(_tsv1);
+double _da=F64(_a),_db=...;  _tsv0 = JS_NewFloat64(ctx,_da+_db);
+_s[_sp++]=JS_NewFloat64(..);
+```
+
+GCC now sees pure locals — no pointer aliasing, all temporaries live in registers.
+A pre-pass computes `stack_depth_tab[pc]` so each opcode knows the exact slot names
+to use without changing the linear gen_body structure.
+
+### 9.3 Control flow structuring
+
+`gen_body` currently emits a flat sequence of C blocks connected by `goto _L{pc}`.
+GCC can sometimes recover loop structure from gotos, but it cannot reliably apply
+vectorisation, LICM, or unrolling unless it sees canonical `while`/`for` forms.
+
+**Algorithm:**
+
+1. Extend `JSJITScanResult` to a full CFG (basic blocks + successor/predecessor edges)
+2. Compute dominator tree (iterative Cooper-Harvey-Kennedy, ~35 lines)
+3. Identify back-edges (loop headers) and immediate post-dominators (if/else joins)
+4. Replace the linear opcode loop with a recursive structured emitter:
+
+```
+emit_region(b, end):
+  if b is loop header  →  emit "while(1){" + emit_region(body) + "}"
+  if b is if/else      →  emit condition + "if(){" + then + "}else{" + else + "}"
+  if b is switch       →  emit "switch(val){ case N: ... }"
+  else                 →  emit block contents + advance to successor
+```
+
+Fallback to `goto` for exception paths, labelled break/continue, and any pattern the
+structurer does not recognise.  All reducible CFGs (the only kind QuickJS generates
+from structured JavaScript) are handled without fallback.
+
+### 9.4 Typed stack temporaries
+
+Once the stack is stackless (P9.2), individual slots can carry type information from
+gen_st.  A slot known to be `JIT_T_NUMBER` at push time uses `double _tsd{N}` instead
+of `JSValue _tsv{N}`.  Combined with IC `kind=1` (P8.6), object float properties are
+read as raw doubles and never re-boxed until a function boundary:
+
+```c
+// After P9.4 for this.x * this.y + this.z (all float64 IC slots)
+double _tsd0 = p_this->prop[ic0.slot].u.float64;  // no JSValue, no tag check
+double _tsd1 = p_this->prop[ic1.slot].u.float64;
+double _tsd2 = _tsd0 * _tsd1;
+double _tsd3 = p_this->prop[ic2.slot].u.float64;
+return JS_NewFloat64(ctx, _tsd2 + _tsd3);
+```
+
+### Expected performance impact
+
+| Benchmark | Current JIT | After Phase 9 | Estimated gain |
+|---|---:|---|---|
+| RayTrace | 963 | 3000–5000 | **3–5×** (float-heavy, typed temps dominant) |
+| DeltaBlue | 905 | 1600–2300 | **1.8–2.5×** (float strengths + LICM) |
+| Crypto | 1253 | 2200–3800 | **1.8–3×** (int locals, loop vectorisation) |
+| Richards | 805 | 1100–1450 | **1.4–1.8×** (object loops, no vtable per access) |
+| Splay | 1208 | 1700–2050 | **1.4–1.7×** |
+| EarleyBoyer | ~1400 | 1800–2400 | **1.3–1.7×** |
+| RegExp | 393 | 430–510 | **1.1–1.3×** (regex engine not JIT-compiled) |
+| **V8bench score** | **~940** | **~1800–3000** | **~2–3×** |
+
+Theoretical ceiling for the GCC-JIT approach (function-call overhead, IC checks, and
+JS→C ABI remain): approximately 5000–7000 overall, or ~25–35% of V8.  Closing the
+remaining gap requires emitting native machine code directly.
 
 ---
 
