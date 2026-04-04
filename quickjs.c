@@ -7678,8 +7678,8 @@ static JSValue JS_GetPrototypeFree(JSContext *ctx, JSValue obj)
 }
 
 /* return TRUE, FALSE or (-1) in case of exception */
-static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
-                                   JSValueConst obj)
+int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
+                            JSValueConst obj)
 {
     JSValue obj_proto;
     JSObject *proto;
@@ -15652,6 +15652,15 @@ int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
 JSValue *js_jit_var_ref_value(JSVarRef *ref) { return ref->pvalue; }
 
+/* P10.4: public wrapper for OP_instanceof — routes through JS_IsInstanceOf
+ * (which handles Symbol.hasInstance), matching the interpreter behaviour.
+ * js_jit_ordinary_instanceof is kept as an alias for combined.so compat shims
+ * that reference it; both names do the same thing. */
+int js_jit_ordinary_instanceof(JSContext *ctx, JSValue val, JSValue obj)
+{
+    return JS_IsInstanceOf(ctx, val, obj);
+}
+
 /* P10.3: extract JSFunctionBytecode from a JSValue (code-gen time use).
  * Returns NULL if the value is not a bytecode function object. */
 JSFunctionBytecode *js_jit_get_callee_fb(JSValue func)
@@ -15794,24 +15803,28 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
             if (jf) {
                 if (js_jit_poll_interrupts(ctx))
                     return JS_EXCEPTION;
-                /* Mirror the interpreter: pad argv to arg_count when fewer
-                 * arguments were provided.  The JIT function's GEN_PUT_ARG
-                 * uses argc as a bounds check — without padding it would
-                 * discard writes to "excess" parameter slots (e.g. p=default
-                 * when called as f(x) but f(x,p) has arg_count=2).
+                /* Always pad argv to arg_count and DUP each element.
                  *
-                 * Each argv[i] is DUP'd into padded[i] so the JIT owns its
-                 * own reference (GEN_PUT_ARG may _FREE(argv[i]) then store a
-                 * new value; without DUP that would corrupt the caller's
-                 * stack slot and cause a double-free).  After the JIT returns
-                 * we free all padded slots (the JIT has already freed/replaced
-                 * each slot it touched). */
-                if (unlikely(argc < b->arg_count)) {
+                 * Padding ensures that GEN_PUT_ARG does not access out-of-range
+                 * slots (e.g. when f(x,p) is called as f(x), arg_count=2 but
+                 * argc=1 — without padding _FREE(argv[1]) would be invalid).
+                 *
+                 * DUP-ing is required for correctness: GEN_PUT_ARG does
+                 * _FREE(argv[i]) then stores a new value.  If argv pointed
+                 * directly into the caller's JIT stack, that free would
+                 * corrupt the caller's reference and cause a double-free when
+                 * the caller cleans up its own _tsv slot.  By giving the callee
+                 * its own copy, the caller's value is untouched.
+                 *
+                 * After the call we free all padded slots: the JIT has already
+                 * freed/replaced each slot it touched via put_arg, so this
+                 * correctly frees any slots that were not modified. */
+                {
                     int n = b->arg_count;
-                    JSValue *padded = alloca(sizeof(JSValue) * n);
+                    JSValue *padded = alloca(sizeof(JSValue) * (n > 0 ? n : 1));
                     JSValue ret;
                     int i;
-                    for (i = 0; i < argc; i++)
+                    for (i = 0; i < argc && i < n; i++)
                         padded[i] = JS_DupValue(ctx, argv[i]);
                     for (; i < n; i++)
                         padded[i] = JS_UNDEFINED;
@@ -15821,8 +15834,6 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                         JS_FreeValue(ctx, padded[i]);
                     return ret;
                 }
-                return jf(ctx, this_val, argc, argv,
-                          b->cpool, p->u.func.var_refs);
             }
         }
     }

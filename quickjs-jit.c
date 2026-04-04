@@ -1052,31 +1052,40 @@ static int  jit_dump_c_mode;  /* set by --jit-dump-c */
 void js_jit_set_dump_c_mode(int active) { jit_dump_c_mode = active; }
 
 /* =======================================================================
- * P10.2 — hash registry for --jit-link combiner
+ * P10.2/P10.4 — hash registry for --jit-link combiner and manifest install
  *
- * Every bc_hash seen during this run is recorded here.  js_jit_link()
- * walks the list, resolves .c paths from the cache, and invokes GCC
- * once with -O2 -flto -shared to produce a combined .so.
+ * Every bc_hash + bytecode pointer seen in js_jit_queue_gcc() is recorded
+ * unconditionally so that js_jit_install_combined() can locate bytecodes
+ * by hash when patching jit_func pointers from the manifest.
+ * js_jit_link() additionally uses jit_link_hashes to collect .c files.
  * ======================================================================= */
-static int       jit_link_mode;
-static uint64_t *jit_link_hashes;
-static int       jit_link_hash_count;
-static int       jit_link_hash_cap;
+static int                  jit_link_mode;
+static uint64_t            *jit_link_hashes;
+static JSFunctionBytecode **jit_link_bytecodes;  /* P10.4: parallel to hashes */
+static int                  jit_link_hash_count;
+static int                  jit_link_hash_cap;
+static void                *jit_combined_handle; /* P10.4: dlopen handle for combined.so */
 
 void js_jit_set_link_mode(int active) { jit_link_mode = active; }
 
-static void jit_link_record_hash(uint64_t hash)
+/* Record hash+bytecode unconditionally (both needed for P10.4 manifest install). */
+static void jit_link_record(uint64_t hash, JSFunctionBytecode *b)
 {
-    if (!jit_link_mode) return;
     if (jit_link_hash_count >= jit_link_hash_cap) {
         int new_cap = jit_link_hash_cap ? jit_link_hash_cap * 2 : 128;
         uint64_t *arr = realloc(jit_link_hashes,
-                                (size_t)new_cap * sizeof(uint64_t));
+                                (size_t)new_cap * sizeof(*arr));
         if (!arr) return;
         jit_link_hashes = arr;
+        JSFunctionBytecode **brr = realloc(jit_link_bytecodes,
+                                           (size_t)new_cap * sizeof(*brr));
+        if (!brr) return;  /* hash array updated; bytecodes stays one version behind */
+        jit_link_bytecodes = brr;
         jit_link_hash_cap = new_cap;
     }
-    jit_link_hashes[jit_link_hash_count++] = hash;
+    jit_link_hashes[jit_link_hash_count] = hash;
+    jit_link_bytecodes[jit_link_hash_count] = b;
+    jit_link_hash_count++;
 }
 
 /* Write src to a temp file with the given suffix; return malloc'd path. */
@@ -1219,6 +1228,11 @@ void js_jit_free(void)
     pthread_mutex_destroy(&jit_worker.lock);
     pthread_cond_destroy(&jit_worker.cond);
     pthread_cond_destroy(&jit_worker.idle_cond);
+    /* P10.4: close combined.so handle if installed */
+    if (jit_combined_handle) {
+        dlclose(jit_combined_handle);
+        jit_combined_handle = NULL;
+    }
 }
 
 /* Block until all enqueued GCC jobs have finished compiling.
@@ -1253,8 +1267,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
     uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
 
-    /* P10.2: record hash so --jit-link can collect all .c files for this run */
-    jit_link_record_hash(bc_hash);
+    /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install */
+    jit_link_record(bc_hash, b);
 
     /* Skip marker: function had an unsupported opcode in a previous run.
      * Avoids re-running code generation and printing noisy messages. */
@@ -2973,25 +2987,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* P9.4: typed fast path — 0.0 or NaN is falsy.
                  * Box any typed slots below the condition before branching. */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) break; }\n",
-                        d-1, d-1, d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
-                        d-1, d-1, d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
+                    d-1, d-1, d-1, d-1, tgt);
             } else {
-                /* P9.3: emit break instead of goto if target is loop exit */
+                /* Always use goto rather than C break: break only lands at exit_pc
+                 * when no other labels exist between the while back-edge and exit_pc.
+                 * In loops with multiple "continue" paths (e.g. while-with-manual-advance),
+                 * those extra labels appear right after } while and break lands there
+                 * instead, causing incorrect control flow (P9.3 bug fix). */
                 _P94_ENSURE(d-1);
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             }
             break;
         }
@@ -3002,25 +3010,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* P9.4: typed fast path — non-zero and non-NaN is truthy.
                  * Box any typed slots below the condition before branching. */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) break; }\n",
-                        d-1, d-1, d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
-                        d-1, d-1, d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
+                    d-1, d-1, d-1, d-1, tgt);
             } else {
-                /* P9.3: emit break instead of goto if target is loop exit */
+                /* Always use goto — see OP_if_false comment above. */
                 _P94_ENSURE(d-1);
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(_b) break; }\n", d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             }
             break;
         }
@@ -3051,25 +3049,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — box surviving slots below condition */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) break; }\n",
-                        d-1, d-1, d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
-                        d-1, d-1, d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { _sp=%d; if(_tsd%d==0.0||_tsd%d!=_tsd%d) goto _L%d; }\n",
+                    d-1, d-1, d-1, d-1, tgt);
             } else {
-                /* P9.3: emit break instead of goto if target is loop exit */
+                /* Always use goto — see OP_if_false comment above. */
                 _P94_ENSURE(d-1);
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(!_b) break; }\n", d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(!_b) goto _L%d; }\n", d-1, d-1, tgt);
             }
             break;
         }
@@ -3078,25 +3066,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — box surviving slots below condition */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) break; }\n",
-                        d-1, d-1, d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
-                        d-1, d-1, d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { _sp=%d; if(_tsd%d!=0.0&&_tsd%d==_tsd%d) goto _L%d; }\n",
+                    d-1, d-1, d-1, d-1, tgt);
             } else {
-                /* P9.3: emit break instead of goto if target is loop exit */
+                /* Always use goto — see OP_if_false comment above. */
                 _P94_ENSURE(d-1);
-                if (p93_depth > 0 && (uint32_t)tgt == p93_active[p93_depth-1].exit_pc)
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(_b) break; }\n", d-1, d-1);
-                else
-                    jit_buf_printf(cb,
-                        "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
-                        " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d; _sp=%d; int _b=_BOOL(_v);"
+                    " _FREE(_v); if(_b) goto _L%d; }\n", d-1, d-1, tgt);
             }
             break;
         }
@@ -3891,37 +3869,104 @@ int js_jit_link(void)
     for (int i = 0; i < jit_link_hash_count; i++) {
         for (int j = i + 1; j < jit_link_hash_count; j++) {
             if (jit_link_hashes[j] == jit_link_hashes[i]) {
-                /* Remove j by swapping with last */
-                jit_link_hashes[j] = jit_link_hashes[--jit_link_hash_count];
+                /* Remove j by swapping with last; keep bytecodes in sync */
+                --jit_link_hash_count;
+                jit_link_hashes[j]    = jit_link_hashes[jit_link_hash_count];
+                jit_link_bytecodes[j] = jit_link_bytecodes[jit_link_hash_count];
                 j--;
             }
         }
     }
 
-    /* Resolve .c paths for all hashes that have a cached source file */
+    /* Resolve .c paths for all hashes that have a cached source file.
+     * P10.4: track c_hashes[] in parallel for manifest generation. */
+    uint64_t *c_hashes = NULL;
     char **c_paths = NULL;
     int n_paths = 0;
     for (int i = 0; i < jit_link_hash_count; i++) {
         char *path = jit_cache_get_c_src(jit_link_hashes[i]);
         if (!path) continue;
-        char **arr = realloc(c_paths, (size_t)(n_paths + 1) * sizeof(char *));
-        if (!arr) { free(path); break; }
-        c_paths = arr;
-        c_paths[n_paths++] = path;
+        char **parr = realloc(c_paths, (size_t)(n_paths + 1) * sizeof(*parr));
+        uint64_t *harr = realloc(c_hashes, (size_t)(n_paths + 1) * sizeof(*harr));
+        if (!parr || !harr) {
+            free(path);
+            if (parr) c_paths  = parr;
+            if (harr) c_hashes = harr;
+            break;
+        }
+        c_paths  = parr;
+        c_hashes = harr;
+        c_paths[n_paths]  = path;
+        c_hashes[n_paths] = jit_link_hashes[i];
+        n_paths++;
     }
 
     if (n_paths == 0) {
         fprintf(stderr, "[JIT] --jit-link: no .c files found — "
                 "run --jit-warmup first\n");
+        free(c_hashes);
         free(c_paths);
         return 0;
+    }
+
+    /* P10.4: Generate manifest .c — extern decls + array + count.
+     * This file is compiled together with the per-function .c files so the
+     * linker can resolve the __jit_f_<hash> symbol references at link time. */
+    JSJITCodeBuf mfst;
+    char *mfst_path = NULL;
+    if (jit_buf_init(&mfst) == 0) {
+        /* Use absolute path so /tmp/ doesn't shadow the real header. */
+#ifdef JIT_INCLUDE_DIR
+        jit_buf_printf(&mfst, "#include \"%s/quickjs-jit.h\"\n", JIT_INCLUDE_DIR);
+#else
+        jit_buf_printf(&mfst, "#include \"quickjs-jit.h\"\n");
+#endif
+        /* Compatibility shim: old cached .c files call js_unlikely() as a
+         * function (quickjs.h #undef's it at end-of-header, so the macro
+         * is gone by the time those TUs emit code for the call site).
+         * js_unlikely is placed AFTER the include because quickjs.h undefines
+         * it there; js_likely is still a macro after the include so we must
+         * NOT define a function with that name after the include. */
+        jit_buf_printf(&mfst,
+            "__attribute__((weak)) int js_unlikely(int x) { return x; }\n");
+        /* Compatibility shim: JS_OrdinaryIsInstanceOf is static in quickjs.c
+         * and therefore not exported from the qjs binary. Old cached .c files
+         * (generated before P10.4) call it without a declaration, producing
+         * `U JS_OrdinaryIsInstanceOf` in each function's .so which prevents
+         * combined.so from loading. Provide a weak definition here so
+         * combined.so is self-contained; it routes through the exported
+         * js_jit_ordinary_instanceof wrapper.
+         * New .c files generated by the current gen_body call
+         * js_jit_ordinary_instanceof directly and do not need this shim. */
+        jit_buf_printf(&mfst,
+            "__attribute__((weak)) int JS_OrdinaryIsInstanceOf("
+            "JSContext *ctx, JSValueConst val, JSValueConst obj)"
+            " { return js_jit_ordinary_instanceof(ctx, val, obj); }\n");
+        for (int i = 0; i < n_paths; i++) {
+            jit_buf_printf(&mfst,
+                "JSValue __jit_f_%016llx"
+                "(JSContext*,JSValue,int,JSValue*,JSValue*,JSVarRef**);\n",
+                (unsigned long long)c_hashes[i]);
+        }
+        jit_buf_printf(&mfst, "JSJITManifestEntry __jit_manifest[] = {\n");
+        for (int i = 0; i < n_paths; i++) {
+            jit_buf_printf(&mfst,
+                "    { 0x%016llxULL, __jit_f_%016llx },\n",
+                (unsigned long long)c_hashes[i],
+                (unsigned long long)c_hashes[i]);
+        }
+        jit_buf_printf(&mfst, "};\n");
+        jit_buf_printf(&mfst, "int __jit_manifest_count = %d;\n", n_paths);
+        if (!mfst.error)
+            mfst_path = jit_write_tmp(mfst.buf, ".c");
+        jit_buf_free(&mfst);
     }
 
     char out_path[620];
     snprintf(out_path, sizeof(out_path), "%s/combined.so", jit_cache_dir);
 
-    /* Build argv for GCC */
-    int max_argc = n_paths + 16;
+    /* Build argv for GCC (+1 for optional manifest file, +16 for fixed args) */
+    int max_argc = n_paths + 20;
     char **argv = malloc((size_t)max_argc * sizeof(char *));
     if (!argv) goto oom;
 
@@ -3938,6 +3983,8 @@ int js_jit_link(void)
 #endif
     for (int i = 0; i < n_paths; i++)
         argv[argc++] = c_paths[i];
+    if (mfst_path)
+        argv[argc++] = mfst_path;
     argv[argc++] = "-o";
     argv[argc++] = out_path;
     argv[argc]   = NULL;
@@ -3959,6 +4006,8 @@ int js_jit_link(void)
     int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
 
     free(argv);
+    if (mfst_path) { unlink(mfst_path); free(mfst_path); }
+    free(c_hashes);
     for (int i = 0; i < n_paths; i++) free(c_paths[i]);
     free(c_paths);
 
@@ -3974,9 +4023,83 @@ int js_jit_link(void)
 oom:
 fail:
     free(argv);
+    if (mfst_path) { unlink(mfst_path); free(mfst_path); }
+    free(c_hashes);
     for (int i = 0; i < n_paths; i++) free(c_paths[i]);
     free(c_paths);
     return -1;
+}
+
+/* -----------------------------------------------------------------------
+ * P10.4 — combined.so installer
+ *
+ * After --jit-link produces combined.so, subsequent --jit-aot runs call
+ * js_jit_install_combined_if_exists() to dlopen combined.so, read its
+ * manifest, and patch each bytecode's jit_func pointer atomically.
+ *
+ * Handle management:
+ *   - Per-bytecode .so handles (tier==2, handle!=NULL) are closed here.
+ *   - The combined.so handle is stored in jit_combined_handle (global).
+ *   - Per-bytecode handle is set to NULL so js_jit_free_bytecode won't
+ *     double-close when the bytecode is eventually freed.
+ * ----------------------------------------------------------------------- */
+
+static JSFunctionBytecode *jit_find_bytecode_by_hash(uint64_t hash)
+{
+    for (int i = 0; i < jit_link_hash_count; i++) {
+        if (jit_link_hashes[i] == hash)
+            return jit_link_bytecodes ? jit_link_bytecodes[i] : NULL;
+    }
+    return NULL;
+}
+
+static int js_jit_install_combined(const char *so_path)
+{
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "[JIT] install_combined: dlopen(%s) failed: %s\n",
+                so_path, dlerror());
+        return -1;
+    }
+    JSJITManifestEntry *manifest =
+        (JSJITManifestEntry *)dlsym(handle, "__jit_manifest");
+    int *count_ptr = (int *)dlsym(handle, "__jit_manifest_count");
+    if (!manifest || !count_ptr) {
+        fprintf(stderr, "[JIT] install_combined: no manifest in %s\n", so_path);
+        dlclose(handle);
+        return -1;
+    }
+    int count = *count_ptr;
+    int installed = 0;
+    for (int i = 0; i < count; i++) {
+        JSFunctionBytecode *b = jit_find_bytecode_by_hash(manifest[i].bc_hash);
+        if (!b) continue;
+        /* Close the old individual .so handle before replacing the pointer */
+        uint8_t old_tier   = js_jit_fb_get_tier(b);
+        void   *old_handle = js_jit_fb_get_handle(b);
+        /* Install with handle=NULL: js_jit_free_bytecode won't touch it */
+        js_jit_fb_set_func(b, manifest[i].func_ptr, NULL, 2);
+        if (old_tier == 2 && old_handle && old_handle != handle)
+            dlclose(old_handle);
+        installed++;
+    }
+    /* Keep combined.so alive; close any previous combined handle */
+    if (jit_combined_handle && jit_combined_handle != handle)
+        dlclose(jit_combined_handle);
+    jit_combined_handle = handle;
+    fprintf(stderr, "[JIT] install_combined: installed %d/%d functions\n",
+            installed, count);
+    return installed;
+}
+
+int js_jit_install_combined_if_exists(void)
+{
+    if (jit_combined_handle) return 0;  /* already installed — idempotent */
+    if (!jit_cache_enabled) return 0;
+    char path[620];
+    snprintf(path, sizeof(path), "%s/combined.so", jit_cache_dir);
+    if (access(path, R_OK) != 0) return 0;
+    return js_jit_install_combined(path);
 }
 
 /* -----------------------------------------------------------------------
