@@ -296,7 +296,7 @@ typedef struct {
     ((ic)->shape != NULL && \
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
-     *(void **)((char*)JS_VALUE_GET_OBJ(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
+     *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
      (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
      *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
                         (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)
