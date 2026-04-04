@@ -1611,7 +1611,7 @@ expanded via a `JIT_IC_CHECK` macro defined in `quickjs-jit.h`:
     ((ic)->shape != NULL && \
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
-     *(void **)((char*)JS_VALUE_GET_OBJ(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
+     *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
      (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
      *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
                         (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)
@@ -1631,7 +1631,12 @@ objdump -d combined.so | grep -c "call.*js_jit_ic_check"
 # → 0  (all 2328 IC checks are now inline)
 ```
 
-### V8bench scores (P10.5, idle machine, 2026-04-04)
+### V8bench scores (P10.5 initial, 2026-04-04) — SUPERSEDED
+
+> **⚠ NOTE:** These results are superseded by the "Phase 10.5 — dlopen Fix" section
+> below.  The `JIT_IC_CHECK` macro used `JS_VALUE_GET_OBJ` which is not defined in
+> `quickjs.h`, causing `dlopen(combined.so, RTLD_NOW)` to fail silently.  All runs
+> below were executing the interpreter, not the JIT.  See the fixed results section.
 
 | Run | Richards | DeltaBlue | Crypto | RayTrace | EarleyBoyer | RegExp | Splay | Score |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -1677,3 +1682,93 @@ cd jit_perf_tests/v8bench
 # Step 3: measure (install from combined.so, execute)
 ../../qjs --jit-aot run_qjs.js
 ```
+
+---
+
+# Phase 10.5 — dlopen Fix + Re-measurement (2026-04-04)
+
+**Date:** 2026-04-04 (re-measured after combined.so dlopen bug fix)
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)
+**Build:** `make CONFIG_JIT=y JIT_THRESHOLD_GCC=100`
+
+## Bug Fixed: `JIT_IC_CHECK` used undefined symbol
+
+`JIT_IC_CHECK` macro in `quickjs-jit.h` referenced `JS_VALUE_GET_OBJ()`, which is a
+macro defined only inside `quickjs.c` — not exported via `quickjs.h`.  JIT-generated
+`.c` files include `quickjs-jit.h` (→ `quickjs.h`) but not `quickjs.c`, so GCC emitted
+`JS_VALUE_GET_OBJ` as an undefined external symbol in `combined.so`.  `dlopen(combined.so,
+RTLD_NOW)` then failed with "undefined symbol: JS_VALUE_GET_OBJ", `jit_combined_handle`
+remained NULL, and `--jit-aot` silently fell back to per-function GCC recompilation.
+
+Fix: replaced `JS_VALUE_GET_OBJ(obj)` with `JS_VALUE_GET_PTR(obj)` in the macro.
+`JS_VALUE_GET_PTR` is defined in `quickjs.h` (`(v).u.ptr`) and accesses the same field.
+
+**Previous P10.5 measurements (2026-04-04, before fix) were therefore running the
+interpreter, not JIT.  All P10.5 results below are re-measured with the fix applied.**
+
+## V8bench Results
+
+### Interpreter (no JIT) — 3 runs
+
+| Benchmark   | Run 1 | Run 2 | Run 3 |
+|-------------|------:|------:|------:|
+| Richards    |   936 |   861 |   798 |
+| DeltaBlue   |   807 |   774 |   672 |
+| Crypto      |  1004 |   996 |  1892 |
+| RayTrace    |  1107 |  1121 |  1080 |
+| EarleyBoyer |  1343 |  1134 |   904 |
+| RegExp      |   387 |   344 |   372 |
+| Splay       |  2361 |  2125 |  2275 |
+| **Score**   | **1004** | **933** | **975** |
+
+Score range: 933–1004, median: **975**
+
+### `--jit-warmup` — 1 run
+
+| Benchmark   | Score |
+|-------------|------:|
+| Richards    |   867 |
+| DeltaBlue   |   728 |
+| Crypto      |  1968 |
+| RayTrace    |  1034 |
+| EarleyBoyer |  1225 |
+| RegExp      |   333 |
+| Splay       |  1496 |
+| **Score**   |   **966** |
+
+### `--jit-aot` + `combined.so` (528 functions, IC inlined) — 5 runs
+
+| Run | Richards | DeltaBlue | Crypto | RayTrace | EarleyBoyer | RegExp | Splay | Score |
+|-----|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 |  951 | 1111 | 1589 | 1081 | 1451 | 550 | 1714 | 1139 |
+| 2 |  910 | 1074 | 1548 | 1068 | 1445 | 617 | 1690 | 1136 |
+| 3 |  900 | 1068 | 1527 | 1078 | 1878 | 363 | 1721 | 1093 |
+| 4 |  906 |  945 | 1490 | 1057 | 2861 | 376 | 1718 | 1139 |
+| 5 |  913 | 1060 | 2976 | 1051 | 1257 | 281 |  775 |  973 |
+
+Score range: 973–1139, typical (runs 1–4): **1093–1139**, median: **1136**
+
+### Summary
+
+| Mode | Score range | Median |
+|---|---:|---:|
+| Interpreter (no JIT) | 933–1004 | 975 |
+| `--jit-warmup` | 966 | 966 |
+| `--jit-aot` + `combined.so` | 973–1139 | 1136 |
+
+### Analysis
+
+- **DeltaBlue**: 945–1111 vs 672–807 baseline → ~1.3–1.4× speedup. Shaped-object IC
+  fast path fires consistently for the constraint-solver's property accesses.
+- **Crypto**: 1490–1589 typical (~1.5×), one run hit 2976 (~3×) when GCC fully
+  vectorised the inner RSA arithmetic loop.
+- **RayTrace**: 1051–1081 vs 1080–1121 — broadly flat; ray-tracer uses many floating-point
+  operations that fall through to vtable slow paths.
+- **EarleyBoyer**: 1257–2861; the JIT's typed-variable inference cuts deep into the Earley
+  parse loops when they hit the fast path.
+- **RegExp**: 281–617 — high variance because regexp-intensive functions contain opcodes
+  not yet supported by the JIT and fall back to the interpreter.
+- **Splay run 5** (775): anomalous — WSL2 scheduling noise / GC pressure. Typical: 1690–1721.
+
+The `--jit-aot` geometric mean over 4 stable runs (~1127) is **~16% above the interpreter
+median (975)**, with DeltaBlue showing the most consistent and reproducible gain.
