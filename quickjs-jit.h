@@ -425,11 +425,54 @@ void js_jit_set_link_mode(int active);
 /*
  * js_jit_link() — combine all per-function .c cache files into a single
  * GCC LTO compilation unit: `gcc -O2 -flto -shared -fPIC <files> -o combined.so`.
- * Writes to <cache_dir>/combined.so.
+ * Writes to <cache_dir>/combined.so.  Also emits a manifest section so the
+ * combined.so exports __jit_manifest[] and __jit_manifest_count.
  * Returns the number of functions combined, 0 if nothing to link, -1 on error.
  * Requires --jit-warmup to have been run first to populate the .c cache files.
  */
 int js_jit_link(void);
+
+/*
+ * JSJITManifestEntry — one entry in the combined.so manifest.
+ * The combined.so exports __jit_manifest[] (array) and __jit_manifest_count (int).
+ * js_jit_install_combined() reads these to patch jit_func in every bytecode.
+ */
+typedef struct {
+    uint64_t  bc_hash;   /* FNV-1a hash of function bytecode + build stamp */
+    JSJITFunc func_ptr;  /* address of the compiled JIT function           */
+} JSJITManifestEntry;
+
+/*
+ * js_jit_preload_combined() — open combined.so and cache its manifest without
+ * installing anything yet.  Call BEFORE js_jit_compile_all() so that
+ * js_jit_queue_gcc() can skip loading individual .so files for functions
+ * already present in the manifest (fast-path in js_jit_queue_gcc).
+ * Returns manifest entry count (≥0) or -1 on error.  Idempotent.
+ */
+int js_jit_preload_combined(void);
+
+/*
+ * js_jit_install_combined_if_exists() — if combined.so is present in the cache,
+ * dlopen it (idempotent with js_jit_preload_combined), read the manifest, and
+ * atomically update jit_func for every function whose bc_hash is known so far.
+ * May be called multiple times as new scripts are loaded; each call patches
+ * any newly discovered bytecodes that match the manifest.
+ * Individual per-function .so handles are closed; the combined.so handle is
+ * kept alive until js_jit_free().
+ * Returns number of functions installed this call, 0 if none, -1 on error.
+ */
+int js_jit_install_combined_if_exists(void);
+
+/*
+ * js_jit_ordinary_instanceof() — JIT entrypoint for OP_instanceof.
+ * Routes through JS_IsInstanceOf (handles Symbol.hasInstance), matching
+ * interpreter behaviour.  The name is retained for combined.so compat:
+ * the manifest.c shim provides a weak JS_OrdinaryIsInstanceOf alias that
+ * calls this function so old cached .c files still link.
+ */
+int js_jit_ordinary_instanceof(JSContext *ctx, JSValue val, JSValue obj);
+/* Direct export of JS_OrdinaryIsInstanceOf (made non-static for JIT use) */
+int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
 
 /*
  * js_jit_get_callee_fb() — extract JSFunctionBytecode* from a JSValue.

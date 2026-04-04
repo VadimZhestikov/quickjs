@@ -1064,7 +1064,9 @@ static uint64_t            *jit_link_hashes;
 static JSFunctionBytecode **jit_link_bytecodes;  /* P10.4: parallel to hashes */
 static int                  jit_link_hash_count;
 static int                  jit_link_hash_cap;
-static void                *jit_combined_handle; /* P10.4: dlopen handle for combined.so */
+static void                *jit_combined_handle;    /* P10.4: dlopen handle for combined.so */
+static JSJITManifestEntry  *jit_combined_manifest;  /* P10.4: manifest array inside combined.so */
+static int                  jit_combined_count;     /* P10.4: manifest entry count */
 
 void js_jit_set_link_mode(int active) { jit_link_mode = active; }
 
@@ -1231,7 +1233,9 @@ void js_jit_free(void)
     /* P10.4: close combined.so handle if installed */
     if (jit_combined_handle) {
         dlclose(jit_combined_handle);
-        jit_combined_handle = NULL;
+        jit_combined_handle   = NULL;
+        jit_combined_manifest = NULL;
+        jit_combined_count    = 0;
     }
 }
 
@@ -1267,12 +1271,25 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
     uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
 
-    /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install */
+    /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install.
+     * Must happen before any early return so jit_find_bytecode_by_hash works. */
     jit_link_record(bc_hash, b);
 
     /* Skip marker: function had an unsupported opcode in a previous run.
      * Avoids re-running code generation and printing noisy messages. */
     if (jit_cache_is_skip(bc_hash)) return;
+
+    /* P10.4: if combined.so is already open, check if this function is in the
+     * manifest.  If so, install it from there and skip loading the individual
+     * .so — avoids opening (and immediately closing) 500+ individual files. */
+    if (jit_combined_handle && jit_combined_manifest) {
+        for (int _mi = 0; _mi < jit_combined_count; _mi++) {
+            if (jit_combined_manifest[_mi].bc_hash == bc_hash) {
+                js_jit_fb_set_func(b, jit_combined_manifest[_mi].func_ptr, NULL, 2);
+                return;
+            }
+        }
+    }
 
     /* Phase 7.4: cache hit — load pre-compiled .so without running GCC */
     char *cache_path = jit_cache_get(bc_hash);
@@ -4042,6 +4059,14 @@ fail:
  *   - The combined.so handle is stored in jit_combined_handle (global).
  *   - Per-bytecode handle is set to NULL so js_jit_free_bytecode won't
  *     double-close when the bytecode is eventually freed.
+ *
+ * Incrementality: js_jit_install_combined_if_exists() is called once per
+ * script file load (eval_buf + quickjs-libc load()).  Scripts loaded via
+ * load() compile their bytecodes AFTER the top-level script already called
+ * install_combined.  We must re-scan on every call and patch any newly
+ * discovered bytecodes.  The combined.so is opened once; the manifest is
+ * cached in jit_combined_manifest/jit_combined_count; subsequent calls
+ * skip bytecodes whose handle already equals jit_combined_handle.
  * ----------------------------------------------------------------------- */
 
 static JSFunctionBytecode *jit_find_bytecode_by_hash(uint64_t hash)
@@ -4053,53 +4078,60 @@ static JSFunctionBytecode *jit_find_bytecode_by_hash(uint64_t hash)
     return NULL;
 }
 
-static int js_jit_install_combined(const char *so_path)
+/* Scan the manifest and patch any bytecodes not yet using combined.so.
+ * Always returns the number of functions patched this call (≥ 0). */
+static int jit_install_combined_pass(void)
 {
-    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        fprintf(stderr, "[JIT] install_combined: dlopen(%s) failed: %s\n",
-                so_path, dlerror());
-        return -1;
-    }
-    JSJITManifestEntry *manifest =
-        (JSJITManifestEntry *)dlsym(handle, "__jit_manifest");
-    int *count_ptr = (int *)dlsym(handle, "__jit_manifest_count");
-    if (!manifest || !count_ptr) {
-        fprintf(stderr, "[JIT] install_combined: no manifest in %s\n", so_path);
-        dlclose(handle);
-        return -1;
-    }
-    int count = *count_ptr;
     int installed = 0;
-    for (int i = 0; i < count; i++) {
-        JSFunctionBytecode *b = jit_find_bytecode_by_hash(manifest[i].bc_hash);
+    for (int i = 0; i < jit_combined_count; i++) {
+        JSFunctionBytecode *b = jit_find_bytecode_by_hash(jit_combined_manifest[i].bc_hash);
         if (!b) continue;
-        /* Close the old individual .so handle before replacing the pointer */
-        uint8_t old_tier   = js_jit_fb_get_tier(b);
-        void   *old_handle = js_jit_fb_get_handle(b);
-        /* Install with handle=NULL: js_jit_free_bytecode won't touch it */
-        js_jit_fb_set_func(b, manifest[i].func_ptr, NULL, 2);
-        if (old_tier == 2 && old_handle && old_handle != handle)
+        void *old_handle = js_jit_fb_get_handle(b);
+        if (old_handle == jit_combined_handle) continue;  /* already patched */
+        uint8_t old_tier = js_jit_fb_get_tier(b);
+        /* Install with handle=NULL so js_jit_free_bytecode skips it */
+        js_jit_fb_set_func(b, jit_combined_manifest[i].func_ptr, NULL, 2);
+        if (old_tier == 2 && old_handle)
             dlclose(old_handle);
         installed++;
     }
-    /* Keep combined.so alive; close any previous combined handle */
-    if (jit_combined_handle && jit_combined_handle != handle)
-        dlclose(jit_combined_handle);
-    jit_combined_handle = handle;
-    fprintf(stderr, "[JIT] install_combined: installed %d/%d functions\n",
-            installed, count);
     return installed;
+}
+
+/* Open combined.so and cache the manifest pointer WITHOUT installing anything.
+ * Safe to call before js_jit_compile_all: enables the fast-path in
+ * js_jit_queue_gcc that skips loading individual .so files for functions
+ * already present in combined.so. */
+int js_jit_preload_combined(void)
+{
+    if (!jit_cache_enabled || jit_combined_handle) return 0;
+    char path[620];
+    snprintf(path, sizeof(path), "%s/combined.so", jit_cache_dir);
+    if (access(path, R_OK) != 0) return 0;
+    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return -1;
+    JSJITManifestEntry *manifest =
+        (JSJITManifestEntry *)dlsym(handle, "__jit_manifest");
+    int *count_ptr = (int *)dlsym(handle, "__jit_manifest_count");
+    if (!manifest || !count_ptr) { dlclose(handle); return -1; }
+    jit_combined_handle   = handle;
+    jit_combined_manifest = manifest;
+    jit_combined_count    = *count_ptr;
+    return jit_combined_count;
 }
 
 int js_jit_install_combined_if_exists(void)
 {
-    if (jit_combined_handle) return 0;  /* already installed — idempotent */
     if (!jit_cache_enabled) return 0;
-    char path[620];
-    snprintf(path, sizeof(path), "%s/combined.so", jit_cache_dir);
-    if (access(path, R_OK) != 0) return 0;
-    return js_jit_install_combined(path);
+    /* Open combined.so once (may already be open from js_jit_preload_combined) */
+    if (js_jit_preload_combined() < 0) return -1;
+    if (!jit_combined_handle) return 0;  /* no combined.so */
+
+    int installed = jit_install_combined_pass();
+    if (installed > 0)
+        fprintf(stderr, "[JIT] install_combined: installed %d/%d functions\n",
+                installed, jit_combined_count);
+    return installed;
 }
 
 /* -----------------------------------------------------------------------

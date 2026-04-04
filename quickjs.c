@@ -15907,7 +15907,7 @@ DEF_JIT_ARITH(mod, OP_mod)
 DEF_JIT_ARITH(pow, OP_pow)
 #undef DEF_JIT_ARITH
 
-/* Bitwise — all route through js_binary_logic_slow */
+/* Bitwise — shl/sar/band/bor/bxor route through js_binary_logic_slow */
 #define DEF_JIT_LOGIC(name, op)                                          \
 JSValue js_jit_op_##name(JSContext *ctx, JSValue a, JSValue b)           \
 {                                                                         \
@@ -15918,11 +15918,19 @@ JSValue js_jit_op_##name(JSContext *ctx, JSValue a, JSValue b)           \
 }
 DEF_JIT_LOGIC(shl,  OP_shl)
 DEF_JIT_LOGIC(sar,  OP_sar)
-DEF_JIT_LOGIC(shr,  OP_shr)
 DEF_JIT_LOGIC(band, OP_and)
 DEF_JIT_LOGIC(bor,  OP_or)
 DEF_JIT_LOGIC(bxor, OP_xor)
 #undef DEF_JIT_LOGIC
+
+/* >>> uses js_shr_slow (bigint forbidden, converts to uint32) */
+JSValue js_jit_op_shr(JSContext *ctx, JSValue a, JSValue b)
+{
+    JSValue sp[2] = { a, b };
+    if (js_shr_slow(ctx, &sp[2]) < 0)
+        return JS_EXCEPTION;
+    return sp[0];
+}
 
 /* Unary arithmetic */
 #define DEF_JIT_UNARY(name, op)                                          \

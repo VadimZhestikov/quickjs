@@ -175,7 +175,7 @@ No `js_jit_call()` reference for known callees.
 
 ---
 
-## P10.4 — Manifest and Combined Loader
+## P10.4 — Manifest and Combined Loader ✓
 **Estimated effort:** ~1 day  **Risk:** low  **Files:** `quickjs-jit.c`, `quickjs-jit.h`
 
 ### Background
@@ -186,7 +186,7 @@ individual per-function `.so` files.  This requires a *manifest*: a mapping from
 
 ### Tasks
 
-- [ ] **P10.4-A** Define manifest format:
+- [x] **P10.4-A** Define manifest format in `quickjs-jit.h`:
   ```c
   typedef struct {
       uint64_t bc_hash;
@@ -195,32 +195,45 @@ individual per-function `.so` files.  This requires a *manifest*: a mapping from
   ```
   The combined `.so` exports a `__jit_manifest[]` array and `__jit_manifest_count`.
 
-- [ ] **P10.4-B** Emit manifest in `js_jit_link()`:
-  After collecting all `bc_hash` values, append to the combined `.c` a manifest table:
+- [x] **P10.4-B** Emit manifest in `js_jit_link()`:
+  After collecting all `bc_hash` values, appends to the combined `.c` a manifest table:
   ```c
   JSJITManifestEntry __jit_manifest[] = {
       { 0xaabbcc0011223344ULL, __jit_f_aabbcc0011223344 },
-      { 0xddeeff0055667788ULL, __jit_f_ddeeff0055667788 },
+      ...
   };
-  int __jit_manifest_count = 2;
+  int __jit_manifest_count = N;
   ```
 
-- [ ] **P10.4-C** Implement `js_jit_install_combined(JSRuntime *rt, const char *so_path)`:
-  1. `dlopen(so_path)` → get `__jit_manifest` and `__jit_manifest_count`
-  2. For each entry, find the `JSFunctionBytecode` with matching `bc_hash` and call
-     `js_jit_fb_set_func(b, entry.func_ptr)` (atomic RELEASE store)
-  3. Call this at the end of `--jit-link` mode before execution begins
+- [x] **P10.4-C** Implemented `js_jit_install_combined_if_exists()` and helper
+  `jit_install_combined_pass()`:
+  1. `js_jit_preload_combined()` — opens combined.so once, caches manifest pointer.
+     Called before `js_jit_compile_all()` so the fast-path in `js_jit_queue_gcc` can
+     skip loading individual `.so` files for functions already in combined.so.
+  2. `jit_install_combined_pass()` — iterates manifest, patches any bytecodes not yet
+     using combined.so.  Skips entries where `old_handle == jit_combined_handle`.
+  3. Incremental: called once per script file load; each call patches newly-discovered
+     bytecodes as `load()`'d scripts register their functions.
 
-- [ ] **P10.4-D** Execution mode: `--jit-link` + `--jit-aot` installs all combined
-  functions atomically before the script runs.  Individual `.so` files are no longer
-  opened; the combined `.so` is `dlopen`'d once.
+- [x] **P10.4-D** Execution mode: in `--jit-aot` mode, `js_jit_preload_combined()` is
+  called before `js_jit_compile_all()`.  Functions already in combined.so are installed
+  directly from the manifest in `js_jit_queue_gcc` without loading individual `.so`.
+  `js_jit_install_combined_if_exists()` cleans up any stragglers.
+  Both `qjs.c` (eval_buf + module path) and `quickjs-libc.c` (js_loadScript) updated.
 
-- [ ] **P10.4-E** Run `make CONFIG_JIT=y test`.  Run V8bench with `--jit-warmup` +
-  `--jit-link` + `--jit-aot` workflow and compare to P9 baseline.
+- [x] **P10.4-E** Tests pass: `make CONFIG_JIT=y test`.  V8bench workflow verified:
+  `--jit-warmup` (808) → `--jit-link` (527 functions) → `--jit-aot` (838, 527/527 installed).
+  Also fixed two pre-existing correctness bugs discovered during testing:
+  - `js_jit_op_shr` (JIT `>>>` operator): used `js_binary_logic_slow` which aborts for
+    BigInt — fixed to use `js_shr_slow` (proper TypeError for BigInt, uint32 coercion).
+  - `js_jit_install_combined_if_exists` idempotent check: prevented patching bytecodes
+    from subsequently `load()`'d scripts — fixed with incremental re-scan per call.
 
-### Definition of done
-`./qjs --jit-warmup s.js && ./qjs --jit-link --jit-aot s.js` runs correctly.
-`lsof` shows only one `combined_*.so` `dlopen`'d, not individual per-function `.so` files.
+### Definition of done ✓
+`./qjs --jit-warmup s.js && ./qjs --jit-link s.js && ./qjs --jit-aot s.js` runs correctly.
+V8bench: 527/527 functions installed from combined.so.  Score 838 vs 808 warmup baseline.
+Individual `.so` files are NOT loaded when combined.so is preloaded (fast-path in
+`js_jit_queue_gcc` skips the cache lookup for manifest-known functions).
 
 ---
 

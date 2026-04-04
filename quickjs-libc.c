@@ -460,9 +460,11 @@ static JSValue js_loadScript(JSContext *ctx, JSValueConst this_val,
         ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(ret)) {
+            js_jit_preload_combined();  /* P10.4: open combined.so before compile_all */
             if (JS_VALUE_GET_TAG(ret) == JS_TAG_FUNCTION_BYTECODE)
                 js_jit_compile_all(ctx, JS_VALUE_GET_PTR(ret));
             js_jit_drain();
+            js_jit_install_combined_if_exists();  /* P10.4 */
             ret = JS_EvalFunction(ctx, ret);
         }
     } else

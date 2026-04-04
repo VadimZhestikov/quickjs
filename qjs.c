@@ -68,9 +68,11 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
             js_module_set_import_meta(ctx, val, TRUE, TRUE);
 #ifdef CONFIG_JIT
             if (jit_aot_mode) {
+                js_jit_preload_combined();  /* P10.4: open combined.so before compile_all */
                 if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
                     js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
                 js_jit_drain();
+                js_jit_install_combined_if_exists();  /* P10.4 */
             }
 #endif
             val = JS_EvalFunction(ctx, val);
@@ -82,9 +84,11 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
         val = JS_Eval(ctx, buf, buf_len, filename,
                       eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(val)) {
+            js_jit_preload_combined();  /* P10.4: open combined.so before compile_all */
             if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
                 js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
             js_jit_drain();
+            js_jit_install_combined_if_exists();  /* P10.4 */
             /* Execute the script so that load() / import() calls fire,
              * allowing js_loadScript()'s AOT hook to compile and cache
              * all functions from dynamically-loaded files. */
