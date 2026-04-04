@@ -1483,8 +1483,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                    js_func_name ? js_func_name : "<unknown>");
     jit_buf_str(cb,
         "#include <stdint.h>\n"
-        "#include \"quickjs.h\"\n"
-        "#include \"quickjs-jit.h\"\n"
+        "#include <quickjs.h>\n"
+        "#include <quickjs-jit.h>\n"
         "#define _RT  (&js_jit_rt)\n"
         /* JS_DupValue / JS_FreeValue are static inline in quickjs.h;
          * GCC will inline them entirely, eliminating vtable dispatch. */
@@ -1509,14 +1509,17 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         fname_out);
 
     /* P9.2: named temp stack slots — declare _tsv0.._tsv{stack_size-1}.
-     * Each initialized to JS_UNDEFINED so the _ex cleanup path can safely
-     * _FREE them even if they were never written. */
+     * P11.2: NOT initialized to JS_UNDEFINED.  The _ex cleanup path uses
+     * runtime _sp guards (if(_sp>N){_FREE(_tsvN);}) so only live slots are
+     * freed.  _sp starts at 0 and is incremented only after a slot is written,
+     * so uninitialized slots are never accessed on the exception path. */
     for (int j = 0; j < stack_size; j++)
-        jit_buf_printf(cb, "    JSValue _tsv%d=JS_UNDEFINED;\n", j);
+        jit_buf_printf(cb, "    JSValue _tsv%d;\n", j);
     /* P9.4: raw double temporaries for typed stack slots.
-     * When gen_st[slot] >= JIT_T_NUMBER the value lives here, not in _tsv{}. */
+     * When gen_st[slot] >= JIT_T_NUMBER the value lives here, not in _tsv{}.
+     * P11.2: not initialized — always assigned before use by the type system. */
     for (int j = 0; j < stack_size; j++)
-        jit_buf_printf(cb, "    double _tsd%d=0.0;\n", j);
+        jit_buf_printf(cb, "    double _tsd%d;\n", j);
     /* _sp is still needed: updated at throw/exception sites so the _ex
      * cleanup knows which _tsv{} slots are live. */
     jit_buf_str(cb, "    int _sp=0;\n");
@@ -3151,11 +3154,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_get_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
             _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
+            /* P11.1: IC hit path inlined — no call to js_jit_ic_read.
+             * JSObject.prop (JIT_OBJ_PROP_OFF=40) is a JSValue* with stride
+             * JIT_PROP_SIZE=16 (== sizeof(JSProperty), u.value at offset 0). */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _o=_tsv%d, _r;\n"
-                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d)))\n"
-                "          _r=js_jit_ic_read(ctx,_o,_ic%d.slot);\n"
+                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d))){\n"
+                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);}\n"
                 "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
                 "      _FREE(_o); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
@@ -3165,11 +3172,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_get_field2: { /* keep object on stack; push result: depth d -> d+1 */
             uint32_t atom = bc_u32(&bc[pc+1]);
             _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
+            /* P11.1: IC hit path inlined — no call to js_jit_ic_read. */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
-                "      if (js_likely(JIT_IC_CHECK(_tsv%d,&_ic%d)))\n"
-                "          _r=js_jit_ic_read(ctx,_tsv%d,_ic%d.slot);\n"
+                "      if (js_likely(JIT_IC_CHECK(_tsv%d,&_ic%d))){\n"
+                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_tsv%d)+JIT_OBJ_PROP_OFF);\n"
+                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);}\n"
                 "      else { _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_tsv%d,(JSAtom)%uu,&_ic%d); }\n"
                 "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
@@ -3179,15 +3188,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_put_field: { /* pop val, pop obj; depth d -> d-2 */
             uint32_t atom = bc_u32(&bc[pc+1]);
             _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
+            /* P11.1: IC write hit path inlined — no call to js_jit_ic_write.
+             * Equivalent to set_value(ctx, &p->prop[slot].u.value, val):
+             * load old, store new, free old. */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
-                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d)))\n"
-                "          _ret=js_jit_ic_write(ctx,_o,_v,_ic%d.slot);\n"
+                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d))){\n"
+                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue _old=_pp[_ic%d.slot]; _pp[_ic%d.slot]=_v;\n"
+                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
                 "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
                 "             js_jit_ic_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
                 "      _FREE(_o); if(_ret<0) goto _ex; }\n",
-                pc, d-1, d-2, d-2, pc, pc, atom, atom, pc);
+                pc, d-1, d-2, d-2, pc, pc, pc, atom, atom, pc);
             break;
         }
         /* P8.5: dense array element fast path.

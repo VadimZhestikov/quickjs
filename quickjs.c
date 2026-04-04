@@ -15998,11 +15998,15 @@ JSValue js_jit_op_type_of(JSContext *ctx, JSValue a)
  * Repeated here only as a cross-check; the #include above brings it in via
  * quickjs-jit.h when CONFIG_JIT is defined. */
 
-/* Verify that the byte offsets used by JIT_IC_CHECK in quickjs-jit.h match
- * the actual struct layout.  These assertions fire at compile time if the
- * structs ever change. */
+/* Verify that the byte offsets used by JIT_IC_CHECK and the P11.1 inline
+ * property slot read in quickjs-jit.h match the actual struct layout.
+ * These assertions fire at compile time if the structs ever change. */
 _Static_assert(offsetof(JSObject,  shape)       == JIT_OBJIC_SHAPE_OFF,
                "JIT_OBJIC_SHAPE_OFF mismatch");
+_Static_assert(offsetof(JSObject,  prop)        == JIT_OBJ_PROP_OFF,
+               "JIT_OBJ_PROP_OFF mismatch");
+_Static_assert(sizeof(JSProperty)               == JIT_PROP_SIZE,
+               "JIT_PROP_SIZE mismatch — JSProperty stride != sizeof(JSValue)");
 _Static_assert(offsetof(JSShape,   prop_count)  == JIT_SHAPEIC_PROPCOUNT_OFF,
                "JIT_SHAPEIC_PROPCOUNT_OFF mismatch");
 _Static_assert(offsetof(JSShape,   prop)        == JIT_SHAPEIC_PROP_OFF,

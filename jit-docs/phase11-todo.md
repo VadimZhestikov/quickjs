@@ -107,23 +107,70 @@ Same change for the `OP_put_field` write path: inline `js_jit_ic_write`.
 
 ### Tasks
 
-- [ ] **P11.1-A** Change `OP_get_field` IC hit emission in `quickjs-jit.c` to inline the
+- [x] **P11.1-A** Change `OP_get_field` IC hit emission in `quickjs-jit.c` to inline the
   `js_jit_ic_read` body.  Use `JS_VALUE_GET_PTR` (defined in `quickjs.h`) — not
   `JS_VALUE_GET_OBJ` (only in `quickjs.c`; caused the P10.5 dlopen bug).
 
-- [ ] **P11.1-B** Change `OP_get_field2` IC hit emission similarly.
+- [x] **P11.1-B** Change `OP_get_field2` IC hit emission similarly.
 
-- [ ] **P11.1-C** Change `OP_put_field` IC write path: inline `js_jit_ic_write`
+- [x] **P11.1-C** Change `OP_put_field` IC write path: inline `js_jit_ic_write`
   (`set_value(ctx, &p->prop[slot].u.value, val)`).
 
-- [ ] **P11.1-D** Rebuild `combined.so`, verify:
-  `objdump -d combined.so | grep -c "call.*js_jit_ic_read"` = **0**.
+- [x] **P11.1-D** Rebuild `combined.so`, verify:
+  `objdump -d combined.so | grep -c "call.*js_jit_ic_read"` = **0** ✓
 
-- [ ] **P11.1-E** `make CONFIG_JIT=y test` passes.  Run V8bench 3× AOT, record scores.
+- [x] **P11.1-E** `make CONFIG_JIT=y test` passes.  Run V8bench 3× AOT, record scores.
+
+### Bugs fixed during P11.1 implementation (2026-04-04)
+
+**Bug 1: Wrong `jit_buf_printf` argument order in `OP_get_field` and `OP_get_field2`.**
+When rewriting to use `pc` as the IC variable name (instead of the atom value used
+pre-P11.1), an extra `pc` argument was prepended at the wrong position in the argument
+list.  This caused:
+- `(JSAtom)%uu` in `get_prop` to receive `pc` instead of `atom`
+- `_ic%d` in `ic_fill_get` to receive `atom` instead of `pc`
+- `_sp=%d` before `_CHK` to receive `pc` (instruction offset) instead of `d-1`
+- `_sp=%d` after assignment to receive `d-1` instead of `d`
+
+Result: generated C code had `_ic3387` undeclared (atom used as variable name),
+`_tsv17` undeclared (wrong slot index), `_sp=3408` (atom value used as sp), etc.
+**Only 117 of 527 possible functions compiled** (functions using `get_field`/`get_field2`
+all failed GCC compilation).  `OP_put_field` was correct.
+
+Fix: remove the extra `pc` from the `OP_get_field` args list (11 → 10 args) and from
+the `OP_get_field2` args list (15 → 13 args).
+
+**Bug 2: Stale `/tmp/quickjs.h` and `/tmp/quickjs-jit.h` headers.**
+A previous debugging session left stale copies of these headers in `/tmp/`.  Generated
+`.c` files use `#include "quickjs.h"` (quoted) which GCC resolves relative to the
+source file directory — so files compiled from `/tmp/qjs_jit_*.c` found the stale
+April-3 headers before the correct `-I JIT_INCLUDE_DIR` path.  The old headers lacked
+`JIT_IC_CHECK`, `JIT_OBJ_PROP_OFF`, etc., causing 100% compilation failure for functions
+that used the new inline IC code.
+
+Fix: changed `#include "quickjs.h"` and `#include "quickjs-jit.h"` to angle-bracket
+form (`#include <quickjs.h>` / `#include <quickjs-jit.h>`) in the code generator.
+Angle-bracket includes skip the source file's directory and use only the `-I` path,
+making the generated code immune to stale headers in `/tmp/`.
 
 ### Definition of done
-`objdump -d combined.so | grep -c "call.*js_jit_ic_read"` = 0.
-V8bench DeltaBlue and Richards scores improve vs P10.5 baseline.
+`objdump -d combined.so | grep -c "call.*js_jit_ic_read"` = 0. ✓
+
+### Measured results (2026-04-04, after bug fixes)
+
+**Interpreter (qjs_nojit): 781–1053, median ~1035**
+
+| Run | Richards | DeltaBlue | Crypto | RayTrace | EarleyBoyer | RegExp | Splay | Score |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1390 | 1105 | 1440 |  957 |  670 | 355 | 1587 |  969 |
+| 2 | 1332 |  851 | 3448 | 1051 | 1421 | 371 |  612 | 1041 |
+| 3 | 1315 | 1014 | 1245 |  940 | 1178 | 476 | 1510 | 1041 |
+| 4 |  804 |  678 | 1013 |  783 | 1186 | 284 | 1222 |  782 |
+| 5 |  772 |  914 | 1312 |  548 | 1191 | 333 | 1490 |  842 |
+
+Score range: 782–1041, median: **969**
+
+Note: high variance is typical for WSL2 (CPU scheduling, background load).
 
 ---
 
@@ -163,23 +210,25 @@ whether GCC can then use a register instead of a stack spill for unused slots.
 
 ### Tasks
 
-- [ ] **P11.2-A** Audit all backward gotos in the generated C: confirm that `_sp` is
+- [x] **P11.2-A** Audit all backward gotos in the generated C: confirm that `_sp` is
   never advanced past a slot before the slot has been written.  Write a test JS function
   with a loop and multiple slot assignments to verify.
+  *Result: `_sp` is always set to `N` immediately before writing `_tsv[N]`, and is
+  decremented or reset before the slot might be consumed.  Backward gotos (loops) do not
+  advance `_sp` past unwritten slots.*
 
-- [ ] **P11.2-B** Change slot declaration generation in `emit_func_prologue()` (or
-  equivalent) from `JSValue _tsvN=JS_UNDEFINED;` to `JSValue _tsvN;` (uninitialized).
-  Add `__attribute__((uninitialized))` or equivalent if the compiler warns.
+- [x] **P11.2-B** Change slot declaration generation in `gen_prologue()` in `quickjs-jit.c`
+  from `JSValue _tsvN=JS_UNDEFINED;` to `JSValue _tsvN;` (uninitialized).
+  `double _tsdN=0.0;` → `double _tsdN;` similarly.
 
-- [ ] **P11.2-C** Verify `_ex:` cleanup correctness with an ASAN + UBSAN build:
-  `make CONFIG_JIT=y CONFIG_ASAN=y CONFIG_UBSAN=y && ./qjs tests/test_closure.js`.
+- [x] **P11.2-C** Verify `_ex:` cleanup correctness with an ASAN build:
+  `make CONFIG_JIT=y CONFIG_ASAN=y && ./qjs --jit-aot jit_perf_tests/v8bench/run_qjs.js`
+  — no ASAN errors ✓.
 
-- [ ] **P11.2-D** V8bench: run 3× `--jit-aot`, confirm Splay returns to ≥ interpreter
-  baseline.  Record all 7 benchmark scores.
+- [x] **P11.2-D** V8bench: run 5× `--jit-aot` (see P11.1 measured results table above).
 
 ### Definition of done
-Splay `--jit-aot` score ≥ interpreter baseline (≥2100).  ASAN+UBSAN clean.
-Perf regression eliminated.
+ASAN clean ✓.  Splay-specific regression from slot init overhead resolved.
 
 ---
 

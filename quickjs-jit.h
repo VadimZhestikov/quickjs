@@ -270,16 +270,21 @@ typedef struct {
 #define JIT_IC_MEGAMORPHIC ((void *)(uintptr_t)1)
 
 /*
- * Struct byte offsets for the inline IC check (JIT_IC_CHECK macro below).
+ * Struct byte offsets for the inline IC check (JIT_IC_CHECK macro below)
+ * and the inline property slot read (P11.1).
  * Verified by _Static_assert in quickjs.c.  Do NOT change without updating
  * both sets together.
  *   JSObject.shape        = byte 32
+ *   JSObject.prop         = byte 40  (pointer to JSProperty array)
  *   JSShape.prop_count    = byte 40
  *   JSShape.prop[]        = byte 64  (flexible array of JSShapeProperty)
  *   JSShapeProperty.atom  = byte  4  (after 4-byte bitfield word)
  *   sizeof(JSShapeProperty) = 8
+ *   sizeof(JSProperty)    = 16       (= sizeof(JSValue); u.value is at offset 0)
  */
 #define JIT_OBJIC_SHAPE_OFF       32
+#define JIT_OBJ_PROP_OFF          40  /* JSObject.prop pointer */
+#define JIT_PROP_SIZE             16  /* sizeof(JSProperty) == sizeof(JSValue) */
 #define JIT_SHAPEIC_PROPCOUNT_OFF 40
 #define JIT_SHAPEIC_PROP_OFF      64
 #define JIT_SHAPEIC_PROPSIZE       8
