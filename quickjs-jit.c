@@ -955,6 +955,28 @@ static char *jit_cache_get(uint64_t hash)
     return NULL;
 }
 
+/* Returns 1 if a .skip marker exists for this hash (function was permanently
+ * excluded from JIT on a previous run due to an unsupported opcode). */
+static int jit_cache_is_skip(uint64_t hash)
+{
+    if (!jit_cache_enabled) return 0;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.skip",
+             jit_cache_dir, (unsigned long long)hash);
+    return access(path, F_OK) == 0;
+}
+
+/* Write a .skip marker so future runs bypass code generation for this hash. */
+static void jit_cache_put_skip(uint64_t hash)
+{
+    if (!jit_cache_enabled) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.skip",
+             jit_cache_dir, (unsigned long long)hash);
+    FILE *f = fopen(path, "w");
+    if (f) fclose(f);
+}
+
 /* Copy src_path to <cache_dir>/<hash>.so atomically via temp+rename. */
 static void jit_cache_put(const char *src_path, uint64_t hash)
 {
@@ -1145,6 +1167,10 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
     uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
 
+    /* Skip marker: function had an unsupported opcode in a previous run.
+     * Avoids re-running code generation and printing noisy messages. */
+    if (jit_cache_is_skip(bc_hash)) return;
+
     /* Phase 7.4: cache hit — load pre-compiled .so without running GCC */
     char *cache_path = jit_cache_get(bc_hash);
     if (cache_path) {
@@ -1170,6 +1196,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
     if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported,
                      js_name, bc_hash, JS_GetRuntime(ctx)) < 0) {
+        /* Persist the failure so future runs skip code generation silently. */
+        jit_cache_put_skip(bc_hash);
         return;
     }
 
