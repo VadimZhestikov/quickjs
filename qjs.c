@@ -51,6 +51,7 @@ extern const uint32_t qjsc_repl_size;
 
 static int jit_aot_mode     = 0; /* set by --jit-aot     */
 static int jit_warmup_mode  = 0; /* set by --jit-warmup  */
+static int jit_link_mode    = 0; /* set by --jit-link    */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -349,6 +350,7 @@ void help(void)
 #ifdef CONFIG_JIT
            "    --jit-aot      compile all functions with GCC before running\n"
            "    --jit-warmup   compile all functions into cache, then exit\n"
+           "    --jit-link     combine cached .c files into one LTO .so after running\n"
            "    --jit-dump-c   print generated C source for each compiled function\n"
 #endif
            );
@@ -496,6 +498,13 @@ int main(int argc, char **argv)
                 js_jit_set_aot_mode(1);
                 continue;
             }
+            if (!strcmp(longopt, "jit-link")) {
+                jit_link_mode = 1;
+                jit_aot_mode = 1;
+                js_jit_set_aot_mode(1);
+                js_jit_set_link_mode(1);
+                continue;
+            }
             if (!strcmp(longopt, "jit-dump-c")) {
                 js_jit_set_dump_c_mode(1);
                 continue;
@@ -584,6 +593,13 @@ int main(int argc, char **argv)
             js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
         }
         js_std_loop(ctx);
+
+#ifdef CONFIG_JIT
+        /* P10.2: --jit-link — after execution collect all seen .c cache files
+         * and combine them into a single GCC LTO shared library. */
+        if (jit_link_mode)
+            js_jit_link();
+#endif
     }
 
     if (dump_memory) {

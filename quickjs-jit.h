@@ -410,5 +410,22 @@ void js_jit_set_dump_c_mode(int active);
  */
 int js_jit_cache_has_c_src(JSFunctionBytecode *b);
 
+/*
+ * js_jit_set_link_mode() — enable hash recording for --jit-link.
+ * When active, every bc_hash seen in js_jit_queue_gcc() is appended to an
+ * internal list so js_jit_link() can collect the corresponding .c files.
+ * Must be called before execution begins.
+ */
+void js_jit_set_link_mode(int active);
+
+/*
+ * js_jit_link() — combine all per-function .c cache files into a single
+ * GCC LTO compilation unit: `gcc -O2 -flto -shared -fPIC <files> -o combined.so`.
+ * Writes to <cache_dir>/combined.so.
+ * Returns the number of functions combined, 0 if nothing to link, -1 on error.
+ * Requires --jit-warmup to have been run first to populate the .c cache files.
+ */
+int js_jit_link(void);
+
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */

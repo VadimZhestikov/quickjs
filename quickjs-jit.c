@@ -1049,6 +1049,34 @@ static int  jit_dump_c_mode;  /* set by --jit-dump-c */
 
 void js_jit_set_dump_c_mode(int active) { jit_dump_c_mode = active; }
 
+/* =======================================================================
+ * P10.2 — hash registry for --jit-link combiner
+ *
+ * Every bc_hash seen during this run is recorded here.  js_jit_link()
+ * walks the list, resolves .c paths from the cache, and invokes GCC
+ * once with -O2 -flto -shared to produce a combined .so.
+ * ======================================================================= */
+static int       jit_link_mode;
+static uint64_t *jit_link_hashes;
+static int       jit_link_hash_count;
+static int       jit_link_hash_cap;
+
+void js_jit_set_link_mode(int active) { jit_link_mode = active; }
+
+static void jit_link_record_hash(uint64_t hash)
+{
+    if (!jit_link_mode) return;
+    if (jit_link_hash_count >= jit_link_hash_cap) {
+        int new_cap = jit_link_hash_cap ? jit_link_hash_cap * 2 : 128;
+        uint64_t *arr = realloc(jit_link_hashes,
+                                (size_t)new_cap * sizeof(uint64_t));
+        if (!arr) return;
+        jit_link_hashes = arr;
+        jit_link_hash_cap = new_cap;
+    }
+    jit_link_hashes[jit_link_hash_count++] = hash;
+}
+
 /* Write src to a temp file with the given suffix; return malloc'd path. */
 static char *jit_write_tmp(const char *src, const char *suffix)
 {
@@ -1222,6 +1250,9 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     int bc_len;
     const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
     uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
+
+    /* P10.2: record hash so --jit-link can collect all .c files for this run */
+    jit_link_record_hash(bc_hash);
 
     /* Skip marker: function had an unsupported opcode in a previous run.
      * Avoids re-running code generation and printing noisy messages. */
@@ -3741,6 +3772,114 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
     return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * P10.2 — js_jit_link(): combine all per-function .c files into one .so
+ *
+ * Deduplicates the recorded hash list, resolves .c paths from cache, and
+ * invokes GCC once with -O2 -flto -shared.  The output is written to
+ * <cache_dir>/combined.so.
+ *
+ * Returns the number of functions linked, or -1 on error.
+ * ----------------------------------------------------------------------- */
+int js_jit_link(void)
+{
+    if (!jit_cache_enabled) {
+        fprintf(stderr, "[JIT] --jit-link: cache not enabled\n");
+        return -1;
+    }
+
+    /* Deduplicate hashes (simple O(n²) for typical sizes ≤ few thousand) */
+    for (int i = 0; i < jit_link_hash_count; i++) {
+        for (int j = i + 1; j < jit_link_hash_count; j++) {
+            if (jit_link_hashes[j] == jit_link_hashes[i]) {
+                /* Remove j by swapping with last */
+                jit_link_hashes[j] = jit_link_hashes[--jit_link_hash_count];
+                j--;
+            }
+        }
+    }
+
+    /* Resolve .c paths for all hashes that have a cached source file */
+    char **c_paths = NULL;
+    int n_paths = 0;
+    for (int i = 0; i < jit_link_hash_count; i++) {
+        char *path = jit_cache_get_c_src(jit_link_hashes[i]);
+        if (!path) continue;
+        char **arr = realloc(c_paths, (size_t)(n_paths + 1) * sizeof(char *));
+        if (!arr) { free(path); break; }
+        c_paths = arr;
+        c_paths[n_paths++] = path;
+    }
+
+    if (n_paths == 0) {
+        fprintf(stderr, "[JIT] --jit-link: no .c files found — "
+                "run --jit-warmup first\n");
+        free(c_paths);
+        return 0;
+    }
+
+    char out_path[620];
+    snprintf(out_path, sizeof(out_path), "%s/combined.so", jit_cache_dir);
+
+    /* Build argv for GCC */
+    int max_argc = n_paths + 16;
+    char **argv = malloc((size_t)max_argc * sizeof(char *));
+    if (!argv) goto oom;
+
+    int argc = 0;
+    argv[argc++] = "gcc";
+    argv[argc++] = "-O2";
+    argv[argc++] = "-flto";
+    argv[argc++] = "-shared";
+    argv[argc++] = "-fPIC";
+    argv[argc++] = "-DCONFIG_JIT";
+#ifdef JIT_INCLUDE_DIR
+    argv[argc++] = "-I";
+    argv[argc++] = JIT_INCLUDE_DIR;
+#endif
+    for (int i = 0; i < n_paths; i++)
+        argv[argc++] = c_paths[i];
+    argv[argc++] = "-o";
+    argv[argc++] = out_path;
+    argv[argc]   = NULL;
+
+    fprintf(stderr, "[JIT] --jit-link: combining %d functions → %s\n",
+            n_paths, out_path);
+
+    pid_t pid = fork();
+    if (pid < 0) goto fail;
+    if (pid == 0) {
+        int logfd = open("/tmp/qjs_jit_link.log",
+                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (logfd >= 0) { dup2(logfd, 1); dup2(logfd, 2); close(logfd); }
+        execvp("gcc", argv);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+
+    free(argv);
+    for (int i = 0; i < n_paths; i++) free(c_paths[i]);
+    free(c_paths);
+
+    if (!ok) {
+        fprintf(stderr, "[JIT] --jit-link: GCC failed "
+                "(see /tmp/qjs_jit_link.log)\n");
+        return -1;
+    }
+    fprintf(stderr, "[JIT] --jit-link: done (%d functions combined)\n",
+            n_paths);
+    return n_paths;
+
+oom:
+fail:
+    free(argv);
+    for (int i = 0; i < n_paths; i++) free(c_paths[i]);
+    free(c_paths);
+    return -1;
 }
 
 /* -----------------------------------------------------------------------
