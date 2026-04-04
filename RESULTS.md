@@ -48,6 +48,29 @@ Richards, DeltaBlue, Crypto, RayTrace, EarleyBoyer, RegExp, Splay.
 - RegExp shows lower scores because regexp-heavy functions tend to have
   unsupported opcodes and fall back to interpretation.
 
+## Phase 10 — Combined .so (LTO) + Manifest Loader
+
+**Date:** 2026-04-04  
+**Workflow:** `--jit-warmup` → `--jit-link` → `--jit-aot`
+
+After Phase 10, the recommended execution path is a 3-step workflow:
+
+1. `./qjs --jit-warmup script.js` — compile all functions to individual `.so` + `.c`
+2. `./qjs --jit-link script.js` — LTO-combine all `.c` into `combined.so`
+3. `./qjs --jit-aot script.js` — install 527/527 functions from `combined.so`, execute
+
+### V8bench scores (WSL2, ±20% variance)
+
+| Mode | Score |
+|---|---:|
+| Interpreter (no JIT) | 702 |
+| `--jit-warmup` | 788–895 |
+| `--jit-aot` + `combined.so` | 841–897 |
+
+The combined.so mode's main benefit is **predictability**: all functions are
+pre-installed from a single shared library before execution begins.  See
+`jit_perf_tests/RESULTS.md` for full phase-by-phase history.
+
 ## Bugs Fixed
 
 ### 1. `OP_tail_call_method` — EarleyBoyer crash (previous session)
