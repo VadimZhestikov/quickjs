@@ -397,5 +397,18 @@ void js_jit_drain(void);
 void js_jit_set_aot_mode(int active);
 int  js_jit_get_aot_mode(void);
 
+/*
+ * js_jit_set_dump_c_mode() — when active, print generated C to stdout
+ * for each JIT-compiled function.  Set by --jit-dump-c.
+ */
+void js_jit_set_dump_c_mode(int active);
+
+/*
+ * js_jit_cache_has_c_src() — returns 1 if a .c source file exists in the
+ * cache alongside the compiled .so for this function's bytecode hash.
+ * Used by P10.2 --jit-link to discover which functions can be LTO-combined.
+ */
+int js_jit_cache_has_c_src(JSFunctionBytecode *b);
+
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */

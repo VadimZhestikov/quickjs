@@ -1003,6 +1003,52 @@ static void jit_cache_put(const char *src_path, uint64_t hash)
     rename(tmp_path, dst_path); /* atomic on same filesystem */
 }
 
+/* Copy src_path to <cache_dir>/<hash>.c — C source companion for the .so.
+ * Non-atomic (supplementary artifact; correctness does not depend on it). */
+static void jit_cache_put_c_src(const char *src_path, uint64_t hash)
+{
+    if (!jit_cache_enabled) return;
+    char dst_path[600];
+    snprintf(dst_path, sizeof(dst_path), "%s/%016llx.c",
+             jit_cache_dir, (unsigned long long)hash);
+    int src_fd = open(src_path, O_RDONLY);
+    if (src_fd < 0) return;
+    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd < 0) { close(src_fd); return; }
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(src_fd, buf, sizeof(buf))) > 0)
+        write(dst_fd, buf, (size_t)n);
+    close(src_fd);
+    close(dst_fd);
+}
+
+/* Returns 1 if a cached .c source file exists for this hash. */
+static int jit_cache_has_c_src(uint64_t hash)
+{
+    if (!jit_cache_enabled) return 0;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.c",
+             jit_cache_dir, (unsigned long long)hash);
+    return access(path, R_OK) == 0;
+}
+
+/* Returns malloc'd path to cached .c source, or NULL if absent. */
+static char *jit_cache_get_c_src(uint64_t hash)
+{
+    if (!jit_cache_enabled) return NULL;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.c",
+             jit_cache_dir, (unsigned long long)hash);
+    if (access(path, R_OK) == 0)
+        return strdup(path);
+    return NULL;
+}
+
+static int  jit_dump_c_mode;  /* set by --jit-dump-c */
+
+void js_jit_set_dump_c_mode(int active) { jit_dump_c_mode = active; }
+
 /* Write src to a temp file with the given suffix; return malloc'd path. */
 static char *jit_write_tmp(const char *src, const char *suffix)
 {
@@ -1055,6 +1101,8 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     int status = 0;
     waitpid(pid, &status, 0);
     int gcc_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    /* P10.1: cache .c source before unlinking the temp file */
+    if (gcc_ok) jit_cache_put_c_src(c_path, job->bc_hash);
     if (!getenv("QJS_JIT_KEEP_C")) unlink(c_path);
     free(c_path);
     if (!gcc_ok) { unlink(so_path); goto fail; }
@@ -1154,6 +1202,14 @@ void js_jit_drain(void)
     pthread_mutex_unlock(&jit_worker.lock);
 }
 
+/* Public API: returns 1 if a .c source file is cached for b's bytecode. */
+int js_jit_cache_has_c_src(JSFunctionBytecode *b)
+{
+    int bc_len;
+    const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
+    return jit_cache_has_c_src(jit_hash_bytecode(bc, bc_len));
+}
+
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (js_jit_fb_jit_no_compile(b)) return;
@@ -1204,6 +1260,11 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
     JITGCCJob *job = malloc(sizeof(*job));
     if (!job) { jit_buf_free(&cb); return; }
     job->b       = b;
+    /* P10.1-C: --jit-dump-c — print generated C to stdout for inspection */
+    if (jit_dump_c_mode)
+        fprintf(stdout, "/* ==== JIT: %s [%016llx] ==== */\n%s\n",
+                js_name ? js_name : "(anon)", (unsigned long long)bc_hash, cb.buf);
+
     job->c_src   = cb.buf;   /* transfer buffer ownership to job */
     cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */
     job->bc_hash = bc_hash;

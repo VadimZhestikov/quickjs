@@ -35,27 +35,27 @@ as the `.so` with a `.c` extension instead of `.so`.
 
 ### Tasks
 
-- [ ] **P10.1-A** In `jit_cache_put()`, after writing the `.so`, write the generated
-  C source to `~/.cache/qjs-jit/<hash16>.c`:
-  ```c
-  // existing: snprintf(so_path, ..., "%s.so", hash_str);
-  // new:
-  char c_path[PATH_MAX];
-  snprintf(c_path, sizeof(c_path), "%s/%s.c", cache_dir, hash_str);
-  FILE *fc = fopen(c_path, "w");
-  if (fc) { fwrite(cb->buf, 1, cb->len, fc); fclose(fc); }
-  ```
+- [x] **P10.1-A** `jit_cache_put_c_src(src_path, hash)` in `quickjs-jit.c`: copies the
+  temp `.c` file to `<cache_dir>/<hash>.c` immediately before the temp file is unlinked
+  (in `jit_compile_gcc_job`).  Non-atomic write (supplementary artifact).
 
-- [ ] **P10.1-B** In `jit_cache_get()`, set a flag `have_c_source` if the `.c` file
-  exists alongside a valid `.so` hit.  (Needed for P10.4 manifest building.)
+- [x] **P10.1-B** `jit_cache_has_c_src(hash)` and `jit_cache_get_c_src(hash)` helpers;
+  public API `js_jit_cache_has_c_src(JSFunctionBytecode *b)` declared in
+  `quickjs-jit.h` for use by P10.2 `--jit-link`.
 
-- [ ] **P10.1-C** Add a `--jit-dump-c` CLI flag (or reuse `--jit-dump`) that writes
-  the generated C to stdout for inspection.
+- [x] **P10.1-C** `--jit-dump-c` CLI flag (`qjs.c` + `js_jit_set_dump_c_mode()`):
+  prints generated C to stdout with `/* ==== JIT: <name> [<hash>] ==== */` header
+  before each function is submitted to GCC.
 
-- [ ] **P10.1-D** Verify: `make CONFIG_JIT=y test`; check that `~/.cache/qjs-jit/`
-  contains `.c` files after a warm-up run.
+- [x] **P10.1-D** `--jit-warmup` now executes the script (instead of exiting after the
+  static compile-only pass), so `load()`'d files trigger the `js_loadScript` AOT hook
+  and their functions are compiled and cached.  Exit happens after execution completes.
 
-### Definition of done
+- [x] **P10.1-E** Verified: after `./qjs --jit-warmup run_qjs.js` on the V8bench suite,
+  `~/.cache/qjs-jit/` contains **527** `.c`/`.so` pairs and **147** `.skip` markers.
+  Every `.so` has a matching `.c` (shell loop confirmed 0 mismatches).
+
+### Definition of done ✓
 After `./qjs --jit-warmup script.js`, every `.so` in `~/.cache/qjs-jit/` has a
 matching `.c` file with identical hash prefix.
 

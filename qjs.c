@@ -84,12 +84,18 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
             if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
                 js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
             js_jit_drain();
+            /* Execute the script so that load() / import() calls fire,
+             * allowing js_loadScript()'s AOT hook to compile and cache
+             * all functions from dynamically-loaded files. */
+            val = JS_EvalFunction(ctx, val);
             if (jit_warmup_mode) {
-                /* --jit-warmup: populate cache only, do not execute */
+                /* --jit-warmup: exit after the warmup execution; the
+                 * cache is now fully populated for --jit-aot runs. */
+                if (JS_IsException(val))
+                    js_std_dump_error(ctx);
                 JS_FreeValue(ctx, val);
                 return 0;
             }
-            val = JS_EvalFunction(ctx, val);
         }
 #else
         val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
@@ -343,6 +349,7 @@ void help(void)
 #ifdef CONFIG_JIT
            "    --jit-aot      compile all functions with GCC before running\n"
            "    --jit-warmup   compile all functions into cache, then exit\n"
+           "    --jit-dump-c   print generated C source for each compiled function\n"
 #endif
            );
     exit(1);
@@ -487,6 +494,10 @@ int main(int argc, char **argv)
             if (!strcmp(longopt, "jit-warmup")) {
                 jit_warmup_mode = 1;
                 js_jit_set_aot_mode(1);
+                continue;
+            }
+            if (!strcmp(longopt, "jit-dump-c")) {
+                js_jit_set_dump_c_mode(1);
                 continue;
             }
 #endif
