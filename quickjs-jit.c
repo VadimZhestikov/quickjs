@@ -596,6 +596,8 @@ static inline uint16_t bc_u16(const uint8_t *p) {
  * OP_get_var.  Used to detect self-recursive call patterns at codegen time so
  * the call can be emitted as a direct C function call instead of _RT->call. */
 #define JIT_T_SELF_FUNC 3
+/* P10.3: stack slot holds a known JIT function; gen_hsh[] carries the bc_hash */
+#define JIT_T_JIT_FUNC  4
 
 /*
  * jit_infer_types() — returns malloc'd uint8_t[var_count] or NULL.
@@ -864,7 +866,7 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                          char *fname_out, size_t fname_sz, int *unsupported,
                          const char *js_func_name, uint64_t bc_hash,
-                         JSRuntime *rt);
+                         JSRuntime *rt, const uint64_t *var_jit_hash);
 
 typedef struct JITGCCJob {
     JSFunctionBytecode *b;
@@ -1238,7 +1240,7 @@ int js_jit_cache_has_c_src(JSFunctionBytecode *b)
     return jit_cache_has_c_src(jit_hash_bytecode(bc, bc_len));
 }
 
-void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
+void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs)
 {
     if (js_jit_fb_jit_no_compile(b)) return;
     if (js_jit_fb_get_func(b) != NULL) return;
@@ -1277,16 +1279,39 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b)
         }
     }
 
+    /* P10.3: resolve JIT callee hashes from closure variables for direct call emit */
+    int p103_cvc = js_jit_fb_get_closure_var_count(b);
+    uint64_t *p103_hash = NULL;
+    if (var_refs && p103_cvc > 0) {
+        p103_hash = (uint64_t *)calloc(p103_cvc, sizeof(uint64_t));
+        if (p103_hash) {
+            for (int _pi = 0; _pi < p103_cvc; _pi++) {
+                if (!var_refs[_pi]) continue;
+                JSValue *_pv = js_jit_var_ref_value(var_refs[_pi]);
+                if (!_pv) continue;
+                JSFunctionBytecode *_cb = js_jit_get_callee_fb(*_pv);
+                if (!_cb) continue;
+                int _cl;
+                const uint8_t *_cc = js_jit_fb_get_bytecode(_cb, &_cl);
+                uint64_t _ch = jit_hash_bytecode(_cc, _cl);
+                if (_ch != bc_hash)   /* skip self (P8.2 handles self) */
+                    p103_hash[_pi] = _ch;
+            }
+        }
+    }
+
     JSJITCodeBuf cb;
     char fname[64];
     int unsupported = 0;
     const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
     if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported,
-                     js_name, bc_hash, JS_GetRuntime(ctx)) < 0) {
+                     js_name, bc_hash, JS_GetRuntime(ctx), p103_hash) < 0) {
         /* Persist the failure so future runs skip code generation silently. */
+        free(p103_hash);
         jit_cache_put_skip(bc_hash);
         return;
     }
+    free(p103_hash);
 
     JITGCCJob *job = malloc(sizeof(*job));
     if (!job) { jit_buf_free(&cb); return; }
@@ -1579,7 +1604,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     const uint8_t *local_type,
                     JSFunctionBytecode *b,
                     uint64_t bc_hash,
-                    char **varnames)
+                    char **varnames,
+                    const uint64_t *var_jit_hash)
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -1609,6 +1635,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         *unsupported_out = 0;
         return -1;
     }
+
+    /* P10.3: parallel hash array for JIT_T_JIT_FUNC slots */
+    int p103_cvc_gb = js_jit_fb_get_closure_var_count(b);
+    uint64_t *gen_hsh = (uint64_t *)calloc(gen_stk_cap, sizeof(uint64_t));
+    if (!gen_hsh) { free(gen_st); *unsupported_out = 0; return -1; }
+    /* Extern declaration tracking (max 16 distinct callees per function) */
+    uint64_t p103_externs[16];
+    int p103_nexterns = 0;
+    int p103_cae_declared = 0; /* js_jit_check_and_extract declaration emitted? */
 
 #define _GS_PUSH(t) do { if (gen_sp < gen_stk_cap) gen_st[gen_sp++] = (uint8_t)(t); } while(0)
 #define _GS_POP()   (gen_sp > 0 ? gen_st[--gen_sp] : (uint8_t)JIT_T_JSVAL)
@@ -1662,6 +1697,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
              * _P94_ENSURE(slot) checks remain valid for all live slots after the
              * reset.  All types are JSVAL since we can't know which path we came from. */
             memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
+            memset(gen_hsh, 0, gen_stk_cap * sizeof(uint64_t));
             gen_sp = (sdt != NULL) ? (int)sdt[pc] : 0;
             if (gen_sp < 0 || gen_sp > gen_stk_cap) gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
@@ -1686,13 +1722,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * spurious boxing in _P94_ENSURE. */
         if (gen_sp > d) {
             memset(gen_st, JIT_T_JSVAL, gen_stk_cap);
+            memset(gen_hsh, 0, gen_stk_cap * sizeof(uint64_t));
             gen_sp = d;
         }
 
         int op = bc[pc];
         if (op >= op_sz_count || op_sz[op] == 0) {
             fprintf(stderr, "[JIT] unsupported opcode 0x%02x at pc=%d\n", op, pc);
-            *unsupported_out = 1; free(gen_st); return -1;
+            *unsupported_out = 1; free(gen_st); free(gen_hsh); return -1;
         }
         int sz = op_sz[op];
 
@@ -1783,14 +1820,16 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
         case OP_drop: /* pop top: depth d -> d-1 */
             /* P9.4: typed slot lives in _tsd — no refcount, no _FREE needed */
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER)
+            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed double — exclude it */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER && gen_st[gen_sp-1] <= JIT_T_INT)
                 jit_buf_printf(cb, "    _sp=%d;\n", d-1);
             else
                 jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1);
             break;
         case OP_dup: /* peek top, push copy: depth d -> d+1 */
             /* P9.4: typed slot — copy _tsd directly, no _DUP */
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER)
+            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed double — exclude it */
+            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER && gen_st[gen_sp-1] <= JIT_T_INT)
                 jit_buf_printf(cb, "    _tsd%d=_tsd%d; _sp=%d;\n", d, d-1, d+1);
             else
                 jit_buf_printf(cb, "    _tsv%d=_DUP(_tsv%d); _sp=%d;\n", d, d-1, d+1);
@@ -3213,6 +3252,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             {
                 int func_slot = gen_sp - 1 - nargs;
                 int is_self = (func_slot >= 0 && gen_st[func_slot] == JIT_T_SELF_FUNC);
+                /* P10.3: guarded direct call to known JIT callee */
+                int is_jit  = (func_slot >= 0 && gen_st[func_slot] == JIT_T_JIT_FUNC && gen_hsh);
+                uint64_t jit_callee_hash = is_jit ? gen_hsh[func_slot] : 0;
                 int fslot = d - nargs - 1; /* absolute slot index of func */
                 /* P9.4: box any typed arg slots before building the args array */
                 for (int _aj = 0; _aj < nargs; _aj++)
@@ -3228,6 +3270,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     jit_buf_str(cb, "};\n");
                 }
                 if (is_self) {
+                    /* P8.2: self-recursive direct call */
                     jit_buf_str(cb, "      if(_RT->poll_interrupts(ctx)) goto _ex;\n");
                     if (nargs > 0)
                         jit_buf_printf(cb,
@@ -3237,7 +3280,44 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         jit_buf_printf(cb,
                             "      JSValue _r=%s(ctx,JS_UNDEFINED,0,NULL,cpool,var_refs);\n",
                             self_jit_sym);
+                } else if (is_jit) {
+                    /* P10.3: emit extern declaration once per callee hash */
+                    int _p103_already = 0;
+                    for (int _pi = 0; _pi < p103_nexterns; _pi++)
+                        if (p103_externs[_pi] == jit_callee_hash) { _p103_already = 1; break; }
+                    if (!_p103_already && p103_nexterns < 16) {
+                        jit_buf_printf(cb,
+                            "extern JSValue __jit_f_%016llx"
+                            "(JSContext*,JSValue,int,JSValue*,JSValue*,JSVarRef**);\n",
+                            (unsigned long long)jit_callee_hash);
+                        p103_externs[p103_nexterns++] = jit_callee_hash;
+                    }
+                    if (!p103_cae_declared) {
+                        jit_buf_str(cb,
+                            "extern int js_jit_check_and_extract"
+                            "(JSValue,JSJITFunc,JSValue**,JSVarRef***);\n");
+                        p103_cae_declared = 1;
+                    }
+                    jit_buf_str(cb, "      JSValue *_dc; JSVarRef **_dv; JSValue _r;\n");
+                    jit_buf_printf(cb,
+                        "      if(js_jit_check_and_extract(_f,(JSJITFunc)__jit_f_%016llx,&_dc,&_dv)){\n"
+                        "        if(_RT->poll_interrupts(ctx)) goto _ex;\n",
+                        (unsigned long long)jit_callee_hash);
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "        _r=__jit_f_%016llx(ctx,JS_UNDEFINED,%d,_ca%d,_dc,_dv);\n"
+                            "      } else {\n"
+                            "        _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n      }\n",
+                            (unsigned long long)jit_callee_hash, nargs, pc,
+                            nargs, pc);
+                    else
+                        jit_buf_printf(cb,
+                            "        _r=__jit_f_%016llx(ctx,JS_UNDEFINED,0,NULL,_dc,_dv);\n"
+                            "      } else {\n"
+                            "        _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n      }\n",
+                            (unsigned long long)jit_callee_hash);
                 } else {
+                    /* Regular call via runtime dispatch */
                     if (nargs > 0)
                         jit_buf_printf(cb,
                             "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n",
@@ -3512,6 +3592,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
             *unsupported_out = 1;
             free(gen_st);
+            free(gen_hsh);
             return -1;
         }
 
@@ -3519,8 +3600,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * Comparison opcodes (OP_lt..OP_strict_neq) already updated gen_st
          * inline above.  All other opcodes are handled here.              */
         {
-            uint8_t _gs_push = 255; /* 255 = no push */
-            int     _gs_drop = 0;
+            uint8_t  _gs_push = 255; /* 255 = no push */
+            int      _gs_drop = 0;
+            uint64_t _gs_hash = 0;   /* P10.3: bc_hash for JIT_T_JIT_FUNC slots */
 
             switch (op) {
             /* --- Numeric constant pushes → INT (all are integer literals) --- */
@@ -3553,13 +3635,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_get_arg2: case OP_get_arg3:
                 _gs_push = JIT_T_JSVAL; break;
 
-            /* --- get_var: SELF_FUNC if loading the function's own name, else JSVAL.
-             * P8.2: marks the stack slot so OP_call* can emit a direct C call. --- */
+            /* --- get_var: SELF_FUNC if loading the function's own name,
+             * JIT_FUNC if loading a known JIT callee, else JSVAL.
+             * P8.2: marks the stack slot so OP_call* can emit a direct C call.
+             * P10.3: marks the slot for known JIT callees; hash stored in gen_hsh. --- */
             case OP_get_var: {
                 int _vi = (int)bc_u16(&bc[pc+1]);
                 JSAtom _va = js_jit_fb_get_closure_var_atom(b, _vi);
-                _gs_push = (self_func_atom != JS_ATOM_NULL && _va == self_func_atom)
-                           ? JIT_T_SELF_FUNC : JIT_T_JSVAL;
+                if (self_func_atom != JS_ATOM_NULL && _va == self_func_atom) {
+                    _gs_push = JIT_T_SELF_FUNC;
+                } else if (var_jit_hash && _vi < p103_cvc_gb && var_jit_hash[_vi]) {
+                    _gs_push = JIT_T_JIT_FUNC;
+                    _gs_hash = var_jit_hash[_vi];
+                } else {
+                    _gs_push = JIT_T_JSVAL;
+                }
                 break;
             }
             /* get_var_ref* also push JSVAL (never self-func) */
@@ -3673,11 +3763,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
             /* Apply drop then push */
             if (_gs_drop > 0) { gen_sp -= _gs_drop; if (gen_sp < 0) gen_sp = 0; }
-            if (_gs_push != 255 && gen_sp < gen_stk_cap)
-                gen_st[gen_sp++] = _gs_push;
+            if (_gs_push != 255 && gen_sp < gen_stk_cap) {
+                gen_st[gen_sp]  = _gs_push;
+                gen_hsh[gen_sp] = _gs_hash;  /* P10.3: store callee hash (0 if not JIT_T_JIT_FUNC) */
+                gen_sp++;
+            }
             /* post_inc/dec: push a second time (original + result both go on stack) */
-            if ((op == OP_post_inc || op == OP_post_dec) && gen_sp < gen_stk_cap)
-                gen_st[gen_sp++] = _gs_push;
+            if ((op == OP_post_inc || op == OP_post_dec) && gen_sp < gen_stk_cap) {
+                gen_st[gen_sp] = _gs_push;
+                gen_hsh[gen_sp] = 0;   /* post-result is never a JIT func */
+                gen_sp++;
+            }
         }
 
         pc += sz;
@@ -3693,6 +3789,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef ANAME
 
     free(gen_st);
+    free(gen_hsh);
     return 0;
 }
 
@@ -3704,7 +3801,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
                         char *fname_out, size_t fname_sz, int *unsupported,
                         const char *js_func_name, uint64_t bc_hash,
-                        JSRuntime *rt)
+                        JSRuntime *rt, const uint64_t *var_jit_hash)
 {
     *unsupported = 0;
 
@@ -3752,7 +3849,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
-                 bc_hash, varnames) < 0) {
+                 bc_hash, varnames, var_jit_hash) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

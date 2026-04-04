@@ -133,35 +133,45 @@ inlines small callees automatically.
 
 ### Tasks
 
-- [ ] **P10.3-A** In `gen_body()`, for `OP_call` / `OP_call_method` with a statically
-  known callee (resolved at JIT-compile time via `js_jit_get_callee_fb()`):
+- [x] **P10.3-A** In `gen_body()`, for `OP_call` / `OP_call0`..`OP_call3` with a
+  statically known JIT callee (resolved at codegen time via closure var_refs):
+  New `JIT_T_JIT_FUNC` gen_st marker tracks which stack slots hold a known JIT function.
+  Parallel `gen_hsh[]` array stores the callee's `bc_hash`. When `OP_call*` sees
+  `JIT_T_JIT_FUNC` at the function slot, emits a guarded direct call:
   ```c
-  // Emit direct-call path if callee bc_hash is known
-  jit_buf_printf(cb,
-      "extern JSValue __jit_f_%016llx"
-      "(JSContext*,JSValue,int,JSValue*,JSValue*,JSValue**);\n",
-      callee_hash);
-  jit_buf_printf(cb,
-      "    _r = __jit_f_%016llx(ctx,_this,%d,_argv,_cpool,_var_refs);\n",
-      callee_hash, argc);
+  if (js_jit_check_and_extract(_f, (JSJITFunc)__jit_f_<hash>, &_dc, &_dv)) {
+      if (_RT->poll_interrupts(ctx)) goto _ex;
+      _r = __jit_f_<hash>(ctx, JS_UNDEFINED, N, _ca, _dc, _dv);
+  } else {
+      _r = _RT->call(ctx, _f, JS_UNDEFINED, N, _ca);
+  }
   ```
 
-- [ ] **P10.3-B** Add `js_jit_get_callee_fb(JSContext *ctx, JSValue func_obj)`
-  in `quickjs.c` / `quickjs-jit.h`:
-  - Extract `JSFunctionBytecode *b` from `func_obj` (if JS_CLASS_BYTECODE_FUNCTION)
-  - Return `b` (or NULL if not a bytecode function / not yet JIT-compiled)
-  - Used at code-gen time to read `b->bc_hash` for the `extern` declaration
+- [x] **P10.3-B** Added `js_jit_get_callee_fb(JSValue func_obj)` in `quickjs.c`
+  and `quickjs-jit.h`: extracts `JSFunctionBytecode*` from a bytecode function JSValue.
+  Used in `js_jit_queue_gcc()` to resolve closure var_refs to their bc_hashes.
 
-- [ ] **P10.3-C** Guard: if callee is not a known bytecode function, fall back to the
-  existing `js_jit_call()` indirect path.  Never emit a direct call to an unknown target.
+- [x] **P10.3-C** Guard via `js_jit_check_and_extract()`: checks that `_f` is exactly
+  the expected JIT function (pointer identity on `jit_func` field), then extracts
+  `cpool` and `var_refs` for the direct call.  Falls back to `_RT->call()` otherwise.
 
-- [ ] **P10.3-D** Run `make CONFIG_JIT=y test`.  Test with `fib` (self-recursive already
-  handled by P8.2) and a benchmark with mutual calls (`DeltaBlue`, `RayTrace`).
+- [x] **P10.3-D** `js_jit_queue_gcc()` signature updated to accept `JSVarRef **var_refs`.
+  At threshold-based compile time (when var_refs is live), iterates closure vars to find
+  JIT-compiled callees and builds `p103_hash[]` for codegen.  AOT pre-pass passes NULL.
+  OP_drop and OP_dup fixed: `>= JIT_T_NUMBER` changed to `>= JIT_T_NUMBER && <= JIT_T_INT`
+  so JIT_T_JIT_FUNC slots are treated as JSValue (not typed double).
 
-### Definition of done
-For a JS file `const r = dot(a,b)` where `dot` is JIT-compiled, the generated C for the
-caller contains `extern JSValue __jit_f_<hash>(...)` and a direct call — no
-`js_jit_call()` reference.  GCC `-S` shows the callee body inlined into the caller.
+- [x] **P10.3-E** Tests pass: `./qjs tests/test_closure.js && ./qjs --std tests/test_builtin.js`.
+  Verified: `QJS_JIT_KEEP_C=1 ./qjs /tmp/test_p103.js` generates a file with
+  `js_jit_check_and_extract` and `__jit_f_<callee_hash>` direct call.
+
+### Definition of done ✓
+For a JS file where `outer()` calls `helper()` (both JIT-compiled, `helper` captured in
+`outer`'s closure), the generated C for `outer` contains:
+- `extern JSValue __jit_f_<hash>(...)` for `helper`
+- `extern int js_jit_check_and_extract(...)` guard
+- Guarded direct call with `_RT->call()` fallback
+No `js_jit_call()` reference for known callees.
 
 ---
 

@@ -15652,6 +15652,32 @@ int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
 JSValue *js_jit_var_ref_value(JSVarRef *ref) { return ref->pvalue; }
 
+/* P10.3: extract JSFunctionBytecode from a JSValue (code-gen time use).
+ * Returns NULL if the value is not a bytecode function object. */
+JSFunctionBytecode *js_jit_get_callee_fb(JSValue func)
+{
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return NULL;
+    JSObject *p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) return NULL;
+    return p->u.func.function_bytecode;
+}
+
+/* P10.3: guard check + cpool/var_refs extraction for generated direct calls.
+ * Returns 1 if func is the expected JIT function and fills *cpool_out and *var_refs_out. */
+int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
+                              JSValue **cpool_out, JSVarRef ***var_refs_out)
+{
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return 0;
+    JSObject *p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) return 0;
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+    if (jf != expected) return 0;
+    *cpool_out    = b->cpool;
+    *var_refs_out = p->u.func.var_refs;
+    return 1;
+}
+
 /* Bytecode/metadata accessors for the code generator (Phase 2+) */
 const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len)
 {
@@ -16096,7 +16122,7 @@ void js_jit_compile_all(JSContext *ctx, JSFunctionBytecode *b)
     if (!b) return;
     if (js_jit_is_eligible(b) && !js_jit_fb_jit_no_compile(b) &&
         js_jit_fb_get_func(b) == NULL) {
-        js_jit_queue_gcc(ctx, b);
+        js_jit_queue_gcc(ctx, b, NULL);  /* no var_refs in AOT pre-pass */
     }
     for (i = 0; i < b->cpool_count; i++) {
         if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
@@ -18040,7 +18066,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         if (!b->jit_no_compile) {
             int cnt = js_jit_fb_inc_count(b);
             if (unlikely(cnt == JIT_THRESHOLD_GCC)) {
-                js_jit_queue_gcc(caller_ctx, b);
+                js_jit_queue_gcc(caller_ctx, b, var_refs);
             }
         }
     }

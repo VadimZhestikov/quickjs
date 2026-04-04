@@ -364,9 +364,13 @@ void js_jit_free(void);
  * Generates C source synchronously, then hands the job to the worker thread.
  * Returns immediately; jit_func is installed atomically when GCC finishes.
  *
+ * var_refs — the function's own closure variable refs (from p->u.func.var_refs
+ * at the call site).  Used by P10.3 to detect known JIT callees at codegen
+ * time.  Pass NULL in AOT pre-pass (no live var_refs available).
+ *
  * Called from JS_CallInternal when b->jit_call_count reaches JIT_THRESHOLD_GCC.
  */
-void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b);
+void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs);
 
 /*
  * js_jit_free_bytecode() — cleanup hook, called from free_function_bytecode().
@@ -426,6 +430,24 @@ void js_jit_set_link_mode(int active);
  * Requires --jit-warmup to have been run first to populate the .c cache files.
  */
 int js_jit_link(void);
+
+/*
+ * js_jit_get_callee_fb() — extract JSFunctionBytecode* from a JSValue.
+ * P10.3: used at codegen time to check whether a closure variable holds a
+ * bytecode function (so its bc_hash can be recorded for direct call emit).
+ * Returns NULL if the value is not a JS_CLASS_BYTECODE_FUNCTION object.
+ */
+JSFunctionBytecode *js_jit_get_callee_fb(JSValue func);
+
+/*
+ * js_jit_check_and_extract() — guard check for P10.3 generated direct calls.
+ * At runtime, verifies that 'func' is exactly the expected JIT function
+ * (pointer identity on the jit_func field), then extracts cpool and var_refs.
+ * Returns 1 if the guard passes and fills *cpool_out / *var_refs_out.
+ * Returns 0 if the guard fails (callee must fall back to _RT->call).
+ */
+int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
+                              JSValue **cpool_out, JSVarRef ***var_refs_out);
 
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */
