@@ -45,6 +45,9 @@
 #include "quickjs-jit.h"
 #include "quickjs-opcode.h"
 
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x)  _STRINGIFY(x)
+
 /* Atom enum — needed to get numeric values of predefined atoms (e.g. JS_ATOM_length)
  * without pulling in the full quickjs.c internal headers.
  * IMPORTANT: must match the runtime enum in quickjs.c exactly.
@@ -3144,7 +3147,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _o=_tsv%d, _r;\n"
-                "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d)))\n"
                 "          _r=js_jit_ic_read(ctx,_o,_ic%d.slot);\n"
                 "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
@@ -3158,7 +3161,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
-                "      if (js_likely(js_jit_ic_check(_tsv%d,&_ic%d)))\n"
+                "      if (js_likely(JIT_IC_CHECK(_tsv%d,&_ic%d)))\n"
                 "          _r=js_jit_ic_read(ctx,_tsv%d,_ic%d.slot);\n"
                 "      else { _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
                 "             js_jit_ic_fill_get(ctx,_tsv%d,(JSAtom)%uu,&_ic%d); }\n"
@@ -3172,7 +3175,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
-                "      if (js_likely(js_jit_ic_check(_o,&_ic%d)))\n"
+                "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d)))\n"
                 "          _ret=js_jit_ic_write(ctx,_o,_v,_ic%d.slot);\n"
                 "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
                 "             js_jit_ic_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
@@ -3867,6 +3870,69 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 }
 
 /* -----------------------------------------------------------------------
+ * P10.5 — LTO IC object: compile quickjs.c once with -flto -fvisibility=hidden
+ *
+ * When added to the --jit-link GCC command, GCC LTO can inline js_jit_ic_check
+ * (and js_jit_ic_read/write, js_jit_array_get/set) directly into the JIT
+ * functions, eliminating the function-call overhead on every property access.
+ *
+ * The compiled .o is cached in <cache_dir>/qjs_ic_<mtime>.o so it is only
+ * rebuilt when quickjs.c changes.  Returns malloc'd path or NULL if
+ * quickjs.c is not found / compilation fails (P10.4 behaviour is preserved).
+ * ----------------------------------------------------------------------- */
+#ifdef JIT_INCLUDE_DIR
+static char *jit_ensure_lto_obj(void)
+{
+    char src[512];
+    snprintf(src, sizeof(src), "%s/quickjs.c", JIT_INCLUDE_DIR);
+    struct stat st;
+    if (stat(src, &st) != 0) return NULL;  /* no source — skip P10.5 */
+
+    /* Cache key: quickjs.c last-modified time (seconds) */
+    char obj[620];
+    snprintf(obj, sizeof(obj), "%s/qjs_ic_%016llx.o",
+             jit_cache_dir, (unsigned long long)(uint64_t)st.st_mtime);
+    if (access(obj, R_OK) == 0) return strdup(obj);  /* cache hit */
+
+    fprintf(stderr, "[JIT] P10.5: compiling quickjs.c for LTO IC inlining...\n");
+
+    /* Compile quickjs.c with -flto -fvisibility=hidden so GCC can inline all
+     * IC helpers into the JIT functions at --jit-link time.  Hidden visibility
+     * keeps quickjs symbols local to combined.so (no conflict with main binary). */
+    char def_ver[]    = "-DCONFIG_VERSION=\"" CONFIG_VERSION "\"";
+    char def_thresh[] = "-DJIT_THRESHOLD_GCC=" STRINGIFY(JIT_THRESHOLD_GCC);
+    char *av[] = {
+        "gcc",
+        "-O2", "-flto", "-fPIC", "-fvisibility=hidden",
+        "-Wno-array-bounds", "-Wno-format-truncation", "-fwrapv",
+        "-D_GNU_SOURCE", "-DHAVE_CLOSEFROM", "-DCONFIG_JIT",
+        def_ver, def_thresh,
+        "-I", JIT_INCLUDE_DIR,
+        "-c", "-o", obj, src,
+        NULL
+    };
+
+    pid_t pid = fork();
+    if (pid < 0) return NULL;
+    if (pid == 0) {
+        int fd = open("/tmp/qjs_jit_ic.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execvp("gcc", av);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "[JIT] P10.5: quickjs.c LTO compile failed "
+                "(see /tmp/qjs_jit_ic.log); continuing without IC inlining\n");
+        return NULL;
+    }
+    fprintf(stderr, "[JIT] P10.5: LTO IC object ready → %s\n", obj);
+    return strdup(obj);
+}
+#endif /* JIT_INCLUDE_DIR */
+
+/* -----------------------------------------------------------------------
  * P10.2 — js_jit_link(): combine all per-function .c files into one .so
  *
  * Deduplicates the recorded hash list, resolves .c paths from cache, and
@@ -3982,14 +4048,21 @@ int js_jit_link(void)
     char out_path[620];
     snprintf(out_path, sizeof(out_path), "%s/combined.so", jit_cache_dir);
 
-    /* Build argv for GCC (+1 for optional manifest file, +16 for fixed args) */
-    int max_argc = n_paths + 20;
+    /* P10.5: compile quickjs.c to LTO object for IC inlining (cached) */
+#ifdef JIT_INCLUDE_DIR
+    char *lto_obj = jit_ensure_lto_obj();
+#else
+    char *lto_obj = NULL;
+#endif
+
+    /* Build argv for GCC (+1 for optional manifest file, +1 for lto_obj, +16 for fixed args) */
+    int max_argc = n_paths + 24;
     char **argv = malloc((size_t)max_argc * sizeof(char *));
     if (!argv) goto oom;
 
     int argc = 0;
     argv[argc++] = "gcc";
-    argv[argc++] = "-O2";
+    argv[argc++] = lto_obj ? "-O3" : "-O2";  /* P10.5: -O3 enables aggressive inlining */
     argv[argc++] = "-flto";
     argv[argc++] = "-shared";
     argv[argc++] = "-fPIC";
@@ -4002,6 +4075,8 @@ int js_jit_link(void)
         argv[argc++] = c_paths[i];
     if (mfst_path)
         argv[argc++] = mfst_path;
+    if (lto_obj)
+        argv[argc++] = lto_obj;    /* P10.5: quickjs.c LTO object for IC inlining */
     argv[argc++] = "-o";
     argv[argc++] = out_path;
     argv[argc]   = NULL;
@@ -4022,7 +4097,9 @@ int js_jit_link(void)
     waitpid(pid, &status, 0);
     int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
 
+    int had_lto = (lto_obj != NULL);
     free(argv);
+    free(lto_obj);
     if (mfst_path) { unlink(mfst_path); free(mfst_path); }
     free(c_hashes);
     for (int i = 0; i < n_paths; i++) free(c_paths[i]);
@@ -4033,13 +4110,14 @@ int js_jit_link(void)
                 "(see /tmp/qjs_jit_link.log)\n");
         return -1;
     }
-    fprintf(stderr, "[JIT] --jit-link: done (%d functions combined)\n",
-            n_paths);
+    fprintf(stderr, "[JIT] --jit-link: done (%d functions combined%s)\n",
+            n_paths, had_lto ? ", with LTO IC inlining" : "");
     return n_paths;
 
 oom:
 fail:
     free(argv);
+    free(lto_obj);
     if (mfst_path) { unlink(mfst_path); free(mfst_path); }
     free(c_hashes);
     for (int i = 0; i < n_paths; i++) free(c_paths[i]);

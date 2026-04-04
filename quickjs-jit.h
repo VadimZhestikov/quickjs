@@ -264,8 +264,46 @@ typedef struct {
 } JSJITICEntry;
 
 /*
- * js_jit_ic_check: returns non-zero iff obj is an OBJECT whose shape
- * matches ic->shape (fast inline shape guard).
+ * JIT_IC_MEGAMORPHIC: sentinel stored in JSJITICEntry.shape when a callsite
+ * has seen more than one shape.  Always causes a miss.
+ */
+#define JIT_IC_MEGAMORPHIC ((void *)(uintptr_t)1)
+
+/*
+ * Struct byte offsets for the inline IC check (JIT_IC_CHECK macro below).
+ * Verified by _Static_assert in quickjs.c.  Do NOT change without updating
+ * both sets together.
+ *   JSObject.shape        = byte 32
+ *   JSShape.prop_count    = byte 40
+ *   JSShape.prop[]        = byte 64  (flexible array of JSShapeProperty)
+ *   JSShapeProperty.atom  = byte  4  (after 4-byte bitfield word)
+ *   sizeof(JSShapeProperty) = 8
+ */
+#define JIT_OBJIC_SHAPE_OFF       32
+#define JIT_SHAPEIC_PROPCOUNT_OFF 40
+#define JIT_SHAPEIC_PROP_OFF      64
+#define JIT_SHAPEIC_PROPSIZE       8
+#define JIT_SHAPEIC_ATOM_OFF       4
+
+/*
+ * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard.
+ * Equivalent to js_jit_ic_check() but expands inline in JIT-generated code
+ * so the compiler can see the body and optimize across the IC boundary.
+ *
+ * Safety: obj and ic must be simple lvalues (evaluated at most twice).
+ */
+#define JIT_IC_CHECK(obj, ic) \
+    ((ic)->shape != NULL && \
+     (ic)->shape != JIT_IC_MEGAMORPHIC && \
+     JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
+     *(void **)((char*)JS_VALUE_GET_OBJ(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
+     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
+     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
+                        (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)
+
+/*
+ * js_jit_ic_check: same logic as JIT_IC_CHECK but as a callable function.
+ * Used by code that cannot inline the macro (e.g. debug helpers).
  */
 int js_jit_ic_check(JSValue obj, const JSJITICEntry *ic);
 

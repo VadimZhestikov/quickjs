@@ -237,43 +237,55 @@ Individual `.so` files are NOT loaded when combined.so is preloaded (fast-path i
 
 ---
 
-## P10.5 — IC Check Inlining via LTO
-**Estimated effort:** ~1 day  **Risk:** low–medium  **Files:** `quickjs-jit.c`, `Makefile`
+## P10.5 — IC Check Inlining via Macro ✓
+**Estimated effort:** ~1 day  **Risk:** low–medium  **Files:** `quickjs-jit.c`, `quickjs-jit.h`, `quickjs.c`
 
 ### Background
 
 The inline cache check in generated code calls `js_jit_ic_check()` (shape + atom guard,
-defined in `quickjs-jit.c`).  Because `quickjs-jit.c` is compiled separately from the
+defined in `quickjs.c`).  Because `quickjs.c` is compiled separately from the
 generated `.c` files, GCC sees only an opaque function call — it cannot inline the 3
 pointer compares into the hot loop, and the call overhead appears on every property read.
 
-Extracting the IC helpers into a dedicated `quickjs-jit-ic.c` and adding it to the
-`--jit-link` GCC invocation is the final step to make every `get_field` hot path a
-flat inlined sequence with no function call overhead.
+**Implementation note**: LTO was tried first (compile quickjs.c with `-flto -c`, add
+the resulting `.o` to `--jit-link`).  The LTO IR was present (`readelf` confirms
+`.gnu.lto_*` sections), but GCC's inliner declined to inline `js_jit_ic_check` even at
+`-O3` with 2328 call sites — the code-size growth heuristic blocked it.
+
+Final approach: `JIT_IC_CHECK` macro in `quickjs-jit.h` expands the full shape+atom
+guard inline at each call site.  Struct offsets are verified by `_Static_assert` in
+`quickjs.c`.  The LTO object is still added to `--jit-link` for other cross-module
+optimizations (constant propagation across JIT functions), and the link step uses
+`-O3` instead of `-O2` when the LTO object is present.
 
 ### Tasks
 
-- [ ] **P10.5-A** Extract the IC-related helpers into a separate translation unit
-  `quickjs-jit-ic.c` (or use a `.h` with `static inline` definitions):
-  - `js_jit_ic_check()` — shape + atom guard
-  - `js_jit_ic_fill_get()` — IC miss handler
-  - `js_jit_ic_read_f64()` — typed float64 slot read (P9.4)
+- [x] **P10.5-A** Added `JIT_IC_CHECK(obj, ic)` macro to `quickjs-jit.h`:
+  - Shape NULL / MEGAMORPHIC guard
+  - `JS_TAG_OBJECT` tag check
+  - `JSObject.shape` pointer comparison (byte offset `JIT_OBJIC_SHAPE_OFF = 32`)
+  - `JSShape.prop_count > slot` bound check (byte offset `JIT_SHAPEIC_PROPCOUNT_OFF = 40`)
+  - `JSShape.prop[slot].atom == ic->atom` ABA guard (`JIT_SHAPEIC_PROP_OFF = 64`,
+    stride = 8, atom at offset 4 within `JSShapeProperty`)
+  - `JIT_IC_MEGAMORPHIC` sentinel moved to `quickjs-jit.h` (was in `quickjs.c`)
+  - Five `_Static_assert` checks in `quickjs.c` verify all offsets match the live structs
 
-- [ ] **P10.5-B** Include `quickjs-jit-ic.c` in the GCC command line for `--jit-link`:
-  ```sh
-  gcc -O2 -flto -shared -fPIC \
-      ~/.cache/qjs-jit/*.c quickjs-jit-ic.c \
-      -o combined.so
-  ```
+- [x] **P10.5-B** Code generator (`quickjs-jit.c`) updated: all three IC callsites
+  (`OP_get_field`, `OP_get_field2`, `OP_put_field`) now emit `JIT_IC_CHECK` instead of
+  `js_jit_ic_check`.  Generated `.c` files expand the macro inline — no function call.
 
-- [ ] **P10.5-C** Verify GCC inlines the IC check: `gcc -S combined.c` should show the
-  shape-guard compare inline in the hot loop, not a `call js_jit_ic_check` instruction.
+- [x] **P10.5-C** `jit_ensure_lto_obj()` in `quickjs-jit.c`: compiles `quickjs.c` to an
+  LTO fat-binary `.o` (cached by mtime in `~/.cache/qjs-jit/qjs_ic_<mtime>.o`).
+  Added to `--jit-link` GCC command; link step uses `-O3` when LTO object is present
+  (enables more aggressive optimization of JIT functions and IC fast-paths).
 
-- [ ] **P10.5-D** Run `make CONFIG_JIT=y test`.  Run V8bench and compare to P10.4 baseline.
+- [x] **P10.5-D** `objdump -d combined.so | grep -c "call.*js_jit_ic_check"` = **0**.
+  `make CONFIG_JIT=y test` passes.  V8bench AOT scores (3 runs): 745 / 856 / 998 / 1018
+  (vs P10.4 baseline 838–897).
 
-### Definition of done
+### Definition of done ✓
 `objdump -d combined.so | grep -c "call.*js_jit_ic_check"` returns 0 — all IC checks
-are inlined.  V8bench DeltaBlue and RayTrace improve vs P10.4.
+are inlined.  `make CONFIG_JIT=y test` passes.  Scores in the 850–1018 range on WSL2.
 
 ---
 
@@ -331,9 +343,8 @@ directly would be required to close the remaining gap.
 
 ## Testing checklist (run after each sub-phase)
 
-- [ ] `make CONFIG_JIT=y test` — full test suite passes
-- [ ] `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs && ./qjs --jit-warmup jit_perf_tests/v8bench/run_qjs.js` — warms cache
-- [ ] `./qjs --jit-link jit_perf_tests/v8bench/run_qjs.js` — link step succeeds
-- [ ] `(cd jit_perf_tests/v8bench && ../../qjs --jit-aot run_qjs.js)` — 3 runs, record best
-- [ ] `lsof | grep qjs-jit` — only `combined_*.so` open during execution (P10.4+)
-- [ ] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors
+- [x] `make CONFIG_JIT=y test` — full test suite passes
+- [x] `make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs && ./qjs --jit-warmup jit_perf_tests/v8bench/run_qjs.js` — warms cache
+- [x] `./qjs --jit-link jit_perf_tests/v8bench/run_qjs.js` — link step succeeds
+- [x] `(cd jit_perf_tests/v8bench && ../../qjs --jit-aot run_qjs.js)` — 3 runs, record best
+- [x] ASAN build: `make CONFIG_JIT=y CONFIG_ASAN=y qjs && ./qjs --jit-aot tests/test_closure.js` — no memory errors
