@@ -1284,7 +1284,12 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
 
     /* P10.4: if combined.so is already open, check if this function is in the
      * manifest.  If so, install it from there and skip loading the individual
-     * .so — avoids opening (and immediately closing) 500+ individual files. */
+     * .so — avoids opening (and immediately closing) 500+ individual files.
+     * If combined.so is open but the hash is NOT in the manifest, skip GCC
+     * entirely: the function is absent from the combined library intentionally
+     * (e.g. it had unsupported opcodes during the --jit-warmup run) and we
+     * should not spawn a background GCC process during a production --jit-aot
+     * run.  The function will be interpreted as usual. */
     if (jit_combined_handle && jit_combined_manifest) {
         for (int _mi = 0; _mi < jit_combined_count; _mi++) {
             if (jit_combined_manifest[_mi].bc_hash == bc_hash) {
@@ -1292,6 +1297,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
                 return;
             }
         }
+        /* Not in combined.so — do not invoke GCC; fall back to interpreter. */
+        return;
     }
 
     /* Phase 7.4: cache hit — load pre-compiled .so without running GCC */
