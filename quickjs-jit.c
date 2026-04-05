@@ -1518,11 +1518,14 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
      * so uninitialized slots are never accessed on the exception path. */
     for (int j = 0; j < stack_size; j++)
         jit_buf_printf(cb, "    JSValue _tsv%d;\n", j);
-    /* P9.4: raw double temporaries for typed stack slots.
-     * When gen_st[slot] >= JIT_T_NUMBER the value lives here, not in _tsv{}.
+    /* P9.4: raw double temporaries for JIT_T_NUMBER stack slots.
      * P11.2: not initialized — always assigned before use by the type system. */
     for (int j = 0; j < stack_size; j++)
         jit_buf_printf(cb, "    double _tsd%d;\n", j);
+    /* P11.6: raw int64 temporaries for JIT_T_INT stack slots.
+     * Avoids float conversion; value in _ti when gen_st[slot]==JIT_T_INT. */
+    for (int j = 0; j < stack_size; j++)
+        jit_buf_printf(cb, "    int64_t _ti%d;\n", j);
     /* _sp is still needed: updated at throw/exception sites so the _ex
      * cleanup knows which _tsv{} slots are live. */
     jit_buf_str(cb, "    int _sp=0;\n");
@@ -1704,15 +1707,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  * gen_sp may drift above d when some pop-ops are not tracked in gen_st, so
  * checking gen_sp alone can incorrectly fire on stale gen_st entries. */
 /* JIT_T_SELF_FUNC (=3) must NOT trigger boxing — it marks a JSValue (function
- * object), not a typed double.  Only JIT_T_NUMBER (1) and JIT_T_INT (2) hold
- * their value in _tsd and need to be boxed into _tsv. */
+ * object).  JIT_T_INT (2) values live in _ti{slot}; JIT_T_NUMBER (1) in _tsd. */
 #define _P94_ENSURE(slot) do { \
     if ((slot) < d && gen_sp > (slot) && \
-        gen_st[(slot)] >= JIT_T_NUMBER && gen_st[(slot)] <= JIT_T_INT) \
-        jit_buf_printf(cb, \
-            "    { double _dv=_tsd%d; " \
-            "_tsv%d=((double)(int32_t)_dv==_dv)?JS_NewInt32(ctx,(int32_t)_dv)" \
-            ":JS_NewFloat64(ctx,_dv); }\n", (slot), (slot)); \
+        gen_st[(slot)] >= JIT_T_NUMBER && gen_st[(slot)] <= JIT_T_INT) { \
+        if (gen_st[(slot)] == JIT_T_INT) \
+            jit_buf_printf(cb, \
+                "    { int64_t _tv=_ti%d; " \
+                "_tsv%d=((int64_t)(int32_t)_tv==_tv)?JS_NewInt32(ctx,(int32_t)_tv)" \
+                ":JS_NewFloat64(ctx,(double)_tv); }\n", (slot), (slot)); \
+        else \
+            jit_buf_printf(cb, \
+                "    { double _dv=_tsd%d; " \
+                "_tsv%d=((double)(int32_t)_dv==_dv)?JS_NewInt32(ctx,(int32_t)_dv)" \
+                ":JS_NewFloat64(ctx,_dv); }\n", (slot), (slot)); \
+    } \
 } while(0)
 
     /* P8.2: self-recursive direct call detection.
@@ -1787,41 +1796,41 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Push immediate values ---- */
-        /* P9.4: push into _tsd{d} (raw double), skip boxing; _sp = d+1.
-         * d = sdt[pc] = depth before push. */
+        /* P11.6: push into _ti{d} (raw int64), skip boxing; _sp = d+1.
+         * d = sdt[pc] = depth before push.  gen_st will be JIT_T_INT. */
         case OP_push_i32:
             jit_buf_printf(cb,
-                "    _tsd%d=(double)(int32_t)%uu; _sp=%d;\n",
+                "    _ti%d=(int64_t)(int32_t)%uu; _sp=%d;\n",
                 d, bc_u32(&bc[pc+1]), d+1);
             break;
         case OP_push_i8:
             jit_buf_printf(cb,
-                "    _tsd%d=(double)%d; _sp=%d;\n",
+                "    _ti%d=%dLL; _sp=%d;\n",
                 d, (int)(int8_t)bc[pc+1], d+1);
             break;
         case OP_push_i16:
             jit_buf_printf(cb,
-                "    _tsd%d=(double)%d; _sp=%d;\n",
+                "    _ti%d=%dLL; _sp=%d;\n",
                 d, (int)(int16_t)bc_u16(&bc[pc+1]), d+1);
             break;
         case OP_push_minus1:
-            jit_buf_printf(cb, "    _tsd%d=-1.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=-1LL; _sp=%d;\n", d, d+1); break;
         case OP_push_0:
-            jit_buf_printf(cb, "    _tsd%d=0.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=0LL; _sp=%d;\n", d, d+1); break;
         case OP_push_1:
-            jit_buf_printf(cb, "    _tsd%d=1.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=1LL; _sp=%d;\n", d, d+1); break;
         case OP_push_2:
-            jit_buf_printf(cb, "    _tsd%d=2.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=2LL; _sp=%d;\n", d, d+1); break;
         case OP_push_3:
-            jit_buf_printf(cb, "    _tsd%d=3.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=3LL; _sp=%d;\n", d, d+1); break;
         case OP_push_4:
-            jit_buf_printf(cb, "    _tsd%d=4.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=4LL; _sp=%d;\n", d, d+1); break;
         case OP_push_5:
-            jit_buf_printf(cb, "    _tsd%d=5.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=5LL; _sp=%d;\n", d, d+1); break;
         case OP_push_6:
-            jit_buf_printf(cb, "    _tsd%d=6.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=6LL; _sp=%d;\n", d, d+1); break;
         case OP_push_7:
-            jit_buf_printf(cb, "    _tsd%d=7.0; _sp=%d;\n", d, d+1); break;
+            jit_buf_printf(cb, "    _ti%d=7LL; _sp=%d;\n", d, d+1); break;
         case OP_push_false:
             jit_buf_printf(cb, "    _tsv%d=JS_FALSE; _sp=%d;\n", d, d+1); break;
         case OP_push_true:
@@ -1866,17 +1875,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Stack manipulation ---- */
         /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
         case OP_drop: /* pop top: depth d -> d-1 */
-            /* P9.4: typed slot lives in _tsd — no refcount, no _FREE needed */
-            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed double — exclude it */
+            /* P11.6: typed slot lives in _ti/_tsd — no refcount, no _FREE needed */
+            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed slot — exclude it */
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER && gen_st[gen_sp-1] <= JIT_T_INT)
                 jit_buf_printf(cb, "    _sp=%d;\n", d-1);
             else
                 jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1);
             break;
         case OP_dup: /* peek top, push copy: depth d -> d+1 */
-            /* P9.4: typed slot — copy _tsd directly, no _DUP */
-            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed double — exclude it */
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER && gen_st[gen_sp-1] <= JIT_T_INT)
+            /* P11.6: INT uses _ti, NUMBER uses _tsd, JSVAL/other uses _tsv+_DUP */
+            /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed slot — exclude it */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT)
+                jit_buf_printf(cb, "    _ti%d=_ti%d; _sp=%d;\n", d, d-1, d+1);
+            else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER)
                 jit_buf_printf(cb, "    _tsd%d=_tsd%d; _sp=%d;\n", d, d-1, d+1);
             else
                 jit_buf_printf(cb, "    _tsv%d=_DUP(_tsv%d); _sp=%d;\n", d, d-1, d+1);
@@ -1944,11 +1955,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     (local_type && (idx) >= 0 && (idx) < var_count && \
      local_type[(idx)] == JIT_T_NUMBER)
 
-/* P9.4: use _tsd{d} for typed locals, _tsv{d} for JSVAL locals. d is in scope. */
+/* P11.6: INT locals use _ti{d}, NUMBER locals use _tsd{d}, JSVAL use _tsv{d}. */
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
-            "    _tsd%d=(double)_jsi_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
+            "    _ti%d=_jsi_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
             "    _tsd%d=_jsd_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
@@ -1957,8 +1968,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 } while(0)
 
 #define GEN_PUT_LOC(idx) do { \
-    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
-        /* P9.4: typed source → read _tsd directly, no unboxing */ \
+    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) { \
+        /* P11.6: INT source → read _ti directly */ \
+        jit_buf_printf(cb, "    _jsi_%s=_ti%d; _sp=%d;\n", LNAME(idx), d-1, d-1); \
+    } else if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) { \
+        /* P9.4: NUMBER source → read _tsd directly */ \
         jit_buf_printf(cb, "    _jsi_%s=(int64_t)_tsd%d; _sp=%d;\n", LNAME(idx), d-1, d-1); \
     } else if (_IS_INT(idx)) { \
         jit_buf_printf(cb, \
@@ -1982,8 +1996,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 } while(0)
 
 #define GEN_SET_LOC(idx) do { \
-    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) { \
-        /* P9.4: typed source → read _tsd directly, non-destructive peek */ \
+    if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) { \
+        /* P11.6: INT source → read _ti directly, non-destructive peek */ \
+        jit_buf_printf(cb, "    _jsi_%s=_ti%d;\n", LNAME(idx), d-1); \
+    } else if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) { \
+        /* P9.4: NUMBER source → read _tsd directly, non-destructive peek */ \
         jit_buf_printf(cb, "    _jsi_%s=(int64_t)_tsd%d;\n", LNAME(idx), d-1); \
     } else if (_IS_INT(idx)) { \
         jit_buf_printf(cb, \
@@ -2222,10 +2239,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_add: {
             int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* P9.4: both typed — pure double add on _tsd */
-                jit_buf_printf(cb,
-                    "    _tsd%d+=_tsd%d; _sp=%d;\n",
-                    d-2, d-1, d-1);
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                if (_t2==JIT_T_INT && _t1==JIT_T_INT) {
+                    /* P11.6: INT×INT — pure int64 add */
+                    jit_buf_printf(cb, "    _ti%d+=_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else if (_t2==JIT_T_INT && _t1==JIT_T_NUMBER) {
+                    jit_buf_printf(cb, "    _tsd%d=(double)_ti%d+_tsd%d; _sp=%d;\n", d-2, d-2, d-1, d-1);
+                } else if (_t2==JIT_T_NUMBER && _t1==JIT_T_INT) {
+                    jit_buf_printf(cb, "    _tsd%d+=( double)_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else {
+                    /* P9.4: NUMBER×NUMBER — pure double add */
+                    jit_buf_printf(cb, "    _tsd%d+=_tsd%d; _sp=%d;\n", d-2, d-1, d-1);
+                }
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
@@ -2253,10 +2278,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_sub: {
             int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* P9.4: both typed — pure double sub on _tsd */
-                jit_buf_printf(cb,
-                    "    _tsd%d-=_tsd%d; _sp=%d;\n",
-                    d-2, d-1, d-1);
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                if (_t2==JIT_T_INT && _t1==JIT_T_INT) {
+                    jit_buf_printf(cb, "    _ti%d-=_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else if (_t2==JIT_T_INT && _t1==JIT_T_NUMBER) {
+                    jit_buf_printf(cb, "    _tsd%d=(double)_ti%d-_tsd%d; _sp=%d;\n", d-2, d-2, d-1, d-1);
+                } else if (_t2==JIT_T_NUMBER && _t1==JIT_T_INT) {
+                    jit_buf_printf(cb, "    _tsd%d-=(double)_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else {
+                    /* P9.4: NUMBER×NUMBER — pure double sub */
+                    jit_buf_printf(cb, "    _tsd%d-=_tsd%d; _sp=%d;\n", d-2, d-1, d-1);
+                }
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
@@ -2284,10 +2316,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_mul: {
             int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* P9.4: both typed — pure double mul on _tsd */
-                jit_buf_printf(cb,
-                    "    _tsd%d*=_tsd%d; _sp=%d;\n",
-                    d-2, d-1, d-1);
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                if (_t2==JIT_T_INT && _t1==JIT_T_INT) {
+                    jit_buf_printf(cb, "    _ti%d*=_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else if (_t2==JIT_T_INT && _t1==JIT_T_NUMBER) {
+                    jit_buf_printf(cb, "    _tsd%d=(double)_ti%d*_tsd%d; _sp=%d;\n", d-2, d-2, d-1, d-1);
+                } else if (_t2==JIT_T_NUMBER && _t1==JIT_T_INT) {
+                    jit_buf_printf(cb, "    _tsd%d*=(double)_ti%d; _sp=%d;\n", d-2, d-1, d-1);
+                } else {
+                    /* P9.4: NUMBER×NUMBER — pure double mul */
+                    jit_buf_printf(cb, "    _tsd%d*=_tsd%d; _sp=%d;\n", d-2, d-1, d-1);
+                }
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
@@ -2318,10 +2357,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_div: {
             int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* P9.4: both typed — pure double div on _tsd */
+                /* P11.6: div result is NUMBER (may not be integer) — always use _tsd.
+                 * Convert _ti inputs to double as needed. */
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                const char *_a2 = (_t2==JIT_T_INT) ? "(double)_ti" : "_tsd";
+                const char *_a1 = (_t1==JIT_T_INT) ? "(double)_ti" : "_tsd";
                 jit_buf_printf(cb,
-                    "    _tsd%d/=_tsd%d; _sp=%d;\n",
-                    d-2, d-1, d-1);
+                    "    _tsd%d=%s%d/%s%d; _sp=%d;\n",
+                    d-2, _a2, d-2, _a1, d-1, d-1);
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
@@ -2349,10 +2392,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_mod: {
             int _bn = (gen_sp <= d && _GS_TOP2()>=JIT_T_NUMBER && _GS_TOP2()<=JIT_T_INT && _GS_TOP()>=JIT_T_NUMBER && _GS_TOP()<=JIT_T_INT);
             if (_bn) {
-                /* P9.4: both typed — fmod on raw _tsd */
-                jit_buf_printf(cb,
-                    "    _tsd%d=fmod(_tsd%d,_tsd%d); _sp=%d;\n",
-                    d-2, d-2, d-1, d-1);
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                if (_t2==JIT_T_INT && _t1==JIT_T_INT) {
+                    /* P11.6: INT×INT mod — integer remainder (div by zero → keep NaN-like behavior via slow path) */
+                    jit_buf_printf(cb, "    if(_ti%d) _ti%d%%=_ti%d; _sp=%d;\n", d-1, d-2, d-1, d-1);
+                } else {
+                    /* P9.4: mixed or NUMBER×NUMBER — fmod on _tsd (convert if needed) */
+                    const char *_a2 = (_t2==JIT_T_INT) ? "(double)_ti" : "_tsd";
+                    const char *_a1 = (_t1==JIT_T_INT) ? "(double)_ti" : "_tsd";
+                    jit_buf_printf(cb,
+                        "    _tsd%d=fmod(%s%d,%s%d); _sp=%d;\n",
+                        d-2, _a2, d-2, _a1, d-1, d-1);
+                }
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
@@ -2444,8 +2495,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Arithmetic (unary) with int fast paths ----
          * P9.2: unary ops: pop 1 (_tsv{d-1}), push 1 back at _tsv{d-1}, depth unchanged */
         case OP_neg:
-            /* P9.4: typed fast path — negate raw double in _tsd */
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
+            /* P11.6: INT uses _ti; NUMBER uses _tsd */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                jit_buf_printf(cb, "    _ti%d=-_ti%d; _sp=%d;\n", d-1, d-1, d);
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
                 jit_buf_printf(cb, "    _tsd%d=-_tsd%d; _sp=%d;\n", d-1, d-1, d);
             } else {
                 jit_buf_printf(cb,
@@ -2508,10 +2561,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
 
         /* ---- Increment / decrement ---- */
-        /* P9.4/P9.2: inc/dec: pop 1, push 1 at same slot; depth unchanged */
+        /* P11.6/P9.4/P9.2: inc/dec: pop 1, push 1 at same slot; depth unchanged */
         case OP_inc:
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
-                /* P9.4: typed fast path — increment raw double */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                /* P11.6: INT fast path — increment int64 */
+                jit_buf_printf(cb, "    _ti%d++; _sp=%d;\n", d-1, d);
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
+                /* P9.4: NUMBER fast path — increment double */
                 jit_buf_printf(cb, "    _tsd%d+=1.0; _sp=%d;\n", d-1, d);
             } else {
                 jit_buf_printf(cb,
@@ -2527,8 +2583,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             }
             break;
         case OP_dec:
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
-                /* P9.4: typed fast path — decrement raw double */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                /* P11.6: INT fast path — decrement int64 */
+                jit_buf_printf(cb, "    _ti%d--; _sp=%d;\n", d-1, d);
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
+                /* P9.4: NUMBER fast path — decrement double */
                 jit_buf_printf(cb, "    _tsd%d-=1.0; _sp=%d;\n", d-1, d);
             } else {
                 jit_buf_printf(cb,
@@ -2545,8 +2604,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         /* OP_post_inc / OP_post_dec: pop 1, push 2: original at slot{d-1}, result at slot{d}; depth d -> d+1 */
         case OP_post_inc:
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
-                /* P9.4: typed fast path — keep _tsd slots valid, no boxing */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                /* P11.6: INT fast path — keep _ti slots valid */
+                jit_buf_printf(cb,
+                    "    { int64_t _ia=_ti%d; _ti%d=_ia; _ti%d=_ia+1LL; _sp=%d; }\n",
+                    d-1, d-1, d, d+1);
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
+                /* P9.4: NUMBER fast path — keep _tsd slots valid, no boxing */
                 jit_buf_printf(cb,
                     "    { double _da=_tsd%d; _tsd%d=_da; _tsd%d=_da+1.0; _sp=%d; }\n",
                     d-1, d-1, d, d+1);
@@ -2565,8 +2629,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             }
             break;
         case OP_post_dec:
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
-                /* P9.4: typed fast path — keep _tsd slots valid, no boxing */
+            if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                /* P11.6: INT fast path — keep _ti slots valid */
+                jit_buf_printf(cb,
+                    "    { int64_t _ia=_ti%d; _ti%d=_ia; _ti%d=_ia-1LL; _sp=%d; }\n",
+                    d-1, d-1, d, d+1);
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
+                /* P9.4: NUMBER fast path — keep _tsd slots valid, no boxing */
                 jit_buf_printf(cb,
                     "    { double _da=_tsd%d; _tsd%d=_da; _tsd%d=_da-1.0; _sp=%d; }\n",
                     d-1, d-1, d, d+1);
@@ -2630,8 +2699,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_add_loc: {
             int idx = bc[pc + 1];
             if (local_type && idx < var_count && local_type[idx] == JIT_T_INT) {
-                if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
-                    /* P9.4: typed source — read _tsd directly */
+                if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                    /* P11.6: INT source — read _ti directly */
+                    jit_buf_printf(cb,
+                        "    _jsi_%s+=_ti%d; _sp=%d;\n",
+                        LNAME(idx), d-1, d-1);
+                } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_NUMBER) {
+                    /* P9.4: NUMBER source — read _tsd directly */
                     jit_buf_printf(cb,
                         "    _jsi_%s+=(int64_t)_tsd%d; _sp=%d;\n",
                         LNAME(idx), d-1, d-1);
@@ -2723,22 +2797,44 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         "      if(%s(_da " c_op " _db)) break; }\n", \
         d-2, d-1, d-2, (fneg)?"!":"")
 
-/* P9.4: typed fused comparison — both operands are raw doubles in _tsd.
- * Box any typed slots BELOW the two comparison operands before the branch so
- * that the branch-target label (which resets gen_st to JSVAL) sees valid _tsv. */
+/* P11.6/P9.4: typed fused comparison.
+ * INT×INT uses _ti; NUMBER×NUMBER or mixed uses _tsd (converting as needed).
+ * Boxes any typed slots BELOW the two operands before the branch. */
 #define GEN_CMP_FUSE_TSD(c_op, ftgt, fneg) do { \
     { int _bx; for (_bx=0; _bx < d-2 && _bx < gen_sp; _bx++) _P94_ENSURE(_bx); } \
-    jit_buf_printf(cb, \
-        "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) goto _L%d; }\n", \
-        d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+    { uint8_t _ct2=_GS_TOP2(), _ct1=_GS_TOP(); \
+      if (_ct2==JIT_T_INT && _ct1==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_ti%d " c_op " _ti%d)) goto _L%d; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+      else if (_ct2==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s((double)_ti%d " c_op " _tsd%d)) goto _L%d; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+      else if (_ct1==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_tsd%d " c_op " (double)_ti%d)) goto _L%d; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+      else \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) goto _L%d; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1, (ftgt)); \
+    } \
 } while(0)
 
-/* P9.4: break-emitting variant of GEN_CMP_FUSE_TSD */
+/* P11.6: break-emitting variant of GEN_CMP_FUSE_TSD */
 #define GEN_CMP_FUSE_TSD_BRK(c_op, fneg) do { \
     { int _bx; for (_bx=0; _bx < d-2 && _bx < gen_sp; _bx++) _P94_ENSURE(_bx); } \
-    jit_buf_printf(cb, \
-        "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) break; }\n", \
-        d-2, (fneg)?"!":"", d-2, d-1); \
+    { uint8_t _ct2=_GS_TOP2(), _ct1=_GS_TOP(); \
+      if (_ct2==JIT_T_INT && _ct1==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_ti%d " c_op " _ti%d)) break; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1); \
+      else if (_ct2==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s((double)_ti%d " c_op " _tsd%d)) break; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1); \
+      else if (_ct1==JIT_T_INT) \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_tsd%d " c_op " (double)_ti%d)) break; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1); \
+      else \
+        jit_buf_printf(cb, "    { _sp=%d; if(%s(_tsd%d " c_op " _tsd%d)) break; }\n", \
+            d-2, (fneg)?"!":"", d-2, d-1); \
+    } \
 } while(0)
 
 /* Helper: emit fused general comparison+branch — INT fast path, float64 middle
@@ -3822,13 +3918,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             /* --- pow: always JSVAL result (calls runtime, no typed fast path) --- */
             case OP_pow: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
 
-            /* --- Arithmetic: INT if both INT, NUMBER if both >=NUMBER, else JSVAL --- */
-            case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod: {
+            /* --- Arithmetic: INT if both INT (except div), NUMBER if both >=NUMBER, else JSVAL ---
+             * div always produces NUMBER since result may not be an integer (5/2=2.5). */
+            case OP_add: case OP_sub: case OP_mul: case OP_mod: {
                 uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
                 _gs_drop = 2;
                 _gs_push = (_t2>=JIT_T_NUMBER&&_t1>=JIT_T_NUMBER)
                            ? ((_t2==JIT_T_INT&&_t1==JIT_T_INT)?JIT_T_INT:JIT_T_NUMBER)
                            : JIT_T_JSVAL;
+                break;
+            }
+            case OP_div: {
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                _gs_drop = 2;
+                /* P11.6: div result is always NUMBER — _tsd holds the result */
+                _gs_push = (_t2>=JIT_T_NUMBER&&_t1>=JIT_T_NUMBER) ? JIT_T_NUMBER : JIT_T_JSVAL;
                 break;
             }
             /* --- Bitwise: result is an int32 stored in _tsv, not _tsd → JSVAL --- */

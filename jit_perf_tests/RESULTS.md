@@ -1986,3 +1986,56 @@ workloads; WSL2 scheduling noise prevents reliable measurement of sub-5% changes
 - [x] **P11.5-C** Comparisons: `_CHK` already inside `else` branches (pre-existing)
 - [x] **P11.5-D** `_CHK` count: unchanged in `.c` files (correct — slow paths still check); GCC emits no exception branch after IC hits in `combined.so`
 - [x] **P11.5-E** `make CONFIG_JIT=y test` passes (same pre-existing failures as baseline)
+
+---
+
+## P11.6 — INT32 type inference for stack temporaries (2026-04-05)
+
+**Change:** `JIT_T_INT` stack slots now use `int64_t _ti{N}` variables instead of
+`double _tsd{N}`.  Previously ALL numeric stack slots used double, even integer literals
+and integer locals.  This change eliminates FP register usage, FP arithmetic, and
+int-to-double conversion for integer-typed stack values.
+
+**Generated code comparison (sumInt loop):**
+
+Before P11.6 (using `_tsd` for integers):
+```c
+_tsd0=(double)0.0; _sp=1;        // push_0: store 0 as double
+_jsi_s=(int64_t)_tsd0; _sp=0;   // put_loc: int64 = (int64_t)double
+_tsd0=(double)_jsi_s; _sp=1;    // get_loc: double = (double)int64
+_tsd1=(double)_jsi_i; _sp=2;    // get_loc: double = (double)int64
+_tsd0+=_tsd1; _sp=1;            // add: double FP add!
+_jsi_s=(int64_t)_tsd0;          // set_loc: int64 = (int64_t)double
+_tsd0+=1.0; _sp=2;              // inc: double increment
+```
+
+After P11.6 (using `_ti` for integers):
+```c
+_ti0=0LL; _sp=1;                // push_0: store 0 as int64
+_jsi_s=_ti0; _sp=0;             // put_loc: int64 = int64 (direct!)
+_ti0=_jsi_s; _sp=1;             // get_loc: int64 = int64 (direct!)
+_ti1=_jsi_i; _sp=2;             // get_loc: int64 = int64 (direct!)
+_ti0+=_ti1; _sp=1;              // add: int64 add! (no FP)
+_jsi_s=_ti0;                    // set_loc: int64 = int64 (direct!)
+{ int64_t _ia=_ti0; _ti0=_ia; _ti1=_ia+1LL; }  // post_inc: int64 ++
+```
+
+### Benchmark results (2026-04-05, WSL2)
+
+| Benchmark | Before (P11.5) | After (P11.6) | Change |
+|---|---:|---:|---:|
+| `bench_loop` (int sum, 1000×10000 iter) | 82ms | 13ms | **−84% (6.3×)** |
+| V8bench --jit-aot (median of 5 runs) | ~946 | ~967 | ~+2% (within noise) |
+
+### P11.6 task checklist
+
+- [x] **P11.6-A** Add `int64_t _ti{N}` declarations to preamble alongside `double _tsd{N}`
+- [x] **P11.6-B** Update `_P94_ENSURE`: INT case boxes from `_ti`; NUMBER case from `_tsd`
+- [x] **P11.6-C** Push ops emit `_ti%d=N` instead of `_tsd%d=(double)N`
+- [x] **P11.6-D** `GEN_GET_LOC` INT: `_ti%d=_jsi_%s` (no FP conversion)
+- [x] **P11.6-E** `GEN_PUT_LOC`/`GEN_SET_LOC` INT from INT source: `_jsi_%s=_ti%d`
+- [x] **P11.6-F** OP_dup, OP_neg, OP_inc, OP_dec, OP_post_inc, OP_post_dec: `_ti` paths
+- [x] **P11.6-G** Binary ops `_bn` path: INT×INT uses `_ti` arithmetic; mixed converts
+- [x] **P11.6-H** OP_div gen_st: INT×INT → NUMBER (result may not be integer); `_tsd` used
+- [x] **P11.6-I** `GEN_CMP_FUSE_TSD`: INT×INT emits `_ti%d < _ti%d` (no JSValue boxing)
+- [x] **P11.6-J** `make CONFIG_JIT=y test` passes (same pre-existing failures as baseline)
