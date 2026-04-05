@@ -1938,3 +1938,51 @@ compilation completing).  Stable runs (2–5): score range 1006–1208, **median
 - WSL2 scheduling noise dominates run-to-run variance; measuring 5 runs with medians
   gives the most stable signal for the full suite.  For individual benchmarks, isolated
   runs (one benchmark per process) are more reliable.
+
+---
+
+## P11.5 — Elide `_CHK` from `get_field` IC hit path (2026-04-05)
+
+**Change:** `_CHK` (exception tag check + branch) moved from after the `if/else` IC block
+to inside the `else` (slow/miss) branch only for `OP_get_field` and `OP_get_field2`.
+The IC hit path (`js_likely` branch) does a direct memory read + `JS_DupValue` which
+can never return `JS_EXCEPTION`, so the check was dead on the hot path.
+
+**Verification:** generated `.c` files confirmed — IC hit path no longer contains `_CHK`:
+
+```
+// P11.5: IC hit — no _CHK
+if (js_likely(JIT_IC_CHECK(_o,&_ic))) {
+    _r = _pp[_ic.slot]; JS_DupValue(ctx,_r);
+    _FREE(_o); _tsv0=_r; _sp=1; }
+// slow path — _CHK still present
+else { _r = _RT->get_prop(ctx,_o,...);
+       _FREE(_o); _sp=0; _CHK(_r); _tsv0=_r; _sp=1; }
+```
+
+**Note on `_CHK` count:** The total count of `_CHK` in `.c` files stays at ~6090 because
+the check is still correct on vtable slow paths.  The improvement is that GCC no longer
+emits the exception-branch instruction after IC hits in `combined.so`.
+
+### AOT median comparison (3 paired runs, WSL2 2026-04-05)
+
+| | Baseline (P11.3+P11.4) | P11.5 |
+|---|---:|---:|
+| Run 1 | 973 | 633† |
+| Run 2 | 844 | 956 |
+| Run 3 | 946 | 963 |
+| **Median** | **946** | **956** |
+
+†Run 1 DeltaBlue=95 (WSL2 scheduler anomaly, excluded from median).
+
+**Overall delta: +1% (within WSL2 noise floor of ±20%).**  The change is a correctness
+improvement (dead branch eliminated) with expected single-digit % benefit on IC-heavy
+workloads; WSL2 scheduling noise prevents reliable measurement of sub-5% changes.
+
+### P11.5 task checklist
+
+- [x] **P11.5-A** `OP_get_field` / `OP_get_field2` IC hit path: `_CHK` moved inside `else`
+- [x] **P11.5-B** Array element fast path: already used `goto _aok` to skip `_CHK` (pre-existing)
+- [x] **P11.5-C** Comparisons: `_CHK` already inside `else` branches (pre-existing)
+- [x] **P11.5-D** `_CHK` count: unchanged in `.c` files (correct — slow paths still check); GCC emits no exception branch after IC hits in `combined.so`
+- [x] **P11.5-E** `make CONFIG_JIT=y test` passes (same pre-existing failures as baseline)

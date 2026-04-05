@@ -3159,33 +3159,38 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
             /* P11.1: IC hit path inlined — no call to js_jit_ic_read.
              * JSObject.prop (JIT_OBJ_PROP_OFF=40) is a JSValue* with stride
-             * JIT_PROP_SIZE=16 (== sizeof(JSProperty), u.value at offset 0). */
+             * JIT_PROP_SIZE=16 (== sizeof(JSProperty), u.value at offset 0).
+             * P11.5: _CHK moved inside the else (slow) branch — IC hit path
+             * is a direct memory read + DupValue and can never return exception. */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _o=_tsv%d, _r;\n"
                 "      if (js_likely(JIT_IC_CHECK(_o,&_ic%d))){\n"
                 "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);}\n"
+                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);\n"
+                "          _FREE(_o); _tsv%d=_r; _sp=%d; }\n"
                 "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
-                "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
-                "      _FREE(_o); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
-                pc, d-1, pc, pc, atom, atom, pc, d-1, d-1, d);
+                "             js_jit_ic_fill_get(ctx,_o,(JSAtom)%uu,&_ic%d);\n"
+                "             _FREE(_o); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; } }\n",
+                pc, d-1, pc, pc, d-1, d, atom, atom, pc, d-1, d-1, d);
             break;
         }
         case OP_get_field2: { /* keep object on stack; push result: depth d -> d+1 */
             uint32_t atom = bc_u32(&bc[pc+1]);
             _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
-            /* P11.1: IC hit path inlined — no call to js_jit_ic_read. */
+            /* P11.1: IC hit path inlined — no call to js_jit_ic_read.
+             * P11.5: _CHK moved inside else branch — hit path never throws. */
             jit_buf_printf(cb,
                 "    { static JSJITICEntry _ic%d={NULL,0};\n"
                 "      JSValue _r;\n"
                 "      if (js_likely(JIT_IC_CHECK(_tsv%d,&_ic%d))){\n"
                 "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_tsv%d)+JIT_OBJ_PROP_OFF);\n"
-                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);}\n"
+                "          _r=_pp[_ic%d.slot]; JS_DupValue(ctx,_r);\n"
+                "          _tsv%d=_r; _sp=%d; }\n"
                 "      else { _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
-                "             js_jit_ic_fill_get(ctx,_tsv%d,(JSAtom)%uu,&_ic%d); }\n"
-                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
-                pc, d-1, pc, d-1, pc, d-1, atom, d-1, atom, pc, d, d, d+1);
+                "             js_jit_ic_fill_get(ctx,_tsv%d,(JSAtom)%uu,&_ic%d);\n"
+                "             _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; } }\n",
+                pc, d-1, pc, d-1, pc, d, d+1, d-1, atom, d-1, atom, pc, d, d, d+1);
             break;
         }
         case OP_put_field: { /* pop val, pop obj; depth d -> d-2 */
