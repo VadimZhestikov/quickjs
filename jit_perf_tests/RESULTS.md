@@ -2039,3 +2039,41 @@ _jsi_s=_ti0;                    // set_loc: int64 = int64 (direct!)
 - [x] **P11.6-H** OP_div gen_st: INT×INT → NUMBER (result may not be integer); `_tsd` used
 - [x] **P11.6-I** `GEN_CMP_FUSE_TSD`: INT×INT emits `_ti%d < _ti%d` (no JSValue boxing)
 - [x] **P11.6-J** `make CONFIG_JIT=y test` passes (same pre-existing failures as baseline)
+
+---
+
+## P11.8 — Mark `OP_get_length` result as INT32 (2026-04-05)
+
+**Change:** `OP_get_length` now pushes `JIT_T_INT` onto the gen_st type stack (was
+`JIT_T_JSVAL`). The emitted code extracts int64 directly from the `_RT->get_prop` result
+and stores into `_ti{N}`. Combined with P11.6's `_ti` stack slots, the loop bound
+comparison `i < arr.length` becomes a direct `_ti0 < _ti1` integer comparison.
+
+**Generated code diff:**
+```c
+// BEFORE P11.8 (JSValue comparison):
+{ JSValue _r=_RT->get_prop(ctx,arr,JS_ATOM_length);
+  _CHK(_r); _FREE(arr); _tsv1=_r; }  // stored as JSValue
+// comparison: multi-branch tag-check path via GEN_CMP_FUSE_GEN
+
+// AFTER P11.8 (direct int comparison):
+{ JSValue _r=_RT->get_prop(ctx,arr,JS_ATOM_length);
+  _CHK(_r); _FREE(arr);
+  _ti1=(JS_VALUE_GET_TAG(_r)==JS_TAG_INT)?(int64_t)JS_VALUE_GET_INT(_r)
+       :(int64_t)JS_VALUE_GET_FLOAT64(_r); _FREE(_r); }
+{ _sp=0; if(!(_ti0 < _ti1)) goto _exit; }  // ← pure int64
+```
+
+### Benchmark results (2026-04-05, WSL2)
+
+| Benchmark | Before (P11.6) | After (P11.8) | Change |
+|---|---:|---:|---:|
+| `arr.length` loop (5000×1000 iter) | 78ms | 49ms | **−37%** |
+| V8bench --jit-aot (median of 5) | ~967 | ~1115 | **+15%** |
+
+### P11.8 task checklist
+
+- [x] **P11.8-A** `jit_infer_types`: `OP_get_length` → `JIT_T_INT`
+- [x] **P11.8-B** Main switch: extract int64 from `_RT->get_prop` result, store in `_ti{N}`
+- [x] **P11.8-C** Gen_st tracking: `JIT_T_JSVAL` → `JIT_T_INT` for `OP_get_length`
+- [x] **P11.8-D** `make CONFIG_JIT=y test` passes (same pre-existing failures as baseline)

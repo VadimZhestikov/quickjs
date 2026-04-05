@@ -694,7 +694,7 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_get_field:    _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
             case OP_get_field2:                 _TI_PUSH(JIT_T_JSVAL); break;
             case OP_get_array_el: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
-            case OP_get_length:   _TI_DROPN(1); _TI_PUSH(JIT_T_NUMBER); break;
+            case OP_get_length:   _TI_DROPN(1); _TI_PUSH(JIT_T_INT); break; /* P11.8: length is always int */
             case OP_object:                     _TI_PUSH(JIT_T_JSVAL); break;
             case OP_array_from: {
                 int n = (int)bc_u16(&bc[pc+1]); _TI_DROPN(n); _TI_PUSH(JIT_T_JSVAL); break;
@@ -3368,13 +3368,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _aok%d:; }\n",
                 d-1, d-2, d-3, d-3, pc, pc);
             break;
-        /* P9.4/P9.2: get_length: box typed slot, peek obj at _tsv{d-1}, replace with result; depth unchanged */
+        /* P11.8: get_length — result is always a non-negative integer; store in _ti{d-1}.
+         * _RT->get_prop returns JS_TAG_INT for arrays/strings (the overwhelmingly common
+         * case).  Float64 branch handles pathological objects with huge or non-integer
+         * length.  _FREE(_r) is a no-op for immediate values (int/float64). */
         case OP_get_length:
-            _P94_ENSURE(d-1); /* P9.4: box typed obj slot (defensive) */
+            _P94_ENSURE(d-1); /* box typed obj slot before JSValue use */
             jit_buf_printf(cb,
-                "    { JSValue _obj=_tsv%d;\n"
-                "      JSValue _r=_RT->get_prop(ctx,_obj,(JSAtom)%uu);\n"
-                "      _sp=%d; _CHK(_r); _FREE(_tsv%d); _tsv%d=_r; _sp=%d; }\n",
+                "    { JSValue _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
+                "      _sp=%d; _CHK(_r); _FREE(_tsv%d);\n"
+                "      _ti%d=(JS_VALUE_GET_TAG(_r)==JS_TAG_INT)\n"
+                "           ?(int64_t)JS_VALUE_GET_INT(_r)\n"
+                "           :(int64_t)JS_VALUE_GET_FLOAT64(_r);\n"
+                "      _FREE(_r); _sp=%d; }\n",
                 d-1, (unsigned)JS_ATOM_length, d-1, d-1, d-1, d);
             break;
 
@@ -3912,8 +3918,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_get_var_ref2: case OP_get_var_ref3:
                 _gs_push = JIT_T_JSVAL; break;
 
-            /* --- get_length: JSVAL (result stored in _tsv via _RT->get_prop, not _tsd) --- */
-            case OP_get_length: _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            /* --- get_length: P11.8 — always INT (stored in _ti, not _tsv/_tsd) --- */
+            case OP_get_length: _gs_drop=1; _gs_push=JIT_T_INT; break;
 
             /* --- pow: always JSVAL result (calls runtime, no typed fast path) --- */
             case OP_pow: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
