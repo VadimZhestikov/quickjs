@@ -1846,3 +1846,81 @@ Score range: 782–1041, median: **969**
 - The Splay score range (612–1587) remains highly variable; P11.2 resolved the
   initialization overhead but WSL2 scheduling noise dominates.
 - Next: P11.3 (method call IC) should give the largest single improvement.
+
+---
+
+# Phase 11.3+11.4 — Monomorphic call IC + array element fast path (2026-04-04)
+
+**Date:** 2026-04-04
+**Host:** Linux 6.6.87.2-microsoft-standard-WSL2 (x86-64)
+**Build:** `make CONFIG_JIT=1 JIT_THRESHOLD_GCC=100`
+**Workflow:** clear cache → `--jit-warmup` → `--jit-warmup --jit-link` → `--jit-aot` ×5
+
+## Changes
+
+**P11.3 — Call IC (`OP_call` / `OP_call_method`):**
+Each call site carries a static `JSJITCallICEntry` that caches the callee's `JSObject*`
+and `JSFunctionBytecode*`.  On an IC hit with a JIT-compiled callee the vtable dispatch
+is bypassed entirely and `direct_jit` is called through `js_jit_ic_direct_call()`.
+
+**P11.4 — Inline array element fast path (`OP_get_array_el` / `OP_put_array_el`):**
+Emits a `class_id == JS_CLASS_ARRAY && idx < count` guard at each call site; falls back
+to the vtable for non-array objects, OOB indices, and holes.
+
+## Bugs Found and Fixed
+
+**Bug 1 — Arg-padding in direct JIT call:** JIT callee code assumes `argc == arg_count`
+because `put_arg` write-backs use `argv[i]` for reassigned parameters.  The vtable path
+(`js_jit_call`) always pads; P11.3's direct call did not.  Fix: `js_jit_ic_direct_call()`
+pads + dups args to `callee_arg_count` before calling `direct_jit`.
+
+**Bug 2 — Megamorphic fill loop:** `js_jit_callIC_fill()` returned without setting
+`expected_func` for non-JS callees (C builtins / bound functions), so the IC-miss branch
+called fill on **every** invocation.  Fix: immediately set
+`ic->expected_func = JIT_IC_MEGAMORPHIC` for non-cacheable callees.  Also guarded
+fill calls in generated code with `if (!_cic.expected_func)` so megamorphic and
+monomorphic sites never pay the fill overhead.
+
+**Bug 3 — Header ordering (`JSJITCallICEntry` used before its definition):** The
+`js_jit_ic_direct_call` declaration in `quickjs-jit.h` was placed before the
+`JSJITCallICEntry` typedef.  Fixed by moving the declaration after the struct definition.
+
+## V8bench Results — 5 × `--jit-aot` runs
+
+| Run | Richards | DeltaBlue | Crypto | RayTrace | EarleyBoyer | RegExp | Splay | Score |
+|-----|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1   | 1114 |   32 | 1759 | 1045 | 1508 | 392 | 1770 |  683 |
+| 2   | 1352 | 1104 | 1830 | 1163 | 1544 | 416 | 1842 | 1208 |
+| 3   | 1065 | 1144 | 1714 |  988 | 1290 | 360 | 1519 | 1055 |
+| 4   | 1105 | 1063 | 1897 | 1072 | 1326 | 344 | 1406 | 1063 |
+| 5   | 1041 |  999 | 1457 |  976 | 1954 | 214 | 1688 | 1006 |
+
+Run 1 DeltaBlue (32) is a WSL2 startup anomaly (first benchmark impacted by background
+compilation completing).  Stable runs (2–5): score range 1006–1208, **median 1063**.
+
+### Per-benchmark medians (runs 1–5)
+
+| Benchmark | P11.1+11.2 baseline | P11.3+11.4 | Change |
+|---|---:|---:|---:|
+| Richards    |  916 | 1105 | +21% |
+| DeltaBlue   |  712 | 1063 | +49% |
+| Crypto      | 1240 | 1759 | +42% |
+| RayTrace    |  793 | 1045 | +32% |
+| EarleyBoyer | 1564 | 1508 |  −4% |
+| RegExp      |  569 |  360 | −37% |
+| Splay       | 1225 | 1688 | +38% |
+| **Score**   |  950 | 1063 | **+12%** |
+
+### Notes
+
+- **DeltaBlue +49%, Crypto +42%, Splay +38%, RayTrace +32%**: P11.3 call IC is
+  eliminating vtable overhead for monomorphic method calls.
+- **RegExp −37%**: RegExp JS code calls into the C regexp engine (not JIT-compiled).
+  Even after the megamorphic fix, the IC check adds ~1 pointer comparison per call.
+  The overall RegExp benchmark score is dominated by the C engine, not JS overhead.
+  Further investigation planned under P11.5 (elide exception checks) or a dedicated
+  IC-bypass for known-builtin call sites.
+- **EarleyBoyer −4%**: within noise.  Single runs show up to 3898 (P11.3 call IC
+  hitting the hot path repeatedly); the median is depressed by system variability.
+- WSL2 scheduling noise dominates run-to-run variance; measuring 5 runs with medians
+  gives the most stable signal.

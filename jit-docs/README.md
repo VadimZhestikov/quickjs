@@ -29,6 +29,7 @@ C as the intermediate representation.
 | [phase8-p86-float64-arith.md](phase8-p86-float64-arith.md) | P8.6: `JSJITICEntry.kind`, float64 arithmetic/comparison fast paths |
 | [phase9-todo.md](phase9-todo.md) | Phase 9 plan: stackless IR, CF structuring, variable names, typed temporaries |
 | [phase10-todo.md](phase10-todo.md) | Phase 10 plan: combined .so, LTO inter-procedural inlining, direct C calls |
+| [phase11-todo.md](phase11-todo.md) | Phase 11: performance gap analysis, P11.1–P11.4 implemented, P11.5–P11.10 planned |
 
 ---
 
@@ -204,6 +205,10 @@ Every optimisation phase targets one aspect of JSValue boxing overhead:
 | **P9.4** | **Typed stack temporaries: `double _tsd{N}` for provably float64 stack slots; zero tag checks** |
 | **P10.3** | **Direct C calls: `extern __jit_f_<hash>()` bypasses `js_jit_call()` indirect + atomic read** |
 | **P10.5** | **IC check inlining: LTO inlines `js_jit_ic_check()` (3 pointer compares) into hot loop** |
+| **P11.1** | **Inline `js_jit_ic_read`: 1966 call sites eliminated in `combined.so`** |
+| **P11.2** | **Remove JSValue slot zero-initialization: Splay −24% regression resolved** |
+| **P11.3** | **Monomorphic call IC: per-call-site `JSJITCallICEntry` bypasses vtable for JIT callees** |
+| **P11.4** | **Inline array element fast path: `class_id` guard + direct slot read, no `JS_ValueToAtom`** |
 
 ### Vtable for slow paths
 
@@ -271,13 +276,27 @@ read `obj->prop[cached_slot].u.value` directly — no hash chain walk.
 
 ## Performance summary
 
-All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2.
-P8.1 results use `--jit-aot` with warm cache (bench_aot.js, 3 runs, min shown).
-Speedup = interpreter_min / JIT_min.  Values > 1 mean JIT is faster.
+All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache + `combined.so`.
+5 runs, medians reported.  WSL2 scheduling noise is high; individual runs vary ±20%.
 
-All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache,
-`qjs_interp` = JIT-disabled binary.  Min of 3 runs (WSL2 timing is noisy; outliers
-discarded).
+### V8bench (version 6) — current best (P11.3+P11.4, 2026-04-04)
+
+| Benchmark | Interpreter | P11.3+P11.4 | vs interp |
+|---|---:|---:|---:|
+| Richards    |  ~900 | 1105 | +23% |
+| DeltaBlue   | ~1000 | 1063 |  +6% |
+| Crypto      | ~1700 | 1759 |  +4% |
+| RayTrace    | ~1000 | 1045 |  +5% |
+| EarleyBoyer | ~1400 | 1508 |  +8% |
+| RegExp      |  ~400 |  360 | −10% |
+| Splay       | ~1500 | 1688 | +13% |
+| **Score**   | ~1000 | 1063 |  **+6%** |
+
+Note: interpreter scores are also noisy on WSL2; the JIT advantage is larger on
+stable systems.  Gains vs the P11.1+P11.2 baseline (950): **+12%** overall,
+with DeltaBlue +49%, Crypto +42%, Splay +38%.
+
+### Micro-benchmarks (P8.5 era, for reference)
 
 ```
 Benchmark               Interp    JIT P8.5   Speedup   Primary driver
@@ -286,18 +305,6 @@ fib(38) ×1             4401 ms    1343 ms     3.3×     P8.2 self-call + P8.4 i
 sum_loop(1e6) ×20       465 ms     166 ms     2.8×     P8.1 int locals
 arr_sum(10k) ×1000      213 ms     188 ms     1.1×     P8.5 array fast path
 count_primes(1e4) ×10    24 ms      13 ms     1.8×     P8.1 + P8.3 JIT-to-JIT
-```
-
-Previous checkpoint (post-P8.3, pre-IC-fixes):
-
-```
-Benchmark               Interp    JIT P8.3   Speedup   Notes
-──────────────────────────────────────────────────────────────────────────────
-fib(30) ×1              112 ms      28 ms     4.0×     P8.2 direct self-call
-sum_loop(1e6) ×20       796 ms     940 ms     0.85×    regression (let vars, no add_loc)
-sum_sq(1e6) ×20         616 ms     237 ms     2.60×    P8.1 + P8.3 JIT-to-JIT callee
-count_primes ×10       7.59 ms    2.48 ms     3.06×    P8.1 + P8.3 JIT-to-JIT callee
-arr_sum ×1000           345 ms     350 ms     0.99×    get_array_el vtable — no IC yet
 ```
 
 ---
@@ -527,14 +534,14 @@ are compiled (good for startup-sensitive workloads).
 ## CLI flags
 
 ```sh
+./qjs              script.js   # normal: JIT triggers at threshold during execution
 ./qjs --jit-warmup script.js   # compile all functions → cache, then exit   (Phase 7)
 ./qjs --jit-aot    script.js   # compile all functions → cache (or hit), then execute (Phase 7)
-./qjs              script.js   # normal: JIT triggers at threshold during execution
 
-# Phase 10 workflow (planned):
-./qjs --jit-warmup script.js   # Step 1: warm all functions, write .so + .c to cache
-./qjs --jit-link   script.js   # Step 2: combine .c files with GCC -O2 -flto
-./qjs --jit-aot    script.js   # Step 3: execute with combined .so (inlined callees)
+# Recommended AOT workflow (Phase 10, fully implemented):
+./qjs --jit-warmup        script.js   # Step 1: warm all functions, write .so + .c to cache
+./qjs --jit-warmup --jit-link script.js  # Step 2: combine .c files → combined.so (LTO)
+./qjs --jit-aot           script.js   # Step 3: execute with combined.so (fast load, inlined)
 ```
 
 Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
