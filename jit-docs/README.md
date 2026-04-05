@@ -279,25 +279,28 @@ read `obj->prop[cached_slot].u.value` directly — no hash chain walk.
 All measurements: Linux 6.6.87.2 WSL2 x86-64, GCC -O2, `--jit-aot` warm cache + `combined.so`.
 5 runs, medians reported.  WSL2 scheduling noise is high; individual runs vary ±20%.
 
-### V8bench (version 6) — current best (P11.3+P11.4, 2026-04-04)
+### V8bench (version 6) — current and projected (2026-04-04)
 
-| Benchmark | Interpreter | P11.3+P11.4 | vs interp |
-|---|---:|---:|---:|
-| Richards    |  ~900 | 1105 | +23% |
-| DeltaBlue   | ~1000 | 1063 |  +6% |
-| Crypto      | ~1700 | 1759 |  +4% |
-| RayTrace    | ~1000 | 1045 |  +5% |
-| EarleyBoyer | ~1400 | 1508 |  +8% |
-| RegExp      |  ~400 |  360 | −10% |
-| Splay       | ~1804¹ | ~2507¹ | +39%¹ |
-| **Score**   | ~1000 | 1063 |  **+6%** |
+Node v24.2.0 reference: **37 551**.  All JIT figures are `--jit-aot` AOT medians.
 
-Note: interpreter scores are noisy on WSL2 when measured as part of the full suite (first
-benchmark always suffers startup jitter).  ¹Splay isolated single-benchmark measurement
-(3 runs, stable median): interp 1804, JIT 2507 — the +39% figure is more reliable than
-the full-suite Splay column which shows +13% due to accumulated scheduling noise.
-Gains vs the P11.1+P11.2 baseline (950): **+12%** overall,
-with DeltaBlue +49%, Crypto +42%, Splay +38% (full-suite).
+| Benchmark | Interpreter | **P11.3+P11.4** | P11.5–P11.8 est. | P11.10 est. | Node v24 |
+|---|---:|---:|---:|---:|---:|
+| Richards    |  ~900 | **1105** | 1350–1600  | 2500–4000  | 31 461 |
+| DeltaBlue   | ~1000 | **1063** | 1350–1550  | 2500–4000  | 74 912 |
+| Crypto      | ~1700 | **1759** | 2600–3800  | 5000–9000  | 41 627 |
+| RayTrace    | ~1000 | **1045** | 1150–1300  | 2500–5000  | 67 783 |
+| EarleyBoyer | ~1400 | **1508** | 1900–2400  | 3000–5500  | 56 761 |
+| RegExp      |  ~400 |  **360** |  380–440   |  400–500   |  9 001 |
+| Splay¹      | ~1804 | **2507** | 2900–3400  | 4500–7000  | 30 991 |
+| **Score**   | ~1000 | **1063** | **1400–1650** | **3000–5000** | **37 551** |
+| % of Node   |  2.7% |  **2.8%** | 3.7–4.4%  | 8–13%      | 100%   |
+
+¹ Splay: isolated single-benchmark measurement (full-suite median 1688 due to WSL2
+  scheduling noise; isolated runs are more reliable for this benchmark).
+
+Note: interpreter scores are noisy in full-suite runs (first benchmark suffers WSL2
+startup jitter).  Gains vs P11.1+P11.2 baseline (950): **+12%** overall,
+DeltaBlue +49%, Crypto +42%, Splay +38% (full-suite medians).
 
 ### Micro-benchmarks (P8.5 era, for reference)
 

@@ -716,33 +716,78 @@ All v8bench correctness tests pass.  No deopt loops.
 
 ## Milestone summary
 
-| Sub-phase | Deliverable | Effort | Risk | Expected V8bench gain |
-|---|---|---:|---|---:|
-| P11.1 Inline ic_read | Zero calls to `js_jit_ic_read` in combined.so | 0.5 day | trivial | +5–15% DeltaBlue/Richards/RayTrace |
-| P11.2 Slot init | Eliminate JSValue zero-init overhead | 1 day | low | +20–30% Splay/fib/recursion; fixes regression |
-| P11.3 Call IC | Monomorphic method dispatch | 2 days | medium | +30–50% Richards/DeltaBlue |
-| P11.4 Array IC | Inline dense array element access | 0.5 day | low | +10–20% Crypto/EarleyBoyer |
-| P11.5 Elide CHK | Remove exception checks from safe ops | 1 day | low | +5–15% (compiler unlock) |
-| P11.6 INT32 types | Native int32 arithmetic, no boxing | 2 days | medium | +3–8× count_primes/sum_loop |
-| P11.7 Persist IC | Warm ICs on AOT startup | 1.5 days | medium | +5–10% cold AOT runs |
-| P11.8 get_length INT32 | Enables P11.6 for array-bounded loops | 0.25 day | trivial | feeds P11.6 |
-| P11.9 OSR | JIT activates for top-level loops | 5 days | high | unlocks new workload class |
-| P11.10 Speculative | Guard-based type specialization + deopt | 10+ days | very high | 3–10× numeric |
-| **P11.1–P11.5 total** | | **~5 days** | | **~1.5–2× over P10.5** |
-| **P11.1–P11.8 total** | | **~9 days** | | **~2–3× over P10.5** |
+Node v24.2.0 reference score: **37551** (measured 2026-04-04).
+Current baseline: P11.3+P11.4 AOT median **~1063** (~2.8% of Node).
 
-### Per-benchmark projections (P10.5 → P11.1–P11.5)
+| Sub-phase | Deliverable | Effort | Risk | Status | V8bench score impact |
+|---|---|---:|---|---|---:|
+| P11.1 Inline ic_read | Zero `js_jit_ic_read` calls in combined.so | 0.5 day | trivial | **done** | included in P11.3+P11.4 baseline |
+| P11.2 Slot init | Eliminate JSValue zero-init on entry | 1 day | low | **done** | included in baseline; Splay −24% → +39% |
+| P11.3 Call IC | Monomorphic method dispatch | 2 days | medium | **done** | baseline **1063** (+12% over P11.2) |
+| P11.4 Array IC | Inline dense array element fast path | 0.5 day | low | **done** | included in baseline |
+| P11.5 Elide CHK | Remove exception checks from safe ops | 1 day | low | pending | **+8–12%** → ~1150–1190 |
+| P11.6 INT32 types | Native int32 arithmetic, no boxing | 2 days | medium | pending | **+15–25%** cumulative → ~1350–1500 |
+| P11.7 Persist IC | Warm property ICs on AOT startup | 1.5 days | medium | pending | **+5–8%** (variance ↓, floor ↑) → ~1420–1620 |
+| P11.8 get_length→INT32 | Enables P11.6 for array-bounded loops | 0.25 day | trivial | pending | feeds P11.6; standalone +2–5% |
+| P11.9 OSR | JIT activates for top-level loops | 5 days | high | pending | **+5–8%** V8bench; larger on real workloads |
+| P11.10 Speculative | Guard-based type specialization + deopt | 10+ days | very high | pending | **+150–300%** → ~3000–5000 |
+| **P11.5–P11.8 total** | | **~4.75 days** | | | **~1400–1650** score |
+| **All P11 total** | | **~21 days** | | | **~3000–5000** score (~8–13% of Node) |
 
-| Benchmark | P10.5 median | P11.1–5 target | Driver |
-|---|---:|---:|---|
-| Richards | ~910 | ~1200–1400 | P11.3 call IC |
-| DeltaBlue | ~1070 | ~1500–2000 | P11.1 + P11.3 |
-| Crypto | ~1540 | ~1800–2500 | P11.4 array IC |
-| RayTrace | ~1070 | ~1200–1500 | P11.1 inlined reads |
-| EarleyBoyer | ~1500 | ~1700–2500 | P11.3 + P11.4 |
-| RegExp | ~430 | ~430–500 | marginal (C regexp engine) |
-| Splay | ~1710 | ~2200–2500 | P11.2 fixes regression — **achieved: ~2500 isolated** |
-| **Score** | **~1136** | **~1500–2000** | |
+### Per-benchmark projections from current P11.3+P11.4 baseline
+
+Node scores shown for scale.  All JIT numbers are `--jit-aot` AOT median.
+
+| Benchmark | **Actual P11.3+P11.4** | After P11.5+P11.6+P11.8 | After P11.10 | Node v24 |
+|---|---:|---:|---:|---:|
+| Richards    | **1105** | 1350–1600 | 2500–4000  | 31 461 |
+| DeltaBlue   | **1063** | 1350–1550 | 2500–4000  | 74 912 |
+| Crypto      | **1759** | 2600–3800 | 5000–9000  | 41 627 |
+| RayTrace    | **1045** | 1150–1300 | 2500–5000† | 67 783 |
+| EarleyBoyer | **1508** | 1900–2400 | 3000–5500  | 56 761 |
+| RegExp      |  **360** |  380–440  |  400–500‡  |  9 001 |
+| Splay       | **2507**¹| 2900–3400 | 4500–7000  | 30 991 |
+| **Score**   | **~1063**| **~1400–1650** | **~3000–5000** | **37 551** |
+| % of Node   | 2.8%     | 3.7–4.4%  | 8–13%      | 100%   |
+
+¹ Isolated single-benchmark measurement (full-suite median 1688 due to WSL2 noise).  
+† RayTrace is float-dominated; the big win there comes from P9.4 float typed temporaries
+  (Phase 9), not INT32.  P11.10 gain depends on whether float speculation is included.  
+‡ RegExp score is bounded by the C regexp engine (not JIT-compiled); JS wrapper overhead
+  is already small.  The score will not approach Node regardless of JIT quality.
+
+### Per-step rationale for remaining phases
+
+**P11.5 (+8–12%)** — 6090 `_CHK` calls, >50% are after provably non-throwing paths
+(int+int fast path, array fast path after P11.4, bool comparisons).  Each eliminated
+`_CHK` is a branch + tag check that fragments GCC's basic blocks.  Mainly helps Crypto
+and EarleyBoyer (array arithmetic), Richards (property-read chains).
+
+**P11.6 (+15–25% cumulative with P11.8)** — Typed double (`_tsd`) slots are only 8.2%
+of value operations today.  Adding `int32_t _ti` slots covers the majority of hot
+locals: loop counters, array indices, integer flags.  Eliminates boxing/unboxing on
+every arithmetic op and enables native int32 comparisons (no JSValue, no `_CHK`).
+Crypto has pure RSA integer arithmetic — largest gain.  All others benefit from loop
+counter elision.
+
+**P11.7 (+5–8%, variance reduction)** — In `--jit-aot` mode property ICs are cold on
+every startup; the 1-second V8bench measurement windows include IC fill cost.
+Persisting (atom, slot) pairs to sidecar `.ic` files and pre-warming shapes at startup
+eliminates this cost.  Main effect: narrows the spread between best and worst AOT run
+(currently 683–1208); raises the floor rather than the ceiling.
+
+**P11.9 (+5–8% V8bench; larger elsewhere)** — The benchmark harness outer loop and many
+benchmark setup functions run in the interpreter.  OSR would JIT-compile these, removing
+interpreter overhead from timers and setup.  Impact on V8bench is modest (setup is not
+in the timed window for most benchmarks), but OSR is critical for real workloads where
+hot logic is at the top level.
+
+**P11.10 (+150–300%)** — The fundamental ceiling of the current JIT: all code compiles
+to generic `JSValue` operations.  Speculative specialization emits guarded native-type
+code (e.g., `int32_t a = argv[0]` after a tag check), with a `_deopt:` path back to
+the interpreter on type mismatch.  V8/JSC/SM get their 10–50× gains entirely from this.
+Even a conservative implementation covering INT32 and FLOAT64 would close 5–10× of
+the current gap with Node.
 
 ---
 
