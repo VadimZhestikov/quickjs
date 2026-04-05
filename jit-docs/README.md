@@ -421,7 +421,9 @@ return JS_NewFloat64(ctx, _tsd2 + _tsd3);
 
 ### Expected performance impact
 
-| Benchmark | Current JIT | After Phase 9 | Estimated gain |
+Phase 9 figures use the pre-P11 baseline (~940).  Current baseline is P11.3+P11.4 (~1063).
+
+| Benchmark | Pre-P11 JIT | After Phase 9 | Estimated gain |
 |---|---:|---|---|
 | RayTrace | 963 | 3000–5000 | **3–5×** (float-heavy, typed temps dominant) |
 | DeltaBlue | 905 | 1600–2300 | **1.8–2.5×** (float strengths + LICM) |
@@ -432,9 +434,38 @@ return JS_NewFloat64(ctx, _tsd2 + _tsd3);
 | RegExp | 393 | 430–510 | **1.1–1.3×** (regex engine not JIT-compiled) |
 | **V8bench score** | **~940** | **~1800–3000** | **~2–3×** |
 
-Theoretical ceiling for the GCC-JIT approach (function-call overhead, IC checks, and
-JS→C ABI remain): approximately 5000–7000 overall, or ~25–35% of V8.  Closing the
-remaining gap requires emitting native machine code directly.
+Theoretical ceiling for the GCC-JIT approach is approximately **4500–8000** overall
+(~12–21% of Node v24 = 37 551).  The four irreducible overheads that bound this ceiling:
+
+1. **C function call ABI** — every JS function boundary pays ~15–30 cycles for register
+   save/restore regardless of callee size.  Recursive and dynamically-dispatched calls
+   cannot be inlined even with LTO.  DeltaBlue (pure method calls) hits this hardest:
+   ceiling ~5–11% of Node.
+2. **JSValue boxing at non-inlined boundaries** — even with INT32/FLOAT64 typed locals,
+   return values must be boxed at every call site GCC doesn't inline.
+3. **Reference counting** — `DupValue`/`FreeValue` on every heap JSValue access.  The JIT
+   and interpreter pay the same cost here; only integer values (no refcount) give the JIT
+   an asymmetric advantage (INT32 locals from P11.6).
+4. **GCC inliner budget** — `combined.so` LTO enables cross-function inlining but GCC's
+   size heuristics cap the depth.  V8's Turbofan uses profile-guided inlining with
+   arbitrary depth.
+
+Per-benchmark ceiling (all P11 + P9 + P10 implemented, C-as-IR only):
+
+| Benchmark | Current | Ceiling | Node v24 | % of Node |
+|---|---:|---:|---:|---:|
+| Richards    | 1105 | 4000–6000  | 31 461 | 13–19% |
+| DeltaBlue   | 1063 | 4000–8000  | 74 912 |  5–11% |
+| Crypto      | 1759 | 8000–15000 | 41 627 | 19–36% |
+| RayTrace    | 1045 | 6000–12000 | 67 783 |  9–18% |
+| EarleyBoyer | 1508 | 5000–10000 | 56 761 |  9–18% |
+| RegExp      |  360 |  500–1000  |  9 001 |  6–11% |
+| Splay       | 2507 | 4000–8000  | 30 991 | 13–26% |
+| **Score**   | **1063** | **4500–8000** | **37 551** | **12–21%** |
+
+Closing the gap beyond 21% requires native machine code emission (custom x86-64
+assembler or LLVM backend), tracing-style inlining across arbitrary call depth, or
+eliminating reference counting via generational GC with escape analysis.
 
 ---
 
