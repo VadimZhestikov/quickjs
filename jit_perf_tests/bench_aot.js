@@ -12,8 +12,9 @@
  *   node jit_perf_tests/bench_aot.js
  */
 
-/* Node.js shim: QuickJS has print() built-in; Node uses console.log */
+/* Shims for engines that lack QuickJS/Node built-ins */
 if (typeof print === 'undefined') var print = console.log.bind(console);
+if (typeof performance === 'undefined') var performance = { now: function() { return Date.now(); } };
 
 function fib(n) {
     if (n <= 1) return n;
