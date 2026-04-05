@@ -187,8 +187,8 @@ void      js_jit_fb_set_no_compile(JSFunctionBytecode *b);
 JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b);
 void      js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f,
                               void *handle, int tier);
+void      js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash);
 int       js_jit_fb_inc_count(JSFunctionBytecode *b);
-
 /* Bytecode / metadata accessors for the code generator */
 const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len);
 int            js_jit_fb_get_arg_count(JSFunctionBytecode *b);
@@ -291,6 +291,34 @@ typedef struct {
 #define JIT_SHAPEIC_ATOM_OFF       4
 
 /*
+ * P11.4: JSObject layout constants for inline array element fast path.
+ *   JSObject.class_id         = byte  6  (uint16_t inside bitfield word)
+ *   JS_CLASS_ARRAY            = 2        (enum value for dense arrays)
+ *   JSObject.u.array.u.values = byte 56  (JSValue* element array)
+ *   JSObject.u.array.count    = byte 64  (int element count)
+ * Verified by _Static_assert in quickjs.c.
+ */
+#define JIT_OBJ_CLASSID_OFF   6   /* JSObject.class_id (uint16_t) */
+#define JIT_CLASS_ARRAY       2   /* JS_CLASS_ARRAY enum value */
+#define JIT_ARR_VALUES_OFF   56   /* JSObject.u.array.u.values (JSValue*) */
+#define JIT_ARR_COUNT_OFF    64   /* JSObject.u.array.count (int) */
+
+/*
+ * P11.3: JSObject layout constants for call IC.
+ *   JS_CLASS_BYTECODE_FUNCTION        = 13       (enum value for JS bytecode functions)
+ *   JSObject.u.func.function_bytecode = byte 48  (JSFunctionBytecode*)
+ *   JSObject.u.func.var_refs          = byte 56  (JSVarRef**)
+ *   JSFunctionBytecode.jit_func       = byte 112 (JSJITFunc)
+ *   JSFunctionBytecode.jit_bc_hash    = byte 128 (uint64_t, stable per-bytecode identity)
+ * Verified by _Static_assert in quickjs.c.
+ */
+#define JIT_FUNC_BC_OFF            48  /* JSObject.u.func.function_bytecode */
+#define JIT_FUNC_VARREFS_OFF       56  /* JSObject.u.func.var_refs */
+#define JIT_CLASS_BYTECODE_FUNCTION 13 /* JS_CLASS_BYTECODE_FUNCTION enum value */
+#define JIT_BC_JIT_FUNC_OFF       112  /* JSFunctionBytecode.jit_func (JSJITFunc) */
+#define JIT_BC_BCHASH_OFF         128  /* JSFunctionBytecode.jit_bc_hash (uint64_t) */
+
+/*
  * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard.
  * Equivalent to js_jit_ic_check() but expands inline in JIT-generated code
  * so the compiler can see the body and optimize across the IC boundary.
@@ -344,9 +372,49 @@ int js_jit_ic_write(JSContext *ctx, JSValue obj, JSValue val, uint32_t slot);
  * Both functions require JS_VALUE_GET_TAG(obj)==JS_TAG_OBJECT (caller-checked).
  * js_jit_array_get: on hit returns 1 with *out set to a new ref; 0 on miss.
  * js_jit_array_set: on hit returns 1 (val consumed); 0 on miss (val intact).
+ * (Retained for AOT-cached .so files that call them; inlined at new call sites.)
  */
 int js_jit_array_get(JSContext *ctx, JSValue obj, uint32_t idx, JSValue *out);
 int js_jit_array_set(JSContext *ctx, JSValue obj, uint32_t idx, JSValue val);
+
+/*
+ * P11.3 — Monomorphic call IC.
+ *
+ * Per-call-site cache for function-call opcodes.  When a call site always
+ * invokes the same bytecode function (monomorphic), this IC lets the JIT:
+ *   1. Skip the class_id check, jit_func atomic load, and JS_Call vtable on hit.
+ *   2. Call the callee's JIT function directly (if compiled) with pre-fetched
+ *      cpool and var_refs — eliminating the identity-check inside js_jit_call.
+ *
+ * ABA safety: expected_bc is the bytecode pointer of the cached callee.  If
+ * the function object is freed and another one allocated at the same address,
+ * its function_bytecode pointer will differ → IC miss (no wrong-callee call).
+ *
+ * Ownership: the IC holds raw (non-refcounted) pointers.  callee_cpool and
+ * callee_var_refs are stable for the lifetime of the bytecode / closure.
+ * If var_refs can be reallocated (rare), the ABA guard on expected_bc catches it.
+ */
+typedef struct {
+    void                *expected_func;      /* JSObject* — NULL=cold, JIT_IC_MEGAMORPHIC=poly */
+    JSFunctionBytecode  *expected_bc;        /* ABA guard: func->u.func.function_bytecode */
+    JSJITFunc            direct_jit;         /* non-NULL = callee is JIT-compiled */
+    JSValue             *callee_cpool;       /* callee's constant pool */
+    JSVarRef           **callee_var_refs;    /* callee's closure var refs */
+    int                  callee_arg_count;   /* b->arg_count (for arg padding) */
+    uint64_t             callee_bc_hash;     /* P11.3 double-ABA guard: b->jit_bc_hash */
+} JSJITCallICEntry;
+
+/*
+ * js_jit_callIC_fill: populate ic after a call IC miss.
+ * Caches expected_func/bc, extracts direct_jit/cpool/var_refs/arg_count.
+ * Goes megamorphic if a second distinct function is seen at this site.
+ * Also re-checks direct_jit when ic hits the same function again but
+ * jit_func was not yet compiled at the time of the previous fill.
+ */
+void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic);
+JSValue js_jit_ic_direct_call(JSContext *ctx, JSValue this_val,
+                               int nargs, JSValue *argv,
+                               JSJITCallICEntry *ic, JSVarRef **var_refs);
 #endif
 
 /* ======================================================================= */

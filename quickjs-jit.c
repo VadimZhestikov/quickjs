@@ -1162,6 +1162,7 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, job->fname);
     if (!f) { dlclose(handle); goto fail; }
 
+    js_jit_fb_set_bc_hash(job->b, job->bc_hash);
     js_jit_fb_set_func(job->b, f, handle, 2);
     return;
 fail:
@@ -1293,6 +1294,7 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     if (jit_combined_handle && jit_combined_manifest) {
         for (int _mi = 0; _mi < jit_combined_count; _mi++) {
             if (jit_combined_manifest[_mi].bc_hash == bc_hash) {
+                js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, jit_combined_manifest[_mi].func_ptr, NULL, 2);
                 return;
             }
@@ -1312,6 +1314,7 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         if (handle) {
             JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, fname);
             if (f) {
+                js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, f, handle, 2);
                 return;
             }
@@ -3204,39 +3207,65 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 pc, d-1, d-2, d-2, pc, pc, pc, atom, atom, pc);
             break;
         }
-        /* P8.5: dense array element fast path.
-         * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT.
-         * Fast path: js_jit_array_get/set hit the u.array.values[] directly.
+        /* P11.4: dense array element fast path — fully inlined.
+         * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT
+         *        && class_id == JIT_CLASS_ARRAY && idx < u.array.count.
+         * Fast path: direct JSValue* read/write from u.array.u.values[],
+         *   no function call, no _CHK (value is never JS_EXCEPTION).
          * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty.
-         * P9.4/P9.2: get_array_el: box typed idx, pop idx(_tsv{d-1}), pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
+         * P9.4/P9.2: get_array_el: box typed idx, pop idx(_tsv{d-1}),
+         *   pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
+        /* P11.4: dense array element fast path — fully inlined.
+         * Guard: obj is JS_TAG_OBJECT && idx is JS_TAG_INT
+         *        && class_id == JIT_CLASS_ARRAY && idx < u.array.count.
+         * Fast path: direct JSValue* read/write from u.array.u.values[],
+         *   no function call, no _CHK (value is never JS_EXCEPTION).
+         * Slow path: _RT->get/set_array_el goes through JS_ValueToAtom + GetProperty.
+         * P9.4/P9.2: get_array_el: box typed idx slot, pop idx(_tsv{d-1}),
+         *   pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
         case OP_get_array_el:
             _P94_ENSURE(d-1); /* P9.4: box typed idx slot before index check */
             jit_buf_printf(cb,
-                "    { JSValue _idx=_tsv%d,_o=_tsv%d;\n"
-                "      JSValue _r;\n"
+                "    { JSValue _idx=_tsv%d,_o=_tsv%d; JSValue _r;\n"
                 "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
-                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
-                "         &&js_jit_array_get(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),&_r))\n"
-                "          ;/* fast hit */\n"
-                "      else _r=_RT->get_array_el(ctx,_o,_idx);\n"
-                "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
-                d-1, d-2, d-2, d-2, d-1);
+                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                "          _r=(*(JSValue**)(_op+JIT_ARR_VALUES_OFF))[_ai];\n"
+                "          JS_DupValue(ctx,_r);\n"
+                "          _FREE(_o);_FREE(_idx); _sp=%d; _tsv%d=_r; _sp=%d;\n"
+                "          goto _aok%d;}}\n"
+                "      _r=_RT->get_array_el(ctx,_o,_idx);\n"
+                "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
+                "      _aok%d:; }\n",
+                d-1, d-2,
+                d-2, d-2, d-1, pc,  /* fast path: _sp, _tsv, _sp, goto label */
+                d-2, d-2, d-1, pc); /* slow path: _sp, _tsv, _sp, label */
             break;
-        /* P9.4/P9.2: put_array_el: box typed slots, pop v(_tsv{d-1}), idx(_tsv{d-2}), obj(_tsv{d-3}); depth d->d-3 */
+        /* P11.4: put_array_el inlined similarly.
+         * P9.4/P9.2: box typed slots, pop v(_tsv{d-1}), idx(_tsv{d-2}),
+         *   obj(_tsv{d-3}); depth d->d-3 */
         case OP_put_array_el:
             _P94_ENSURE(d-3); /* P9.4: box typed obj slot (unlikely but safe) */
             _P94_ENSURE(d-2); /* P9.4: box typed idx slot before index check */
             _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d;\n"
-                "      _sp=%d; int _ret;\n"
+                "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
                 "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
-                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)\n"
-                "         &&js_jit_array_set(ctx,_o,(uint32_t)JS_VALUE_GET_INT(_idx),_v))\n"
-                "          _ret=0;/* fast hit, _v consumed */\n"
-                "      else _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                "      _FREE(_o);_FREE(_idx);if(_ret<0) goto _ex; }\n",
-                d-1, d-2, d-3, d-3);
+                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
+                "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
+                "      _aok%d:; }\n",
+                d-1, d-2, d-3, d-3, pc, pc);
             break;
         /* P9.4/P9.2: get_length: box typed slot, peek obj at _tsv{d-1}, replace with result; depth unchanged */
         case OP_get_length:
@@ -3336,14 +3365,76 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                             "        _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n      }\n",
                             (unsigned long long)jit_callee_hash);
                 } else {
-                    /* Regular call via runtime dispatch */
+                    /* P11.3: monomorphic call IC.
+                     * Check: _fo == cached_func && func->function_bytecode == cached_bc.
+                     * Hit + direct_jit: call JIT function via js_jit_ic_direct_call which
+                     *   pads args to callee_arg_count (required because the callee's JIT
+                     *   code may write-back to argv[i] for i < arg_count even when the
+                     *   caller passes fewer args; also prevents double-free of caller args).
+                     * Hit + no jit:    call through vtable (avoid identity re-check).
+                     * Miss:            vtable call + fill IC for future hits.
+                     * Note: void* instead of JSObject* — JSObject not in public header. */
+                    if (!p103_cae_declared) {
+                        jit_buf_str(cb,
+                            "extern int js_jit_check_and_extract"
+                            "(JSValue,JSJITFunc,JSValue**,JSVarRef***);\n");
+                        p103_cae_declared = 1;
+                    }
+                    jit_buf_str(cb,
+                        "extern JSValue js_jit_ic_direct_call"
+                        "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n");
+                    jit_buf_printf(cb,
+                        "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0};\n"
+                        "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
+                              "?JS_VALUE_GET_PTR(_f):NULL;\n"
+                        "      JSValue _r;\n"
+                        "      if(js_likely(_fo&&_fo==_cic%d.expected_func&&\n"
+                        "                   *(void**)((char*)_fo+JIT_FUNC_BC_OFF)"
+                                            "==(void*)_cic%d.expected_bc)){\n"
+                        /* Full ABA guard: check bc_hash to detect both single-ABA
+                         * (new closure at same address, same bytecode) and double-ABA
+                         * (bytecode AND jit_func pointers reused). bc_hash is set when
+                         * the bytecode is compiled and is unique per bytecode function.
+                         * A different bytecode at the same address will have a different
+                         * hash, preventing wrong-callee direct calls in all cases. */
+                        "        if(_cic%d.direct_jit&&\n"
+                        "           *(uint64_t*)((char*)_cic%d.expected_bc"
+                                                "+JIT_BC_BCHASH_OFF)==_cic%d.callee_bc_hash){\n"
+                        "          if(_RT->poll_interrupts(ctx)) goto _ex;\n",
+                        pc, pc, pc, pc, pc, pc);
+                    /* Use js_jit_ic_direct_call to pad args to callee_arg_count and dup them.
+                     * This matches js_jit_call's padding so the callee's put_arg write-backs
+                     * operate on a private copy, not the caller's stack slots. */
                     if (nargs > 0)
                         jit_buf_printf(cb,
-                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n",
-                            nargs, pc);
+                            "          _r=js_jit_ic_direct_call(ctx,JS_UNDEFINED,%d,_ca%d,"
+                                       "&_cic%d,"
+                                       "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                            nargs, pc, pc);
                     else
-                        jit_buf_str(cb,
-                            "      JSValue _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n");
+                        jit_buf_printf(cb,
+                            "          _r=js_jit_ic_direct_call(ctx,JS_UNDEFINED,0,NULL,"
+                                       "&_cic%d,"
+                                       "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                            pc);
+                    if (nargs > 0)
+                        jit_buf_printf(cb,
+                            "        } else _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n"
+                            "      } else {\n"
+                            "        _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n"
+                            "        if(!_cic%d.expected_func)\n"
+                            "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
+                            "      }\n",
+                            nargs, pc, nargs, pc, pc, pc);
+                    else
+                        jit_buf_printf(cb,
+                            "        } else _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n"
+                            "      } else {\n"
+                            "        _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n"
+                            "        if(!_cic%d.expected_func)\n"
+                            "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
+                            "      }\n",
+                            pc, pc);
                 }
                 /* Free args */
                 for (int _aj = 0; _aj < nargs; _aj++)
@@ -3376,13 +3467,56 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         jit_buf_printf(cb, "_tsv%d", d-nargs+_aj);
                     }
                     jit_buf_str(cb, "};\n");
-                    jit_buf_printf(cb,
-                        "      JSValue _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n",
-                        nargs, pc);
-                } else {
-                    jit_buf_str(cb,
-                        "      JSValue _r=_RT->call(ctx,_f,_t,0,NULL);\n");
                 }
+                /* P11.3: method call IC — same structure as OP_call */
+                jit_buf_str(cb,
+                    "extern JSValue js_jit_ic_direct_call"
+                    "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n");
+                jit_buf_printf(cb,
+                    "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0};\n"
+                    "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
+                          "?JS_VALUE_GET_PTR(_f):NULL;\n"
+                    "      JSValue _r;\n"
+                    "      if(js_likely(_fo&&_fo==_cic%d.expected_func&&\n"
+                    "                   *(void**)((char*)_fo+JIT_FUNC_BC_OFF)"
+                                        "==(void*)_cic%d.expected_bc)){\n"
+                    /* Full ABA guard: same as OP_call — bc_hash check */
+                    "        if(_cic%d.direct_jit&&\n"
+                    "           *(uint64_t*)((char*)_cic%d.expected_bc"
+                                            "+JIT_BC_BCHASH_OFF)==_cic%d.callee_bc_hash){\n"
+                    "          if(_RT->poll_interrupts(ctx)) goto _ex;\n",
+                    pc, pc, pc, pc, pc, pc);
+                /* Use js_jit_ic_direct_call for arg padding (same reason as OP_call). */
+                if (nargs > 0)
+                    jit_buf_printf(cb,
+                        "          _r=js_jit_ic_direct_call(ctx,_t,%d,_ca%d,"
+                                   "&_cic%d,"
+                                   "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                        nargs, pc, pc);
+                else
+                    jit_buf_printf(cb,
+                        "          _r=js_jit_ic_direct_call(ctx,_t,0,NULL,"
+                                   "&_cic%d,"
+                                   "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                        pc);
+                if (nargs > 0)
+                    jit_buf_printf(cb,
+                        "        } else _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n"
+                        "      } else {\n"
+                        "        _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n"
+                        "        if(!_cic%d.expected_func)\n"
+                        "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
+                        "      }\n",
+                        nargs, pc, nargs, pc, pc, pc);
+                else
+                    jit_buf_printf(cb,
+                        "        } else _r=_RT->call(ctx,_f,_t,0,NULL);\n"
+                        "      } else {\n"
+                        "        _r=_RT->call(ctx,_f,_t,0,NULL);\n"
+                        "        if(!_cic%d.expected_func)\n"
+                        "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
+                        "      }\n",
+                        pc, pc);
                 for (int _aj = 0; _aj < nargs; _aj++)
                     jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
                 jit_buf_printf(cb,
@@ -4189,6 +4323,7 @@ static int jit_install_combined_pass(void)
         if (old_handle == jit_combined_handle) continue;  /* already patched */
         uint8_t old_tier = js_jit_fb_get_tier(b);
         /* Install with handle=NULL so js_jit_free_bytecode skips it */
+        js_jit_fb_set_bc_hash(b, jit_combined_manifest[i].bc_hash);
         js_jit_fb_set_func(b, jit_combined_manifest[i].func_ptr, NULL, 2);
         if (old_tier == 2 && old_handle)
             dlclose(old_handle);

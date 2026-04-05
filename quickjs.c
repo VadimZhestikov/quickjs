@@ -674,6 +674,7 @@ typedef struct JSFunctionBytecode {
     int               jit_call_count; /* incremented on every JS_CallInternal */
     JSJITFunc         jit_func;       /* NULL → interpreter, else JIT entry  */
     void             *jit_handle;     /* dlopen handle for compiled .so      */
+    uint64_t          jit_bc_hash;    /* P11.3: stable bc identity for call IC ABA guard */
     uint16_t         *stack_depth_tab; /* [byte_code_len] stack depth before each opcode; P9.0 */
     JSJITCFAnnotation *cf_annotations;  /* loop CF annotations; P9.3 */
     int                cf_annotation_count;
@@ -15646,6 +15647,10 @@ void     js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f, void *handle, in
     b->jit_tier   = (uint8_t)tier;
     __atomic_store_n(&b->jit_func, f, __ATOMIC_RELEASE);
 }
+void     js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash)
+{
+    b->jit_bc_hash = hash;
+}
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
 
 /* Return pointer to the JSValue inside a JSVarRef.  Used by generated C code
@@ -15839,6 +15844,86 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
     }
     return JS_Call(ctx, func, this_val, argc, argv);
 }
+
+/* P11.3: Direct JIT call with argument padding.
+ *
+ * The callee's JIT code assumes argc == callee_arg_count: it may write back
+ * to argv[i] (via put_arg) for any i < callee_arg_count.  When nargs <
+ * callee_arg_count, argv[i] for i >= nargs would be out-of-bounds, and when
+ * nargs == callee_arg_count the callee's _FREE(argv[i]) would double-free the
+ * caller's own arg slots.  We therefore create a private padded copy.
+ *
+ * This mirrors the padding in js_jit_call(). */
+JSValue js_jit_ic_direct_call(
+    JSContext *ctx, JSValue this_val,
+    int nargs, JSValue *argv,
+    JSJITCallICEntry *ic, JSVarRef **var_refs)
+{
+    int n = ic->callee_arg_count;
+    /* alloca is safe here: arg counts are small (< 64 typically) */
+    JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * (n > 0 ? n : 1));
+    int i;
+    for (i = 0; i < nargs && i < n; i++)
+        padded[i] = JS_DupValue(ctx, argv[i]);
+    for (; i < n; i++)
+        padded[i] = JS_UNDEFINED;
+    JSValue ret = ic->direct_jit(ctx, this_val, n, padded,
+                                  ic->callee_cpool, var_refs);
+    for (i = 0; i < n; i++)
+        JS_FreeValue(ctx, padded[i]);
+    return ret;
+}
+
+/* P11.3: Populate call IC after a miss.
+ *
+ * On first miss (cold):  fill with the callee's identity + JIT info.
+ * On same callee again:  refresh direct_jit if it has since been compiled.
+ * On different callee:   mark megamorphic — never cache again.
+ *
+ * Only bytecode functions are cached; builtins/bound functions go megamorphic
+ * immediately since they are almost always monomorphic in practice and
+ * js_jit_call already handles them cheaply.
+ */
+void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
+{
+    (void)ctx;
+    if (ic->expected_func == JIT_IC_MEGAMORPHIC)
+        return; /* already megamorphic — no point filling */
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) {
+        ic->expected_func = JIT_IC_MEGAMORPHIC; /* primitive callee — not cacheable */
+        return;
+    }
+    JSObject *fo = JS_VALUE_GET_OBJ(func);
+    if (fo->class_id != JS_CLASS_BYTECODE_FUNCTION) {
+        ic->expected_func = JIT_IC_MEGAMORPHIC; /* builtin/bound — go megamorphic */
+        return;
+    }
+    JSFunctionBytecode *b = fo->u.func.function_bytecode;
+    if (ic->expected_func == NULL) {
+        /* Cold → fill */
+        ic->expected_func     = fo;
+        ic->expected_bc       = b;
+        ic->direct_jit        = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+        ic->callee_cpool      = b->cpool;
+        ic->callee_var_refs   = fo->u.func.var_refs;
+        ic->callee_arg_count  = b->arg_count;
+        ic->callee_bc_hash    = b->jit_bc_hash;
+    } else if (ic->expected_func == fo && ic->expected_bc == b) {
+        /* Same callee — refresh jit_func if it was compiled since last fill */
+        if (ic->direct_jit == NULL) {
+            JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+            if (jf) {
+                ic->direct_jit      = jf;
+                ic->callee_cpool    = b->cpool;
+                ic->callee_var_refs = fo->u.func.var_refs;
+                ic->callee_bc_hash  = b->jit_bc_hash;
+            }
+        }
+    } else {
+        /* Different callee — megamorphic */
+        ic->expected_func = JIT_IC_MEGAMORPHIC;
+    }
+}
 /* Returns function name as a C string (caller must NOT free - static buffer). */
 const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
 {
@@ -16015,6 +16100,30 @@ _Static_assert(sizeof(JSShapeProperty)          == JIT_SHAPEIC_PROPSIZE,
                "JIT_SHAPEIC_PROPSIZE mismatch");
 _Static_assert(offsetof(JSShapeProperty, atom)  == JIT_SHAPEIC_ATOM_OFF,
                "JIT_SHAPEIC_ATOM_OFF mismatch");
+
+/* P11.4: Verify JSObject array layout constants used by the inline array
+ * element fast path in quickjs-jit.c (OP_get_array_el / OP_put_array_el). */
+_Static_assert(offsetof(JSObject, class_id)           == JIT_OBJ_CLASSID_OFF,
+               "JIT_OBJ_CLASSID_OFF mismatch");
+_Static_assert((int)JS_CLASS_ARRAY                    == JIT_CLASS_ARRAY,
+               "JIT_CLASS_ARRAY mismatch");
+_Static_assert(offsetof(JSObject, u.array.count)      == JIT_ARR_COUNT_OFF,
+               "JIT_ARR_COUNT_OFF mismatch");
+_Static_assert(offsetof(JSObject, u.array.u.values)   == JIT_ARR_VALUES_OFF,
+               "JIT_ARR_VALUES_OFF mismatch");
+
+/* P11.3: Verify JSObject bytecode-function layout constants used by the
+ * call IC in quickjs-jit.c (OP_call / OP_call_method). */
+_Static_assert(offsetof(JSObject, u.func.function_bytecode) == JIT_FUNC_BC_OFF,
+               "JIT_FUNC_BC_OFF mismatch");
+_Static_assert(offsetof(JSObject, u.func.var_refs)          == JIT_FUNC_VARREFS_OFF,
+               "JIT_FUNC_VARREFS_OFF mismatch");
+_Static_assert((int)JS_CLASS_BYTECODE_FUNCTION              == JIT_CLASS_BYTECODE_FUNCTION,
+               "JIT_CLASS_BYTECODE_FUNCTION mismatch");
+_Static_assert(offsetof(JSFunctionBytecode, jit_func)       == JIT_BC_JIT_FUNC_OFF,
+               "JIT_BC_JIT_FUNC_OFF mismatch");
+_Static_assert(offsetof(JSFunctionBytecode, jit_bc_hash)    == JIT_BC_BCHASH_OFF,
+               "JIT_BC_BCHASH_OFF mismatch");
 
 /* js_jit_ic_check: shape pointer guard + atom-at-slot ABA guard.
  * The atom check prevents false positives when a shape is freed and its
