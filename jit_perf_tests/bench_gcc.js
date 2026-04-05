@@ -7,9 +7,15 @@
  *   3. Run a few warm calls to confirm JIT is active.
  *   4. Measure elapsed time.
  *
- * Run with: ./qjs jit_perf_tests/bench_gcc.js
- * (Build with: make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs)
+ * Run with (QuickJS JIT):
+ *   ./qjs jit_perf_tests/bench_gcc.js
+ *   (Build with: make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs)
+ * Run with (Node.js — measures Node's own JIT, busy-wait is a no-op):
+ *   node jit_perf_tests/bench_gcc.js
  */
+
+/* Node.js shim: QuickJS has print() built-in; Node uses console.log */
+if (typeof print === 'undefined') var print = console.log.bind(console);
 
 /* ---- benchmark functions ---- */
 

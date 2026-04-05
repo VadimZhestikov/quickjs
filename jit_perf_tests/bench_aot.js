@@ -4,11 +4,16 @@
  * With --jit-aot, all functions are GCC-compiled (or loaded from cache)
  * before execution starts.  No busy-wait warm-up needed.
  *
- * Run with:
+ * Run with (QuickJS):
  *   ./qjs --jit-warmup jit_perf_tests/bench_aot.js   # populate cache
  *   ./qjs --jit-aot    jit_perf_tests/bench_aot.js   # measure (cache hit)
  *   ./qjs              jit_perf_tests/bench_aot.js   # interpreter baseline
+ * Run with (Node.js):
+ *   node jit_perf_tests/bench_aot.js
  */
+
+/* Node.js shim: QuickJS has print() built-in; Node uses console.log */
+if (typeof print === 'undefined') var print = console.log.bind(console);
 
 function fib(n) {
     if (n <= 1) return n;

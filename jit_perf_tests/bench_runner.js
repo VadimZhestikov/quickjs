@@ -1,12 +1,17 @@
 /*
  * bench_runner.js — JIT performance benchmark runner
  *
- * Usage:
+ * Usage (QuickJS):
  *   ./qjs jit_perf_tests/bench_runner.js
+ * Usage (Node.js):
+ *   node jit_perf_tests/bench_runner.js
  *
  * Reports: benchmark name, iterations, elapsed ms, Mops/s
  * JSON output (for diffing): set env BENCH_JSON=1  (not used here; plain text)
  */
+
+/* Node.js shim: QuickJS has print() built-in; Node uses console.log */
+if (typeof print === 'undefined') var print = console.log.bind(console);
 
 function bench(name, warmup_iters, iters, fn) {
     /* Warm-up: let the JIT compile (threshold=2 means 2 warm-up calls suffice) */
