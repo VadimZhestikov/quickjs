@@ -1915,6 +1915,19 @@ compilation completing).  Stable runs (2–5): score range 1006–1208, **median
 
 - **DeltaBlue +49%, Crypto +42%, Splay +38%, RayTrace +32%**: P11.3 call IC is
   eliminating vtable overhead for monomorphic method calls.
+- **Splay full-suite +38%, but isolated +39%**: full-suite Splay column (1688) understates
+  the JIT advantage because accumulated WSL2 scheduling noise over the 60s test run affects
+  it.  Isolated single-benchmark measurement (3 runs, stable values):
+
+  | | Run 1† | Run 2 | Run 3 | Median |
+  |---|---:|---:|---:|---:|
+  | Interpreter | 1107 | 1783 | 1825 | **1804** |
+  | JIT (AOT)   | 2507 | 2521 | 2467 | **2507** |
+
+  †Run 1 is the WSL2 first-process startup anomaly (discarded).  JIT is **+39%** above
+  interpreter in isolation.  The original −24% Splay regression (pre-P11.x, caused by
+  `JSValue _tsv=JS_UNDEFINED` slot initialization overhead on every recursive call) was
+  fully resolved in P11.2.
 - **RegExp −37%**: RegExp JS code calls into the C regexp engine (not JIT-compiled).
   Even after the megamorphic fix, the IC check adds ~1 pointer comparison per call.
   The overall RegExp benchmark score is dominated by the C engine, not JS overhead.
@@ -1923,4 +1936,5 @@ compilation completing).  Stable runs (2–5): score range 1006–1208, **median
 - **EarleyBoyer −4%**: within noise.  Single runs show up to 3898 (P11.3 call IC
   hitting the hot path repeatedly); the median is depressed by system variability.
 - WSL2 scheduling noise dominates run-to-run variance; measuring 5 runs with medians
-  gives the most stable signal.
+  gives the most stable signal for the full suite.  For individual benchmarks, isolated
+  runs (one benchmark per process) are more reliable.
