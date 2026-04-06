@@ -16278,6 +16278,252 @@ JSValue js_jit_op_type_of(JSContext *ctx, JSValue a)
     return JS_AtomToString(ctx, atom);
 }
 
+/* P18: typeof_is_undefined / typeof_is_function helpers.
+ * These consume the value (free it) and return 1/0.
+ * They use js_operator_typeof() which handles HTMLDDA objects correctly. */
+int js_jit_op_typeof_is_undefined(JSContext *ctx, JSValue a)
+{
+    int r = ((JSAtom)js_operator_typeof(ctx, a) == JS_ATOM_undefined);
+    JS_FreeValue(ctx, a);
+    return r;
+}
+
+int js_jit_op_typeof_is_function(JSContext *ctx, JSValue a)
+{
+    int r = ((JSAtom)js_operator_typeof(ctx, a) == JS_ATOM_function);
+    JS_FreeValue(ctx, a);
+    return r;
+}
+
+/* -----------------------------------------------------------------------
+ * P19 — simple utility op helpers
+ * ----------------------------------------------------------------------- */
+
+/* OP_get_var_undef slow path: like get_var_slow but passes FALSE (no throw)
+ * to JS_GetPropertyInternal when the global var is not found. */
+JSValue js_jit_op_get_var_undef(JSContext *ctx, JSAtom atom, int is_lexical)
+{
+    if (is_lexical) {
+        JS_ThrowReferenceErrorUninitialized(ctx, atom);
+        return JS_EXCEPTION;
+    }
+    return JS_GetPropertyInternal(ctx, ctx->global_obj, atom,
+                                   ctx->global_obj, FALSE);
+}
+
+/* OP_throw_error: throw by (atom, type) pair — mirrors interpreter exactly. */
+void js_jit_op_throw_error(JSContext *ctx, JSAtom atom, int type)
+{
+#define JS_THROW_VAR_RO             0
+#define JS_THROW_VAR_REDECL         1
+#define JS_THROW_VAR_UNINITIALIZED  2
+#define JS_THROW_ERROR_DELETE_SUPER   3
+#define JS_THROW_ERROR_ITERATOR_THROW 4
+    switch (type) {
+    case JS_THROW_VAR_RO:
+        JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, atom); break;
+    case JS_THROW_VAR_REDECL:
+        JS_ThrowSyntaxErrorVarRedeclaration(ctx, atom); break;
+    case JS_THROW_VAR_UNINITIALIZED:
+        JS_ThrowReferenceErrorUninitialized(ctx, atom); break;
+    case JS_THROW_ERROR_DELETE_SUPER:
+        JS_ThrowReferenceError(ctx, "unsupported reference to 'super'"); break;
+    case JS_THROW_ERROR_ITERATOR_THROW:
+        JS_ThrowTypeError(ctx, "iterator does not have a throw method"); break;
+    default:
+        JS_ThrowInternalError(ctx, "invalid throw error type %d", type); break;
+    }
+#undef JS_THROW_VAR_RO
+#undef JS_THROW_VAR_REDECL
+#undef JS_THROW_VAR_UNINITIALIZED
+#undef JS_THROW_ERROR_DELETE_SUPER
+#undef JS_THROW_ERROR_ITERATOR_THROW
+}
+
+/* OP_to_object: borrows val, returns new reference (or JS_EXCEPTION). */
+JSValue js_jit_op_to_object(JSContext *ctx, JSValue val)
+{
+    return JS_ToObject(ctx, val);
+}
+
+/* OP_to_propkey: borrows val, returns new reference (or JS_EXCEPTION). */
+JSValue js_jit_op_to_propkey(JSContext *ctx, JSValue val)
+{
+    return JS_ToPropertyKey(ctx, val);
+}
+
+/* OP_regexp: consumes both pattern and bc (matches JS_NewRegexp). */
+JSValue js_jit_op_regexp(JSContext *ctx, JSValue pattern, JSValue bc)
+{
+    return JS_NewRegexp(ctx, pattern, bc);
+}
+
+/* OP_set_name_computed: borrows func and name_src.
+ * Returns 0 on success, -1 on exception. */
+int js_jit_op_set_name_computed(JSContext *ctx, JSValue func, JSValue name_src)
+{
+    return JS_DefineObjectNameComputed(ctx, func, name_src, JS_PROP_CONFIGURABLE);
+}
+
+/* OP_set_proto: borrows obj and proto.
+ * Only calls JS_SetPrototypeInternal when proto is object or null.
+ * Returns 0 on success, -1 on exception. */
+int js_jit_op_set_proto(JSContext *ctx, JSValue obj, JSValue proto)
+{
+    if (JS_IsObject(proto) || JS_IsNull(proto))
+        return JS_SetPrototypeInternal(ctx, obj, proto, TRUE);
+    return 0;
+}
+
+/* OP_set_home_object: borrows both func and home. */
+void js_jit_op_set_home_object(JSContext *ctx, JSValue func, JSValue home)
+{
+    js_method_set_home_object(ctx, func, home);
+}
+
+/* OP_get_array_el2: borrows obj, CONSUMES prop.
+ * Returns the element (new reference) or JS_EXCEPTION. */
+JSValue js_jit_op_get_array_el2(JSContext *ctx, JSValue obj, JSValue prop)
+{
+    return JS_GetPropertyValue(ctx, obj, prop);
+}
+
+/* OP_define_array_el: borrows arr, CONSUMES prop and val.
+ * Returns 0 on success, -1 on exception. */
+int js_jit_op_define_array_el(JSContext *ctx, JSValue arr, JSValue prop, JSValue val)
+{
+    return JS_DefinePropertyValueValue(ctx, arr, prop, val,
+                                       JS_PROP_C_W_E | JS_PROP_THROW);
+}
+
+/* OP_push_bigint_i32: create a BigInt from an int32 literal.
+ * __JS_NewShortBigInt never fails (no allocation for small values). */
+JSValue js_jit_op_push_bigint_i32(JSContext *ctx, int32_t v)
+{
+    return __JS_NewShortBigInt(ctx, (js_slimb_t)v);
+}
+
+/* OP_close_loc: detach one captured local's JSVarRef from its _cap_buf slot.
+ * Mirrors js_jit_close_caps but for a single entry. */
+void js_jit_op_close_loc(JSContext *ctx, JSVarRef *vref)
+{
+    if (vref && !vref->is_detached) {
+        JSRuntime *rt = JS_GetRuntime(ctx);
+        vref->value    = JS_DupValueRT(rt, *vref->pvalue);
+        vref->pvalue   = &vref->value;
+        vref->is_detached = TRUE;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * P20 — reference-slot op helpers
+ * ----------------------------------------------------------------------- */
+
+/* Create a ref-pair JSObject using an existing JSVarRef.
+ * Increments vref->header.ref_count; fills *pobj (the ref object) and
+ * *patom (JS_AtomToValue of atom).
+ * Used by OP_make_loc_ref / OP_make_arg_ref / OP_make_var_ref_ref. */
+int js_jit_op_make_ref_pair(JSContext *ctx, JSVarRef *var_ref, JSAtom atom,
+                             JSValue *pobj, JSValue *patom)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(obj)) return -1;
+    var_ref->header.ref_count++;
+    JSProperty *pr = add_property(ctx, JS_VALUE_GET_OBJ(obj), atom,
+                                   JS_PROP_WRITABLE | JS_PROP_VARREF);
+    if (!pr) {
+        free_var_ref(rt, var_ref);
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    pr->u.var_ref = var_ref;
+    *pobj  = obj;
+    *patom = JS_AtomToValue(ctx, atom);
+    return 0;
+}
+
+/* OP_make_var_ref: create a ref-pair for a global variable. */
+int js_jit_op_make_var_ref(JSContext *ctx, JSAtom atom,
+                            JSValue *pobj, JSValue *patom)
+{
+    JSValue sp[2];
+    if (JS_GetGlobalVarRef(ctx, atom, sp))
+        return -1;
+    *pobj  = sp[0];
+    *patom = sp[1];
+    return 0;
+}
+
+/* OP_get_ref_value: read value from ref-pair (borrows obj and atom_val).
+ * Mirrors the interpreter's OP_get_ref_value exactly. */
+JSValue js_jit_op_get_ref_value(JSContext *ctx, JSValue obj, JSValue atom_val)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, atom_val);
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    if (unlikely(JS_IsUndefined(obj))) {
+        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+        JS_FreeAtom(ctx, atom);
+        return JS_EXCEPTION;
+    }
+    int ret = JS_HasProperty(ctx, obj, atom);
+    JSValue val;
+    if (ret <= 0) {
+        if (ret < 0) { JS_FreeAtom(ctx, atom); return JS_EXCEPTION; }
+        if (is_strict_mode(ctx)) {
+            JS_ThrowReferenceErrorNotDefined(ctx, atom);
+            JS_FreeAtom(ctx, atom);
+            return JS_EXCEPTION;
+        }
+        val = JS_UNDEFINED;
+    } else {
+        val = JS_GetProperty(ctx, obj, atom);
+    }
+    JS_FreeAtom(ctx, atom);
+    return val;
+}
+
+/* OP_put_ref_value: write value via ref-pair (CONSUMES obj, atom_val, val).
+ * Mirrors the interpreter's OP_put_ref_value exactly. */
+int js_jit_op_put_ref_value(JSContext *ctx, JSValue obj, JSValue atom_val, JSValue val)
+{
+    int ret;
+    JSAtom atom = JS_ValueToAtom(ctx, atom_val);
+    if (unlikely(atom == JS_ATOM_NULL)) {
+        JS_FreeValue(ctx, obj); JS_FreeValue(ctx, atom_val); JS_FreeValue(ctx, val);
+        return -1;
+    }
+    if (unlikely(JS_IsUndefined(obj))) {
+        if (is_strict_mode(ctx)) {
+            JS_ThrowReferenceErrorNotDefined(ctx, atom);
+            JS_FreeAtom(ctx, atom);
+            JS_FreeValue(ctx, obj); JS_FreeValue(ctx, atom_val); JS_FreeValue(ctx, val);
+            return -1;
+        }
+        JS_FreeValue(ctx, obj);
+        obj = JS_DupValue(ctx, ctx->global_obj);
+    }
+    ret = JS_HasProperty(ctx, obj, atom);
+    if (unlikely(ret < 0)) {
+        JS_FreeAtom(ctx, atom);
+        JS_FreeValue(ctx, obj); JS_FreeValue(ctx, atom_val); JS_FreeValue(ctx, val);
+        return -1;
+    }
+    if (ret == 0 && is_strict_mode(ctx)) {
+        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+        JS_FreeAtom(ctx, atom);
+        JS_FreeValue(ctx, obj); JS_FreeValue(ctx, atom_val); JS_FreeValue(ctx, val);
+        return -1;
+    }
+    /* JS_SetPropertyInternal consumes val; js_op_put_ref_value frees obj+atom_val */
+    ret = JS_SetPropertyInternal(ctx, obj, atom, val, obj, JS_PROP_THROW_STRICT);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, atom_val);
+    JS_FreeValue(ctx, obj);
+    return (ret < 0) ? -1 : 0;
+}
+
 /* -----------------------------------------------------------------------
  * Inline Property Cache helpers — Phase 6.2
  * ----------------------------------------------------------------------- */

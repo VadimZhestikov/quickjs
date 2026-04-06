@@ -204,6 +204,8 @@ const JSJITRuntime js_jit_rt = {
     .plus             = js_jit_op_plus,
     .bnot             = js_jit_op_bnot,
     .type_of          = js_jit_op_type_of,
+    .typeof_is_undefined = js_jit_op_typeof_is_undefined,
+    .typeof_is_function  = js_jit_op_typeof_is_function,
     /* comparisons */
     .lt               = js_jit_op_lt,
     .lte              = js_jit_op_lte,
@@ -234,6 +236,24 @@ const JSJITRuntime js_jit_rt = {
     .throw_val        = jit_rt_throw_val,
     /* P8.2: interrupt poll for direct self-recursive calls */
     .poll_interrupts  = js_jit_poll_interrupts,
+    /* P19: utility ops */
+    .get_var_undef    = js_jit_op_get_var_undef,
+    .throw_error      = js_jit_op_throw_error,
+    .to_object        = js_jit_op_to_object,
+    .to_propkey       = js_jit_op_to_propkey,
+    .regexp           = js_jit_op_regexp,
+    .set_name_computed = js_jit_op_set_name_computed,
+    .set_proto        = js_jit_op_set_proto,
+    .set_home_object  = js_jit_op_set_home_object,
+    .get_array_el2    = js_jit_op_get_array_el2,
+    .define_array_el  = js_jit_op_define_array_el,
+    .push_bigint_i32  = js_jit_op_push_bigint_i32,
+    .close_loc        = js_jit_op_close_loc,
+    /* P20: ref-slot ops */
+    .make_ref_pair    = js_jit_op_make_ref_pair,
+    .make_var_ref     = js_jit_op_make_var_ref,
+    .get_ref_value    = js_jit_op_get_ref_value,
+    .put_ref_value    = js_jit_op_put_ref_value,
 };
 
 /* -----------------------------------------------------------------------
@@ -825,7 +845,11 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_not: _TI_DROPN(1); _TI_PUSH(JIT_T_NUMBER); break;
 
             /* ---- Boolean / comparison / typeof → JSVAL ---- */
-            case OP_lnot: case OP_typeof: _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            /* P18: type-test ops: consume 1, push bool (JSVAL) */
+            case OP_lnot: case OP_typeof:
+            case OP_is_null: case OP_is_undefined: case OP_is_undefined_or_null:
+            case OP_typeof_is_undefined: case OP_typeof_is_function:
+                _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
             case OP_lt:  case OP_lte: case OP_gt:  case OP_gte:
             case OP_eq:  case OP_neq: case OP_strict_eq: case OP_strict_neq:
             case OP_instanceof: case OP_in: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
@@ -892,6 +916,43 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
                 if (sp>=1) st[sp-1]=JIT_T_JSVAL;
                 if (sp>=2) st[sp-2]=JIT_T_JSVAL;
                 _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* P18: new stack-shuffle ops */
+            case OP_insert3: /* obj prop a -> a obj prop a: +1 */
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_insert4: /* this obj prop a -> a this obj prop a: +1 */
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                if (sp>=4) st[sp-4]=JIT_T_JSVAL;
+                _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_dup3: /* a b c -> a b c a b c: +3 */
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_nip1: /* a b c -> b c: -1 (removes 3rd-from-top) */
+                if (sp>=3) { st[sp-3]=st[sp-2]; st[sp-2]=st[sp-1]; }
+                _TI_DROPN(1); break;
+            /* Depth-neutral shuffles: conservatively mark all involved slots JSVAL */
+            case OP_perm3: /* 3 slots */
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                break;
+            case OP_perm4: case OP_rot4l: case OP_swap2: /* 4 slots */
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                if (sp>=4) st[sp-4]=JIT_T_JSVAL;
+                break;
+            case OP_perm5: case OP_rot5l: /* 5 slots */
+                if (sp>=1) st[sp-1]=JIT_T_JSVAL;
+                if (sp>=2) st[sp-2]=JIT_T_JSVAL;
+                if (sp>=3) st[sp-3]=JIT_T_JSVAL;
+                if (sp>=4) st[sp-4]=JIT_T_JSVAL;
+                if (sp>=5) st[sp-5]=JIT_T_JSVAL;
+                break;
 
             /* ---- Arg/varref writes (no effect on locals) ---- */
             case OP_put_arg:  case OP_put_arg0: case OP_put_arg1:
@@ -990,6 +1051,37 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_call_constructor: {
                 int n=(int)bc_u16(&bc[pc+1]); _TI_DROPN(n+2); _TI_PUSH(JIT_T_JSVAL); break;
             }
+
+            /* ---- P19: utility ops ---- */
+            case OP_get_var_undef: _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_throw_error: break; /* no stack effect (always throws) */
+            case OP_to_object: case OP_to_propkey:
+                _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_regexp: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            /* set_name_computed: func name → func name (no net change) */
+            case OP_set_name_computed: break;
+            /* set_proto: obj proto → obj (-1) */
+            case OP_set_proto: _TI_DROPN(1); break;
+            /* set_home_object: func home → func home (no net change) */
+            case OP_set_home_object: break;
+            /* get_array_el2: obj prop → obj val (net 0; prop consumed, val replaces it) */
+            case OP_get_array_el2: _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break;
+            /* get_array_el3: arr idx → arr idx result (+1) */
+            case OP_get_array_el3: _TI_PUSH(JIT_T_JSVAL); break;
+            /* define_array_el: arr prop val → arr prop (-1) */
+            case OP_define_array_el: _TI_DROPN(1); break;
+            case OP_push_bigint_i32: _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_close_loc: break; /* no stack effect */
+
+            /* ---- P20: ref-slot ops ---- */
+            /* make_loc_ref/make_arg_ref/make_var_ref/make_var_ref_ref: push 2 (obj, atom_val) */
+            case OP_make_loc_ref: case OP_make_arg_ref:
+            case OP_make_var_ref: case OP_make_var_ref_ref:
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            /* get_ref_value: obj atom_val → obj atom_val result (+1) */
+            case OP_get_ref_value: _TI_PUSH(JIT_T_JSVAL); break;
+            /* put_ref_value: obj atom_val val → (pops all 3) */
+            case OP_put_ref_value: _TI_DROPN(3); break;
 
             default: break;
             }
@@ -2599,6 +2691,73 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-1, d-2, d-2, d-3, d-3);
             break;
 
+        /* ---- P18: new stack-shuffle opcodes ---- */
+        case OP_dup3: /* a b c -> a b c a b c: depth d -> d+3 */
+            jit_buf_printf(cb,
+                "    _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _sp=%d;\n",
+                d, d-3, d+1, d-2, d+2, d-1, d+3);
+            break;
+        case OP_nip1: /* a b c -> b c: depth d -> d-1 (removes 3rd-from-top) */
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _t1=_tsv%d,_t2=_tsv%d; _FREE(_tsv%d); _tsv%d=_t1; _tsv%d=_t2; _sp=%d; }\n",
+                d-2, d-1, d-3, d-3, d-2, d-1);
+            break;
+        case OP_insert3: /* obj prop a -> a obj prop a: depth d -> d+1 */
+            _P94_ENSURE(d-1); _P94_ENSURE(d-2); _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_DUP(_tsv%d);"
+                " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
+                d-1, d, d-1, d-1, d-2, d-2, d-3, d-3, d+1);
+            break;
+        case OP_insert4: /* this obj prop a -> a this obj prop a: depth d -> d+1 */
+            _P94_ENSURE(d-1); _P94_ENSURE(d-2); _P94_ENSURE(d-3); _P94_ENSURE(d-4);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_DUP(_tsv%d);"
+                " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
+                d-1, d, d-1, d-1, d-2, d-2, d-3, d-3, d-4, d-4, d+1);
+            break;
+        case OP_perm3: /* obj a b -> a obj b: swap sp[-3] and sp[-2] */
+            _P94_ENSURE(d-3); _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-2, d-2, d-3, d-3);
+            break;
+        case OP_perm4: /* obj prop a b -> a obj prop b */
+            _P94_ENSURE(d-4); _P94_ENSURE(d-3); _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-2, d-2, d-3, d-3, d-4, d-4);
+            break;
+        case OP_perm5: /* this obj prop a b -> a this obj prop b */
+            _P94_ENSURE(d-5); _P94_ENSURE(d-4); _P94_ENSURE(d-3); _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d;"
+                " _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-2, d-2, d-3, d-3, d-4, d-4, d-5, d-5);
+            break;
+        case OP_rot4l: /* x a b c -> a b c x */
+            _P94_ENSURE(d-4); _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d;"
+                " _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-4, d-4, d-3, d-3, d-2, d-2, d-1, d-1);
+            break;
+        case OP_rot5l: /* x a b c d -> a b c d x */
+            _P94_ENSURE(d-5); _P94_ENSURE(d-4); _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d;"
+                " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
+                d-5, d-5, d-4, d-4, d-3, d-3, d-2, d-2, d-1, d-1);
+            break;
+        case OP_swap2: /* a b c d -> c d a b */
+            _P94_ENSURE(d-4); _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _t1=_tsv%d,_t2=_tsv%d;"
+                " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t1; _tsv%d=_t2; }\n",
+                d-4, d-3, d-4, d-2, d-3, d-1, d-2, d-1);
+            break;
+
         /* ---- Local variable access (Phase 5 / P8.1: type-aware) ----
          *
          * JIT_T_INT    → int64_t _li[idx]: single int64 op, no branch in hot path.
@@ -3248,6 +3407,50 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      else { _tsv%d=JS_NewBool(ctx,!JS_ToBool(ctx,_a)); _FREE(_a); }\n"
                 "      _sp=%d; }\n",
                 d-1, d-1, d-1, d-1, d);
+            break;
+
+        /* ---- P18: type-test opcodes ---- */
+        /* is_null / is_undefined / is_undefined_or_null:
+         * Check JS_TAG_* directly. _FREE is always safe — NULL/UNDEFINED are
+         * immediates so JS_FreeValue is a no-op for them. */
+        case OP_is_null:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _is=(JS_VALUE_GET_TAG(_tsv%d)==JS_TAG_NULL);"
+                " _FREE(_tsv%d); _tsv%d=JS_NewBool(ctx,_is); _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        case OP_is_undefined:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _is=(JS_VALUE_GET_TAG(_tsv%d)==JS_TAG_UNDEFINED);"
+                " _FREE(_tsv%d); _tsv%d=JS_NewBool(ctx,_is); _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        case OP_is_undefined_or_null:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _tag=JS_VALUE_GET_TAG(_tsv%d);"
+                " int _is=(_tag==JS_TAG_NULL||_tag==JS_TAG_UNDEFINED);"
+                " _FREE(_tsv%d); _tsv%d=JS_NewBool(ctx,_is); _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        /* typeof_is_undefined / typeof_is_function:
+         * Use runtime helpers that call js_operator_typeof() (handles HTMLDDA).
+         * The helpers consume (free) the value and return int. */
+        case OP_typeof_is_undefined:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _is=_RT->typeof_is_undefined(ctx,_tsv%d);"
+                " _tsv%d=JS_NewBool(ctx,_is); _sp=%d; }\n",
+                d-1, d-1, d);
+            break;
+        case OP_typeof_is_function:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _is=_RT->typeof_is_function(ctx,_tsv%d);"
+                " _tsv%d=JS_NewBool(ctx,_is); _sp=%d; }\n",
+                d-1, d-1, d);
             break;
 
         /* ---- Increment / decrement ---- */
@@ -4896,6 +5099,247 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P19: utility ops ---- */
+
+        /* OP_get_var_undef: like OP_get_var but passes FALSE to GetPropertyInternal.
+         * Operand: u16 index into closure var_refs. */
+        case OP_get_var_undef: {
+            int idx = (int)bc_u16(&bc[pc+1]);
+            JSAtom cv_atom   = js_jit_fb_get_closure_var_atom(b, idx);
+            int    cv_is_lex = js_jit_fb_get_closure_var_is_lexical(b, idx);
+            jit_buf_printf(cb,
+                "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
+                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED){\n"
+                "        JSValue _r=_RT->get_var_undef(ctx,%uu,%d);\n"
+                "        _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
+                "      } else { _tsv%d=_DUP(*_pv); _sp=%d; } }\n",
+                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, d+1);
+            break;
+        }
+
+        /* OP_throw_error: bake atom+type into generated C, always jumps to _ex.
+         * Operand: atom u32 + type u8. */
+        case OP_throw_error: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            int type = (int)bc[pc+5];
+            jit_buf_printf(cb,
+                "    _RT->throw_error(ctx,(JSAtom)%uu,%d); goto _ex;\n",
+                (unsigned)atom, type);
+            break;
+        }
+
+        /* OP_to_object: borrows top-of-stack, replaces with wrapped object. */
+        case OP_to_object: {
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _v=_tsv%d;\n"
+                "      JSValue _r=_RT->to_object(ctx,_v);\n"
+                "      _FREE(_v); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        }
+
+        /* OP_to_propkey: borrows top-of-stack, replaces with propkey-coerced value. */
+        case OP_to_propkey: {
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _v=_tsv%d;\n"
+                "      JSValue _r=_RT->to_propkey(ctx,_v);\n"
+                "      _FREE(_v); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        }
+
+        /* OP_regexp: pops pattern and bc_val (both consumed), pushes RegExp object. */
+        case OP_regexp: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _pat=_tsv%d, _bc2=_tsv%d; _sp=%d;\n"
+                "      JSValue _r=_RT->regexp(ctx,_pat,_bc2);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d-2, d-2, d-2, d-1);
+            break;
+        }
+
+        /* OP_set_name_computed: name_src(_tsv{d-2}) func(_tsv{d-1}) — no depth change.
+         * Interpreter: JS_DefineObjectNameComputed(ctx, sp[-1]=func, sp[-2]=name_src).
+         * Borrows both, may throw. */
+        case OP_set_name_computed: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { int _r=_RT->set_name_computed(ctx,_tsv%d,_tsv%d);\n"
+                "      if(_r<0) goto _ex; }\n",
+                d-1, d-2);  /* func=d-1, name_src=d-2 */
+            break;
+        }
+
+        /* OP_set_proto: obj(_tsv{d-2}) proto(_tsv{d-1}) → obj; pops proto. */
+        case OP_set_proto: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _proto=_tsv%d; _sp=%d;\n"
+                "      int _r=_RT->set_proto(ctx,_tsv%d,_proto);\n"
+                "      _FREE(_proto);\n"
+                "      if(_r<0) goto _ex; }\n",
+                d-1, d-1, d-2);
+            break;
+        }
+
+        /* OP_set_home_object: home(_tsv{d-2}) func(_tsv{d-1}) — no depth change.
+         * Interpreter: js_method_set_home_object(ctx, sp[-1]=func, sp[-2]=home).
+         * Borrows both, never throws. */
+        case OP_set_home_object: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    _RT->set_home_object(ctx,_tsv%d,_tsv%d);\n",
+                d-1, d-2);  /* func=d-1, home=d-2 */
+            break;
+        }
+
+        /* OP_get_array_el2: obj(_tsv{d-2}) prop(_tsv{d-1}) → obj val.
+         * Borrows obj, CONSUMES prop; val replaces prop at d-1. Depth unchanged. */
+        case OP_get_array_el2: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _prop=_tsv%d; _sp=%d;\n"
+                "      JSValue _r=_RT->get_array_el2(ctx,_tsv%d,_prop);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-1, d-2, d-1, d-1, d);
+            break;
+        }
+
+        /* OP_get_array_el3: arr(_tsv{d-2}) idx(_tsv{d-1}) → arr idx result.
+         * Borrows both; result pushed at _tsv{d}. Depth +1. */
+        case OP_get_array_el3: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->get_array_el2(ctx,_tsv%d,_DUP(_tsv%d));\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d, d, d+1);
+            break;
+        }
+
+        /* OP_define_array_el: arr(_tsv{d-3}) key(_tsv{d-2}) val(_tsv{d-1}) → arr key.
+         * Borrows arr, DUPs key (helper consumes DUP), consumes val. Depth -1. */
+        case OP_define_array_el: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _val=_tsv%d; _sp=%d;\n"
+                "      int _r=_RT->define_array_el(ctx,_tsv%d,_DUP(_tsv%d),_val);\n"
+                "      if(_r<0) goto _ex; }\n",
+                d-1, d-1, d-3, d-2);
+            break;
+        }
+
+        /* OP_push_bigint_i32: push BigInt from i32 literal. Operand: i32. */
+        case OP_push_bigint_i32: {
+            int32_t v = (int32_t)bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->push_bigint_i32(ctx,%d);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                v, d, d, d+1);
+            break;
+        }
+
+        /* OP_close_loc: detach one captured local's JSVarRef.
+         * Operand: u16 local var idx → mapped through vardefs to get _sf_vrefs index. */
+        case OP_close_loc: {
+            int var_idx = (int)bc_u16(&bc[pc+1]);
+            int vri = js_jit_fb_get_local_var_ref_idx(b, var_idx);
+            if (vri < 0) {
+                /* var has no associated var_ref — close_loc is a no-op here */
+                break;
+            }
+            jit_buf_printf(cb,
+                "    _RT->close_loc(ctx,_sf_vrefs[%d]);\n", vri);
+            break;
+        }
+
+        /* ---- P20: ref-slot ops ---- */
+
+        /* OP_make_loc_ref / OP_make_arg_ref: capture a local/arg into a ref-pair.
+         * Operands: atom u32 + idx u16 (local/arg index → mapped to _sf_vrefs index).
+         * Pushes (obj, atom_val) at d, d+1. */
+        case OP_make_loc_ref:
+        case OP_make_arg_ref: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            int idx = (int)bc_u16(&bc[pc+5]);
+            int vri = (op == OP_make_arg_ref)
+                      ? js_jit_fb_get_arg_var_ref_idx(b, idx)
+                      : js_jit_fb_get_local_var_ref_idx(b, idx);
+            if (vri < 0) {
+                /* No var_ref available — generate a runtime error path */
+                jit_buf_printf(cb,
+                    "    JS_ThrowInternalError(ctx,\"make_ref: no var_ref for idx %d\"); goto _ex;\n",
+                    idx);
+                break;
+            }
+            jit_buf_printf(cb,
+                "    { JSValue _obj, _atv;\n"
+                "      if(_RT->make_ref_pair(ctx,_sf_vrefs[%d],(JSAtom)%uu,&_obj,&_atv)<0) goto _ex;\n"
+                "      _sp=%d; _tsv%d=_obj; _sp=%d; _tsv%d=_atv; _sp=%d; }\n",
+                vri, (unsigned)atom, d, d, d+1, d+1, d+2);
+            break;
+        }
+
+        /* OP_make_var_ref_ref: re-use an existing closure var_ref (outer capture).
+         * Operands: atom u32 + var_ref_idx u16. Pushes (obj, atom_val). */
+        case OP_make_var_ref_ref: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            int idx = (int)bc_u16(&bc[pc+5]);
+            jit_buf_printf(cb,
+                "    { JSValue _obj, _atv;\n"
+                "      if(_RT->make_ref_pair(ctx,var_refs[%d],(JSAtom)%uu,&_obj,&_atv)<0) goto _ex;\n"
+                "      _sp=%d; _tsv%d=_obj; _sp=%d; _tsv%d=_atv; _sp=%d; }\n",
+                idx, (unsigned)atom, d, d, d+1, d+1, d+2);
+            break;
+        }
+
+        /* OP_make_var_ref: create a ref-pair for a global variable.
+         * Operand: atom u32. Pushes (obj, atom_val). */
+        case OP_make_var_ref: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _obj, _atv;\n"
+                "      if(_RT->make_var_ref(ctx,(JSAtom)%uu,&_obj,&_atv)<0) goto _ex;\n"
+                "      _sp=%d; _tsv%d=_obj; _sp=%d; _tsv%d=_atv; _sp=%d; }\n",
+                (unsigned)atom, d, d, d+1, d+1, d+2);
+            break;
+        }
+
+        /* OP_get_ref_value: obj(_tsv{d-2}) atom_val(_tsv{d-1}) → obj atom_val result.
+         * Borrows both; result pushed at _tsv{d}. Depth +1. */
+        case OP_get_ref_value: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->get_ref_value(ctx,_tsv%d,_tsv%d);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d, d, d+1);
+            break;
+        }
+
+        /* OP_put_ref_value: obj(_tsv{d-3}) atom_val(_tsv{d-2}) val(_tsv{d-1}) → (all consumed).
+         * Helper takes ownership of all 3. Depth -3. */
+        case OP_put_ref_value: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _o=_tsv%d,_av=_tsv%d,_val=_tsv%d; _sp=%d;\n"
+                "      if(_RT->put_ref_value(ctx,_o,_av,_val)<0) goto _ex; }\n",
+                d-3, d-2, d-1, d-3);
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -5092,6 +5536,100 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_apply:      _gs_drop=3; _gs_push=JIT_T_JSVAL; break;
             case OP_apply_eval: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
 
+            /* --- P18: type-test ops: 1-in, 1-out (JSVAL bool) --- */
+            case OP_is_null: case OP_is_undefined: case OP_is_undefined_or_null:
+            case OP_typeof_is_undefined: case OP_typeof_is_function:
+                _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            /* P18: stack-shuffle ops — must update gen_st[] for existing slots too.
+             * P94_ENSURE (called in the codegen first-switch) boxes any INT/NUMBER
+             * slot to _tsv before the shuffle.  After the shuffle, all involved
+             * slots hold JSValues; mark them all JSVAL so the next opcode's
+             * P94_ENSURE does not try to re-box a stale _ti value.             */
+            case OP_dup3:   /* a b c -> a b c a b c: +3 */
+                _gs_push=JIT_T_JSVAL; _gs_push_n=3; break;
+            case OP_nip1: { /* a b c -> b c: remove slot gen_sp-3, shift down */
+                int s = gen_sp;
+                if (s >= 3) {
+                    gen_st[s-3] = gen_st[s-2];
+                    gen_st[s-2] = gen_st[s-1];
+                }
+                gen_sp = (s >= 1) ? s-1 : 0;
+                break; }
+            /* insert3: obj prop a -> a obj prop a (+1). P94_ENSURE forces all to JSVAL. */
+            case OP_insert3:
+                if (gen_sp >= 3) {
+                    gen_st[gen_sp-3] = JIT_T_JSVAL; /* dup(a) at bottom */
+                    gen_st[gen_sp-2] = JIT_T_JSVAL; /* obj */
+                    gen_st[gen_sp-1] = JIT_T_JSVAL; /* prop */
+                    if (gen_sp < gen_stk_cap) {
+                        gen_st[gen_sp] = JIT_T_JSVAL; /* original a at top */
+                        gen_sp++;
+                    }
+                }
+                break;
+            /* insert4: this obj prop a -> a this obj prop a (+1) */
+            case OP_insert4:
+                if (gen_sp >= 4) {
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                    if (gen_sp < gen_stk_cap) {
+                        gen_st[gen_sp] = JIT_T_JSVAL;
+                        gen_sp++;
+                    }
+                }
+                break;
+            /* perm3/4/5: cyclic rotation of 3/4/5 slots (depth-neutral). */
+            case OP_perm3:
+                if (gen_sp >= 3) {
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                }
+                break;
+            case OP_perm4:
+                if (gen_sp >= 4) {
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                }
+                break;
+            case OP_perm5:
+                if (gen_sp >= 5) {
+                    gen_st[gen_sp-5] = JIT_T_JSVAL;
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                }
+                break;
+            /* rot4l/rot5l: left-rotate 4/5 slots (depth-neutral). */
+            case OP_rot4l:
+                if (gen_sp >= 4) {
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                break;
+            case OP_rot5l:
+                if (gen_sp >= 5) {
+                    gen_st[gen_sp-5] = JIT_T_JSVAL;
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                break;
+            /* swap2: a b c d -> c d a b (depth-neutral). */
+            case OP_swap2:
+                if (gen_sp >= 4) {
+                    gen_st[gen_sp-4] = JIT_T_JSVAL;
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                break;
+
             /* --- Property / array access → JSVAL --- */
             case OP_get_field:    _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
             case OP_get_field2:              _gs_push=JIT_T_JSVAL; break;
@@ -5114,6 +5652,29 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_yield: break;           /* updated inline in OP_yield case above */
             case OP_await: break;           /* updated inline in OP_await case above */
             case OP_return_async: gen_sp=0; break;
+
+            /* --- P19: utility ops --- */
+            case OP_get_var_undef: _gs_push=JIT_T_JSVAL; break;
+            case OP_throw_error: gen_sp=0; break; /* always jumps to _ex */
+            case OP_to_object: case OP_to_propkey:
+                _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            case OP_regexp: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_set_name_computed: break; /* 2-in 2-out, no net change */
+            case OP_set_proto: _gs_drop=1; break; /* 2-in 1-out */
+            case OP_set_home_object: break; /* 2-in 2-out, no net change */
+            case OP_get_array_el2: _gs_drop=1; _gs_push=JIT_T_JSVAL; break; /* net 0 */
+            case OP_get_array_el3: _gs_push=JIT_T_JSVAL; break; /* net +1 */
+            case OP_define_array_el: _gs_drop=1; break; /* net -1 */
+            case OP_push_bigint_i32: _gs_push=JIT_T_JSVAL; break;
+            case OP_close_loc: break; /* no stack effect */
+
+            /* --- P20: ref-slot ops --- */
+            /* make_*_ref: push 2 (obj, atom_val) */
+            case OP_make_loc_ref: case OP_make_arg_ref:
+            case OP_make_var_ref: case OP_make_var_ref_ref:
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;
+            case OP_get_ref_value: _gs_push=JIT_T_JSVAL; break; /* net +1 */
+            case OP_put_ref_value: _gs_drop=3; break; /* net -3 */
 
             /* Everything else: no tracked stack effect (conservative) */
             default: break;

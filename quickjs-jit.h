@@ -94,6 +94,9 @@ typedef struct JSJITRuntime {
     JSValue (*plus)(JSContext *, JSValue a);   /* ToNumber */
     JSValue (*bnot)(JSContext *, JSValue a);   /* ~ */
     JSValue (*type_of)(JSContext *, JSValue a);
+    /* P18: typeof_is_undefined / typeof_is_function — consume value, return int */
+    int (*typeof_is_undefined)(JSContext *, JSValue a);
+    int (*typeof_is_function)(JSContext *, JSValue a);
 
     /* ------------------------------------------------------------------ */
     /* Comparisons — return JS_TAG_BOOL result or JS_EXCEPTION            */
@@ -175,6 +178,53 @@ typedef struct JSJITRuntime {
      * Called once per direct recursive call to honour JS_SetInterruptHandler.
      * Returns non-zero and sets an exception on the context if interrupted. */
     int (*poll_interrupts)(JSContext *);
+
+    /* ------------------------------------------------------------------ */
+    /* P19 — simple utility ops                                            */
+    /* ------------------------------------------------------------------ */
+    /* OP_get_var_undef slow path: returns JS_UNDEFINED (not exception)
+     * when the global variable is not found.  is_lexical: if true, TDZ throw. */
+    JSValue (*get_var_undef)(JSContext *, JSAtom atom, int is_lexical);
+    /* OP_throw_error: throw by type+atom (type 0-4, see interpreter) */
+    void    (*throw_error)(JSContext *, JSAtom atom, int type);
+    /* OP_to_object: JS_ToObject — borrows val, returns new ref */
+    JSValue (*to_object)(JSContext *, JSValue val);
+    /* OP_to_propkey: JS_ToPropertyKey — borrows val, returns new ref */
+    JSValue (*to_propkey)(JSContext *, JSValue val);
+    /* OP_regexp: JS_NewRegexp — CONSUMES pattern and bc */
+    JSValue (*regexp)(JSContext *, JSValue pattern, JSValue bc);
+    /* OP_set_name_computed: JS_DefineObjectNameComputed — borrows both */
+    int     (*set_name_computed)(JSContext *, JSValue func, JSValue name_src);
+    /* OP_set_proto: JS_SetPrototypeInternal — borrows both */
+    int     (*set_proto)(JSContext *, JSValue obj, JSValue proto);
+    /* OP_set_home_object: js_method_set_home_object — borrows both */
+    void    (*set_home_object)(JSContext *, JSValue func, JSValue home);
+    /* OP_get_array_el2: JS_GetPropertyValue — borrows obj, CONSUMES prop */
+    JSValue (*get_array_el2)(JSContext *, JSValue obj, JSValue prop);
+    /* OP_define_array_el: JS_DefinePropertyValueValue — borrows arr,
+     * CONSUMES prop and val */
+    int     (*define_array_el)(JSContext *, JSValue arr, JSValue prop, JSValue val);
+    /* OP_push_bigint_i32: __JS_NewShortBigInt — always succeeds */
+    JSValue (*push_bigint_i32)(JSContext *, int32_t v);
+    /* OP_close_loc: detach one captured local's JSVarRef from its cap_buf slot */
+    void    (*close_loc)(JSContext *, JSVarRef *vref);
+
+    /* ------------------------------------------------------------------ */
+    /* P20 — reference-slot ops                                            */
+    /* ------------------------------------------------------------------ */
+    /* Create a ref-pair JSObject using an existing JSVarRef.
+     * Increments vref->ref_count; fills *pobj and *patom.
+     * Used for OP_make_loc_ref / OP_make_arg_ref / OP_make_var_ref_ref. */
+    int     (*make_ref_pair)(JSContext *, JSVarRef *vref, JSAtom atom,
+                             JSValue *pobj, JSValue *patom);
+    /* OP_make_var_ref: creates a ref-pair for a global variable via
+     * JS_GetGlobalVarRef; fills *pobj and *patom. */
+    int     (*make_var_ref)(JSContext *, JSAtom atom,
+                            JSValue *pobj, JSValue *patom);
+    /* OP_get_ref_value: read value from ref-pair (borrows obj and atom_val) */
+    JSValue (*get_ref_value)(JSContext *, JSValue obj, JSValue atom_val);
+    /* OP_put_ref_value: write value via ref-pair (CONSUMES obj, atom_val, val) */
+    int     (*put_ref_value)(JSContext *, JSValue obj, JSValue atom_val, JSValue val);
 } JSJITRuntime;
 
 /*
@@ -553,6 +603,26 @@ JSValue js_jit_op_gte(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_eq(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_strict_eq(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_type_of(JSContext *, JSValue);
+int js_jit_op_typeof_is_undefined(JSContext *, JSValue);
+int js_jit_op_typeof_is_function(JSContext *, JSValue);
+/* P19: utility op helpers */
+JSValue js_jit_op_get_var_undef(JSContext *, JSAtom, int);
+void    js_jit_op_throw_error(JSContext *, JSAtom, int);
+JSValue js_jit_op_to_object(JSContext *, JSValue);
+JSValue js_jit_op_to_propkey(JSContext *, JSValue);
+JSValue js_jit_op_regexp(JSContext *, JSValue, JSValue);
+int     js_jit_op_set_name_computed(JSContext *, JSValue, JSValue);
+int     js_jit_op_set_proto(JSContext *, JSValue, JSValue);
+void    js_jit_op_set_home_object(JSContext *, JSValue, JSValue);
+JSValue js_jit_op_get_array_el2(JSContext *, JSValue, JSValue);
+int     js_jit_op_define_array_el(JSContext *, JSValue, JSValue, JSValue);
+JSValue js_jit_op_push_bigint_i32(JSContext *, int32_t);
+void    js_jit_op_close_loc(JSContext *, JSVarRef *);
+/* P20: ref-slot op helpers */
+int     js_jit_op_make_ref_pair(JSContext *, JSVarRef *, JSAtom, JSValue *, JSValue *);
+int     js_jit_op_make_var_ref(JSContext *, JSAtom, JSValue *, JSValue *);
+JSValue js_jit_op_get_ref_value(JSContext *, JSValue, JSValue);
+int     js_jit_op_put_ref_value(JSContext *, JSValue, JSValue, JSValue);
 #endif
 
 /* ======================================================================= */

@@ -32,6 +32,9 @@ C as the intermediate representation.
 | [phase11-todo.md](phase11-todo.md) | Phase 11: performance gap analysis, P11.1–P11.4 implemented, P11.5–P11.10 planned |
 | [phase12-todo.md](phase12-todo.md) | Phase 12: generator/async JIT (yield/await CPS transform) — P12.1–P12.4 implemented |
 | [phase13-todo.md](phase13-todo.md) | Phase 13–17: closure creation, try/catch, iterators, delete, spread/apply |
+| [phase18-todo.md](phase18-todo.md) | Phase 18: type-test opcodes (is_null/undefined/typeof_is_*), stack-shuffle extras (dup3, nip1, insert3/4, perm3/4/5, rot4l/5l, swap2) |
+| [phase18-todo.md](phase18-todo.md) | Phase 19: utility ops (close_loc, get_var_undef, throw_error, to_object/propkey, regexp, set_name_computed, set_proto/home_object, get_array_el2/3, define_array_el, push_bigint_i32) |
+| [phase18-todo.md](phase18-todo.md) | Phase 20: ref-slot ops (make_loc_ref, make_arg_ref, make_var_ref, make_var_ref_ref, get_ref_value, put_ref_value) |
 
 ---
 
