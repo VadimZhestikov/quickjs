@@ -2147,3 +2147,103 @@ JIT warmup; run 1 includes JIT compilation overhead). WSL2 variance ±5% for thi
 - [x] **P11.9-C** `add_loc` JSVAL local + INT source fast path in `quickjs-jit.c`
 - [x] **P11.9-D** Verify bytecode dump shows `add_loc` for `prop_read` loop ✓
 - [x] **P11.9-E** `make CONFIG_JIT=y test` passes ✓
+
+---
+
+## P16 — Property Deletion (`OP_delete`, `OP_delete_var`) (2026-04-05)
+
+### Goal
+
+Remove `OP_delete` and `OP_delete_var` from `scan_is_unsupported()`. Add codegen in
+`gen_body()` delegating to `JS_ValueToAtom` + `JS_DeleteProperty` for `OP_delete` and
+a new vtable entry `delete_global_var` for `OP_delete_var`.
+
+### Changes
+
+- `quickjs-jit.h`: new `delete_global_var` vtable field
+- `quickjs.c`: `js_jit_op_delete_global_var` wrapping `JS_DeleteGlobalVar`
+- `quickjs-jit.c`: removed `OP_delete`/`OP_delete_var` from `scan_is_unsupported()`;
+  added type inference, gen-time stack tracking, and gen_body codegen for both opcodes
+
+### Generated JIT C (OP_delete)
+
+```c
+{ JSValue _obj=_tsv0, _key=_tsv1; _sp=0;
+  JSAtom _at=JS_ValueToAtom(ctx,_key);
+  _FREE(_key);
+  if(_at==JS_ATOM_NULL){ _FREE(_obj); goto _ex; }
+  int _ret=JS_DeleteProperty(ctx,_obj,_at,JS_PROP_THROW_STRICT);
+  JS_FreeAtom(ctx,_at); _FREE(_obj);
+  if(_ret<0) goto _ex;
+  _tsv0=JS_NewBool(ctx,_ret); _sp=1; }
+```
+
+### Benchmark results (2026-04-05, WSL2)
+
+P16 is an **unlocking** phase, not an optimization phase. The value is enabling
+JIT compilation of functions that previously fell back to the interpreter due to
+containing `delete`. Individual opcode throughput is interpreter-equivalent.
+
+| Benchmark | JIT (3-run min) | Interp (3-run min) | Δ |
+|---|---:|---:|---:|
+| `delete(1M iter)` | 189 ms | 190 ms | ~0% |
+
+### P16 task checklist
+
+- [x] **P16-A** Remove `OP_delete`/`OP_delete_var` from `scan_is_unsupported()`
+- [x] **P16-B** Add vtable `delete_global_var` + `js_jit_op_delete_global_var` in `quickjs.c`
+- [x] **P16-C** `gen_body()` codegen for `OP_delete` (key→atom, DeleteProperty)
+- [x] **P16-D** `gen_body()` codegen for `OP_delete_var` (vtable call)
+- [x] **P16-E** Type inference and gen-time stack tracking for both opcodes
+- [x] **P16-F** Correctness tests pass (`tests/test_jit_p16_delete.js`)
+
+---
+
+## P17 — Spread and Apply (`OP_apply`, `OP_apply_eval`) (2026-04-05)
+
+### Goal
+
+Remove `OP_apply` and `OP_apply_eval` from `scan_is_unsupported()`. Add vtable entries
+`apply` and `apply_eval` wrapping `js_function_apply` and `js_same_value`/`JS_EvalObject`
+logic. Add codegen delegating through the vtable.
+
+### Changes
+
+- `quickjs-jit.h`: new `apply` and `apply_eval` vtable fields
+- `quickjs.c`: `js_jit_op_apply` (wraps `js_function_apply`) and
+  `js_jit_op_apply_eval` (mirrors interpreter `OP_apply_eval` logic)
+- `quickjs-jit.c`: removed `OP_apply`/`OP_apply_eval` from `scan_is_unsupported()`;
+  added `OP_special_object` to fix pre-existing scan gap; type inference, gen-time
+  stack tracking, and gen_body codegen for both opcodes
+- `jit_perf_tests/v8bench/test_p17_apply_perf.js`: new perf test
+
+### Generated JIT C (OP_apply, magic=0)
+
+```c
+{ JSValue _func=_tsv0, _this=_tsv1, _args=_tsv2; _sp=0;
+  JSValue _r=_RT->apply(ctx, _func, _this, _args, 0);
+  _FREE(_func); _FREE(_this); _FREE(_args);
+  _sp=0; _CHK(_r); _tsv0=_r; _sp=1; }
+```
+
+### Benchmark results (2026-04-05, WSL2)
+
+P17 is an **unlocking** phase. The apply/spread path fully delegates to `js_function_apply`
+(which builds an arg list and calls `JS_Call`), so throughput is interpreter-equivalent.
+The value is enabling JIT compilation of functions that use spread calls.
+
+| Benchmark | JIT (3-run min) | Interp (3-run min) | Δ |
+|---|---:|---:|---:|
+| `apply_spread(100K iter)` | 48 ms | 44 ms | ~0% (vtable overhead) |
+| `apply_method(100K iter)` | 10 ms | 9 ms  | ~0% (vtable overhead) |
+
+### P17 task checklist
+
+- [x] **P17-A** Remove `OP_apply`/`OP_apply_eval` from `scan_is_unsupported()`
+- [x] **P17-B** Add vtable `apply` + `js_jit_op_apply` in `quickjs.c`
+- [x] **P17-C** Add vtable `apply_eval` + `js_jit_op_apply_eval` in `quickjs.c`
+- [x] **P17-D** `gen_body()` codegen for `OP_apply` (magic from bytecode)
+- [x] **P17-E** `gen_body()` codegen for `OP_apply_eval` (scope_idx from bytecode)
+- [x] **P17-F** Type inference and gen-time stack tracking for both opcodes
+- [x] **P17-G** Fix pre-existing gap: add `OP_special_object` to `scan_is_unsupported()`
+- [x] **P17-H** Correctness tests pass (`tests/test_jit_p17_apply.js`)

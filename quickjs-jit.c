@@ -221,9 +221,14 @@ const JSJITRuntime js_jit_rt = {
     .put_var_slow     = js_jit_op_put_var_slow,
     .get_array_el     = jit_rt_get_array_el,
     .set_array_el     = jit_rt_set_array_el,
+    /* property deletion — P16 */
+    .delete_global_var = js_jit_op_delete_global_var,
     /* calls — P8.3: js_jit_call checks jit_func before falling to JS_Call */
     .call             = js_jit_call,
     .call_constructor = jit_rt_call_constructor,
+    /* spread/apply — P17 */
+    .apply            = js_jit_op_apply,
+    .apply_eval       = js_jit_op_apply_eval,
     /* exceptions */
     .throw_type_error = jit_rt_throw_type_error,
     .throw_val        = jit_rt_throw_val,
@@ -459,12 +464,8 @@ static int scan_is_unsupported(int op)
     case OP_iterator_close:
     case OP_iterator_next:
     case OP_iterator_call:
-    /* spread / apply */
-    case OP_apply:
-    case OP_apply_eval:
-    /* property deletion */
-    case OP_delete:
-    case OP_delete_var:
+    /* special_object: creates arguments/this_func/new.target — needs sf pointer */
+    case OP_special_object:
         return 1;
     default:
         return 0;
@@ -732,6 +733,12 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_lt:  case OP_lte: case OP_gt:  case OP_gte:
             case OP_eq:  case OP_neq: case OP_strict_eq: case OP_strict_neq:
             case OP_instanceof: case OP_in: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            /* P16: delete → bool (JSVAL) */
+            case OP_delete:     _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_delete_var: _TI_PUSH(JIT_T_JSVAL); break;
+            /* P17: apply pops 3 (func/this/args), apply_eval pops 2 (func/args) */
+            case OP_apply:      _TI_DROPN(3); _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_apply_eval: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
 
             /* ---- put_loc: write local ← stack top (pops) ---- */
             case OP_put_loc: case OP_put_loc_check: case OP_put_loc_check_init:
@@ -3865,6 +3872,68 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P16: property deletion ---- */
+        /* OP_delete: obj(_tsv{d-2}) key(_tsv{d-1}) -> bool(_tsv{d-2}); depth d -> d-1 */
+        case OP_delete:
+            _P94_ENSURE(d-2); /* P9.4: box typed obj slot */
+            _P94_ENSURE(d-1); /* P9.4: box typed key slot */
+            jit_buf_printf(cb,
+                "    { JSValue _obj=_tsv%d,_key=_tsv%d; _sp=0;\n"
+                "      JSAtom _at=JS_ValueToAtom(ctx,_key);\n"
+                "      _FREE(_key);\n"
+                "      if(_at==JS_ATOM_NULL){ _FREE(_obj); goto _ex; }\n"
+                "      int _ret=JS_DeleteProperty(ctx,_obj,_at,JS_PROP_THROW_STRICT);\n"
+                "      JS_FreeAtom(ctx,_at); _FREE(_obj);\n"
+                "      if(_ret<0) goto _ex;\n"
+                "      _tsv%d=JS_NewBool(ctx,_ret); _sp=%d; }\n",
+                d-2, d-1, d-2, d-1);
+            break;
+        /* OP_delete_var <atom>: push bool; depth d -> d+1 */
+        case OP_delete_var: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { int _ret=_RT->delete_global_var(ctx,(JSAtom)%uu);\n"
+                "      if(_ret<0) goto _ex;\n"
+                "      _tsv%d=JS_NewBool(ctx,_ret); _sp=%d; }\n",
+                atom, d, d+1);
+            break;
+        }
+
+        /* ---- P17: spread / apply ---- */
+        /* OP_apply <magic u16>: func(_tsv{d-3}) this(_tsv{d-2}) args(_tsv{d-1})
+         * -> result(_tsv{d-3}); depth d -> d-2 */
+        case OP_apply: {
+            int magic = (int)bc_u16(&bc[pc+1]);
+            _P94_ENSURE(d-3); /* P9.4: box typed func slot */
+            _P94_ENSURE(d-2); /* P9.4: box typed this slot */
+            _P94_ENSURE(d-1); /* P9.4: box typed args slot */
+            jit_buf_printf(cb,
+                "    { JSValue _func=_tsv%d,_this=_tsv%d,_args=_tsv%d; _sp=0;\n"
+                "      JSValue _r=_RT->apply(ctx,_func,_this,_args,%d);\n"
+                "      _FREE(_func); _FREE(_this); _FREE(_args);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-3, d-2, d-1, magic, d-3, d-3, d-2);
+            break;
+        }
+        /* OP_apply_eval <scope_idx u16>: func(_tsv{d-2}) args(_tsv{d-1})
+         * -> result(_tsv{d-2}); depth d -> d-1 */
+        case OP_apply_eval: {
+            /* scope_idx in bytecode = s->scopes[scope].first - ARG_SCOPE_END;
+             * at runtime: scope_idx = stored + ARG_SCOPE_END.
+             * ARG_SCOPE_END = -2 (from quickjs.c). */
+            int raw = (int)(int16_t)bc_u16(&bc[pc+1]);
+            int scope_idx = raw + (-2); /* ARG_SCOPE_END */
+            _P94_ENSURE(d-2); /* P9.4: box typed func slot */
+            _P94_ENSURE(d-1); /* P9.4: box typed args slot */
+            jit_buf_printf(cb,
+                "    { JSValue _func=_tsv%d,_args=_tsv%d; _sp=0;\n"
+                "      JSValue _r=_RT->apply_eval(ctx,_func,_args,%d);\n"
+                "      _FREE(_func); _FREE(_args);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, scope_idx, d-2, d-2, d-1);
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -4025,6 +4094,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+2; _gs_push=JIT_T_JSVAL; break; }
             case OP_call_constructor:
                 { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+2; _gs_push=JIT_T_JSVAL; break; }
+
+            /* --- P16: delete / delete_var → bool (JSVAL) --- */
+            case OP_delete:     _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_delete_var: _gs_push=JIT_T_JSVAL; break;
+
+            /* --- P17: apply pops 3, apply_eval pops 2 → JSVAL --- */
+            case OP_apply:      _gs_drop=3; _gs_push=JIT_T_JSVAL; break;
+            case OP_apply_eval: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
 
             /* --- Property / array access → JSVAL --- */
             case OP_get_field:    _gs_drop=1; _gs_push=JIT_T_JSVAL; break;

@@ -15742,6 +15742,44 @@ int js_jit_op_put_var_slow(JSContext *ctx, JSAtom atom, int is_lexical,
     /* val was consumed by JS_SetPropertyInternal regardless of ret */
     return (ret < 0) ? -1 : 0;
 }
+/* P16: delete_var — mirrors JS_DeleteGlobalVar (which is static). */
+int js_jit_op_delete_global_var(JSContext *ctx, JSAtom atom)
+{
+    return JS_DeleteGlobalVar(ctx, atom);
+}
+/* P17: apply — mirrors js_function_apply (which is static).
+ * func, this_val, args_array are borrowed (not consumed). */
+JSValue js_jit_op_apply(JSContext *ctx, JSValue func, JSValue this_val,
+                        JSValue args_array, int magic)
+{
+    JSValueConst argv[2] = { this_val, args_array };
+    return js_function_apply(ctx, func, 2, argv, magic);
+}
+/* P17: apply_eval — mirrors OP_apply_eval interpreter logic.
+ * func and args_array are borrowed (not consumed).
+ * scope_idx: raw value from bytecode operand (already + ARG_SCOPE_END). */
+JSValue js_jit_op_apply_eval(JSContext *ctx, JSValue func, JSValue args_array,
+                              int scope_idx)
+{
+    uint32_t len;
+    JSValue *tab;
+    JSValueConst obj;
+    JSValue ret_val;
+
+    tab = build_arg_list(ctx, &len, args_array);
+    if (!tab)
+        return JS_EXCEPTION;
+    if (js_same_value(ctx, func, ctx->eval_obj)) {
+        obj = (len >= 1) ? tab[0] : JS_UNDEFINED;
+        ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
+                                JS_EVAL_TYPE_DIRECT, scope_idx);
+    } else {
+        ret_val = JS_Call(ctx, func, JS_UNDEFINED, len,
+                          (JSValueConst *)tab);
+    }
+    free_arg_list(ctx, tab, len);
+    return ret_val;
+}
 int      js_jit_fb_get_cpool_count(JSFunctionBytecode *b) { return b->cpool_count; }
 JSAtom   js_jit_fb_get_func_atom(JSFunctionBytecode *b)  { return b->func_name; }
 /* P9.1: atom-to-string helper for codegen name table building */

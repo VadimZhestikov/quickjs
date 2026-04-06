@@ -132,6 +132,15 @@ typedef struct JSJITRuntime {
     int     (*set_array_el)(JSContext *, JSValue obj, JSValue idx, JSValue val);
 
     /* ------------------------------------------------------------------ */
+    /* Property deletion (P16)                                             */
+    /* ------------------------------------------------------------------ */
+    /* OP_delete_var: delete a global variable by atom.
+     * Mirrors JS_DeleteGlobalVar: checks global_var_obj first (lexical vars
+     * cannot be deleted), then deletes from global_obj.
+     * Returns 1 (deleted), 0 (not deletable), or -1 (exception). */
+    int (*delete_global_var)(JSContext *, JSAtom atom);
+
+    /* ------------------------------------------------------------------ */
     /* Function calls                                                      */
     /* ------------------------------------------------------------------ */
     JSValue (*call)(JSContext *, JSValue func, JSValue this_val,
@@ -139,6 +148,17 @@ typedef struct JSJITRuntime {
     JSValue (*call_constructor)(JSContext *, JSValue ctor,
                                 JSValue new_target,
                                 int argc, JSValue *argv);
+    /* OP_apply: f.apply(this, args_array) / f(...spread).
+     * func, this_val and args_array are borrowed (not consumed).
+     * magic: 0=apply, 1=new apply, 2=spread-call. */
+    JSValue (*apply)(JSContext *, JSValue func, JSValue this_val,
+                     JSValue args_array, int magic);
+    /* OP_apply_eval: eval(...spread) or f(...spread) at a call site where
+     * the callee might be eval.  func and args_array are borrowed.
+     * scope_idx is the encoded scope index from the bytecode operand
+     * (already adjusted by ARG_SCOPE_END by the caller). */
+    JSValue (*apply_eval)(JSContext *, JSValue func, JSValue args_array,
+                          int scope_idx);
 
     /* ------------------------------------------------------------------ */
     /* Exceptions                                                          */
@@ -429,6 +449,9 @@ JSValue js_jit_op_mod(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_pow(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_get_var_slow(JSContext *, JSAtom atom, int is_lexical);
 int     js_jit_op_put_var_slow(JSContext *, JSAtom atom, int is_lexical, int is_put_init, JSValue val);
+int     js_jit_op_delete_global_var(JSContext *, JSAtom atom);
+JSValue js_jit_op_apply(JSContext *, JSValue func, JSValue this_val, JSValue args_array, int magic);
+JSValue js_jit_op_apply_eval(JSContext *, JSValue func, JSValue args_array, int scope_idx);
 JSValue js_jit_op_shl(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_sar(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_shr(JSContext *, JSValue, JSValue);

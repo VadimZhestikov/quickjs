@@ -298,7 +298,7 @@ delegating to the existing interpreter helper.
 
 ---
 
-## Phase 16 — Property Deletion (`OP_delete`, `OP_delete_var`)
+## Phase 16 — Property Deletion (`OP_delete`, `OP_delete_var`) ✅ DONE (2026-04-05)
 
 ### Why it's excluded
 
@@ -328,7 +328,7 @@ No new infrastructure needed.  Remove from `scan_is_unsupported()` and add two c
 
 ---
 
-## Phase 17 — Spread and Apply (`OP_apply`, `OP_apply_eval`)
+## Phase 17 — Spread and Apply (`OP_apply`, `OP_apply_eval`) ✅ DONE (2026-04-05)
 
 ### Why it's excluded
 
@@ -376,8 +376,8 @@ None of the supported benchmarks use it.  **This group will remain excluded inde
 | P13 | Closure creation | `OP_fclosure`, `OP_fclosure8` | ~5 days | Functions that define inner functions/closures |
 | P14 | try/catch/finally | `OP_catch`, `OP_gosub`, `OP_nip_catch` | ~4 days | Functions with exception handling |
 | P15 | Iterators / for-of | `OP_for_in_start` … `OP_iterator_call` | ~6 days | Loops over objects, arrays, generators |
-| P16 | Property deletion | `OP_delete`, `OP_delete_var` | ~1 day | `delete obj.prop` patterns |
-| P17 | Spread / apply | `OP_apply`, `OP_apply_eval` | ~1 day | `f(...args)`, `f.apply(this, args)` |
+| P16 ✅ | Property deletion | `OP_delete`, `OP_delete_var` | ~1 day | `delete obj.prop` patterns |
+| P17 ✅ | Spread / apply | `OP_apply`, `OP_apply_eval` | ~1 day | `f(...args)`, `f.apply(this, args)` |
 | P18 | with-statement | `OP_with_*` | — | Not planned |
 | **Total** | | | **~17 days** | |
 
