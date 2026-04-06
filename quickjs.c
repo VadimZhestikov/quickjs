@@ -759,6 +759,9 @@ typedef struct JSAsyncFunctionState {
     JSValue resolving_funcs[2]; /* only used in JS async functions */
     JSStackFrame frame;
     /* arg_buf, var_buf, stack_buf and var_refs follow */
+#ifdef CONFIG_JIT
+    void *jit_gen_frame; /* JSJITGeneratorFrame* — non-NULL after first JIT-compiled resume */
+#endif
 } JSAsyncFunctionState;
 
 typedef enum {
@@ -18469,6 +18472,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             b = p->u.func.function_bytecode;
             ctx = b->realm;
             var_refs = p->u.func.var_refs;
+#ifdef CONFIG_JIT
+            /* P12.2: if a JIT-compiled version exists, dispatch to it directly. */
+            {
+                JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+                if (jf) {
+                    JSValue ret2;
+                    sf->prev_frame = rt->current_stack_frame;
+                    rt->current_stack_frame = sf;
+                    sf->cur_sp = NULL; /* mark as running */
+                    ret2 = jf(ctx, s->this_val, s->argc, sf->arg_buf,
+                              b->cpool, var_refs);
+                    rt->current_stack_frame = sf->prev_frame;
+                    /* Restore cur_sp to a safe value if exception fired before
+                     * any yield (async_func_free_frame asserts cur_sp != NULL). */
+                    if (JS_IsException(ret2) && !sf->cur_sp)
+                        sf->cur_sp = sf->var_buf + b->var_count;
+                    return ret2;
+                }
+            }
+#endif
             local_buf = arg_buf = sf->arg_buf;
             var_buf = sf->var_buf;
             stack_buf = sf->var_buf + b->var_count;
@@ -21460,6 +21483,19 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
     JSStackFrame *sf = &s->frame;
     JSValue *sp;
 
+#ifdef CONFIG_JIT
+    if (s->jit_gen_frame) {
+        JSJITGeneratorFrame *gf = (JSJITGeneratorFrame *)s->jit_gen_frame;
+        if (gf->saved_lv) {
+            int i;
+            for (i = 0; i < gf->n_lv; i++)
+                JS_FreeValueRT(rt, gf->saved_lv[i]);
+            js_free_rt(rt, gf->saved_lv);
+        }
+        js_free_rt(rt, gf);
+        s->jit_gen_frame = NULL;
+    }
+#endif
     /* cannot free the function if it is running */
     assert(sf->cur_sp != NULL);
     for(sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
@@ -21468,6 +21504,123 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
 }
+
+#ifdef CONFIG_JIT
+/* P12: JIT generator frame helpers — called from JIT-compiled generator code. */
+
+/*
+ * js_jit_gen_init_frame — allocate/retrieve the JSJITGeneratorFrame for the
+ * currently-executing generator.  Called once at the start of every JIT entry
+ * into a generator function.  Returns NULL on OOM (caller should goto _ex).
+ */
+JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSAsyncFunctionState *s = container_of(sf, JSAsyncFunctionState, frame);
+    if (!s->jit_gen_frame) {
+        JSJITGeneratorFrame *gf;
+        JSObject *p;
+        JSFunctionBytecode *b;
+        JSValue *stack_start;
+        int i;
+        gf = js_malloc(ctx, sizeof(JSJITGeneratorFrame));
+        if (!gf)
+            return NULL;
+        gf->resume_idx = -1;
+        gf->n_lv = n_lv;
+        if (n_lv > 0) {
+            gf->saved_lv = js_malloc(ctx, (size_t)n_lv * sizeof(JSValue));
+            if (!gf->saved_lv) {
+                js_free(ctx, gf);
+                return NULL;
+            }
+            for (i = 0; i < n_lv; i++)
+                gf->saved_lv[i] = JS_UNDEFINED;
+        } else {
+            gf->saved_lv = NULL;
+        }
+        /* Pre-initialise the two stack slots used for value handshake. */
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        b = p->u.func.function_bytecode;
+        stack_start = sf->var_buf + b->var_count;
+        if (b->stack_size >= 1) stack_start[0] = JS_UNDEFINED;
+        if (b->stack_size >= 2) stack_start[1] = JS_UNDEFINED;
+        s->jit_gen_frame = gf;
+    }
+    return (JSJITGeneratorFrame *)s->jit_gen_frame;
+}
+
+/*
+ * js_jit_gen_get_throw — check and consume the throw_flag.
+ * Returns 1 if the generator was resumed via .throw() and an exception is
+ * already pending; the JIT should goto _ex immediately.
+ */
+int js_jit_gen_get_throw(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSAsyncFunctionState *s = container_of(sf, JSAsyncFunctionState, frame);
+    if (s->throw_flag) {
+        s->throw_flag = FALSE;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * js_jit_gen_yield_setup — save the yield value into the stack buffer and
+ * update resume_idx so the next entry dispatches to the right _Lresume_N label.
+ *
+ * After this call sf->cur_sp points one slot past stack_start[0] (the yield
+ * value slot), matching the invariant expected by js_generator_next.
+ */
+void js_jit_gen_yield_setup(JSContext *ctx, JSValue yield_val,
+                             int resume_idx, JSJITGeneratorFrame *gf)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue *stack_start = sf->var_buf + b->var_count;
+    stack_start[0] = yield_val;
+    sf->cur_sp = stack_start + 1;
+    gf->resume_idx = resume_idx;
+}
+
+/*
+ * js_jit_gen_get_next_val — consume the .next(v) value written by
+ * js_generator_next into stack_start[0].  Clears the slot so it is not
+ * double-freed.  The caller is responsible for freeing the returned value
+ * when it is no longer needed.
+ */
+JSValue js_jit_gen_get_next_val(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue *stack_start = sf->var_buf + b->var_count;
+    JSValue val = stack_start[0];
+    stack_start[0] = JS_UNDEFINED;
+    return val;
+}
+
+/*
+ * js_jit_gen_get_magic_int — read the magic integer (GEN_MAGIC_NEXT=0,
+ * GEN_MAGIC_RETURN=1, GEN_MAGIC_THROW=2) from stack_start[1].
+ * Called only after js_jit_gen_get_next_val (magic is at [1]).
+ */
+int js_jit_gen_get_magic_int(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue *stack_start = sf->var_buf + b->var_count;
+    return JS_VALUE_GET_INT(stack_start[1]);
+}
+#endif /* CONFIG_JIT */
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {

@@ -295,6 +295,36 @@ int js_jit_iterator_next_step(JSContext *ctx,
 int js_jit_iterator_call(JSContext *ctx,
                          JSValue iter, JSValue val, int flags,
                          JSValue *presult, int *pret_flag);
+
+/* P12: generator frame helpers */
+
+/*
+ * JSJITGeneratorFrame — JIT-side save area for a suspended generator.
+ *
+ * Allocated once on the first call to a JIT-compiled generator function and
+ * freed by js_jit_gen_frame_free() from async_func_free_frame().
+ *
+ * resume_idx:
+ *   -1  = never yielded (initial call, run function from the top)
+ *    0  = suspended after OP_initial_yield
+ *    N  = suspended after the N-th OP_yield (N >= 1)
+ *
+ * saved_lv[0..n_lv-1]:
+ *   Spilled JSValues for each local variable slot (var_count).
+ *   JS_UNDEFINED means the slot held no live reference at yield time.
+ */
+typedef struct JSJITGeneratorFrame {
+    int      resume_idx;   /* -1=first call; 0=after initial_yield; N=after N-th yield */
+    int      n_lv;         /* var_count of the generator function */
+    JSValue *saved_lv;     /* heap array[n_lv], JS_UNDEFINED for empty slot */
+} JSJITGeneratorFrame;
+
+JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv);
+int     js_jit_gen_get_throw(JSContext *ctx);
+void    js_jit_gen_yield_setup(JSContext *ctx, JSValue yield_val,
+                               int resume_idx, JSJITGeneratorFrame *gf);
+JSValue js_jit_gen_get_next_val(JSContext *ctx);
+int     js_jit_gen_get_magic_int(JSContext *ctx);
 #endif
 
 /* ======================================================================= */

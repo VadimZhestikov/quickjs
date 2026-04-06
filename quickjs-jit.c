@@ -256,13 +256,16 @@ const JSJITRuntime js_jit_rt = {
  * This is fragile; Phase 3 will centralise this into a helper macro.
  */
 
-/* func_kind == 0 means JS_FUNC_NORMAL; any other value is generator/async */
-#define JS_JIT_FUNC_NORMAL 0
+/* func_kind values matching JSFunctionKindEnum in quickjs.c */
+#define JS_JIT_FUNC_NORMAL    0
+#define JS_JIT_FUNC_GENERATOR 1  /* JS_FUNC_GENERATOR */
 
 int js_jit_is_eligible(JSFunctionBytecode *b)
 {
-    /* Generators/async require saved execution context (yield/await) */
-    if (js_jit_fb_func_kind(b) != JS_JIT_FUNC_NORMAL)
+    uint8_t fk = js_jit_fb_func_kind(b);
+    /* Only normal functions and simple generators are supported.
+     * Async functions (fk==2) and async generators (fk==3) are not. */
+    if (fk != JS_JIT_FUNC_NORMAL && fk != JS_JIT_FUNC_GENERATOR)
         return 0;
     /* eval() has dynamic variable scoping — incompatible with JIT */
     if (js_jit_fb_is_eval(b))
@@ -400,6 +403,9 @@ typedef struct JSJITScanResult {
     int       n_catch;                    /* number of OP_catch instructions */
     int       gosub_ret_pcs[32];          /* return PC (=gosub_pc+5) for each OP_gosub */
     int       n_gosub;                    /* number of OP_gosub instructions */
+    /* P12: generator yield analysis */
+    int       has_yield;   /* 1 if function has OP_yield or OP_initial_yield */
+    int       yield_count; /* number of OP_yield sites (excluding initial_yield) */
 } JSJITScanResult;
 
 static void scan_result_free(JSJITScanResult *sr)
@@ -459,6 +465,9 @@ static int scan_is_unsupported(int op)
     /* async iterators — not supported (need await/generator machinery) */
     case OP_for_await_of_start:
     case OP_for_await_of_next:
+    /* yield* and async yield* — require iterator protocol, not yet supported */
+    case OP_yield_star:
+    case OP_async_yield_star:
         return 1;
     default:
         return 0;
@@ -487,6 +496,8 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
     sr->has_try   = 0;
     sr->n_catch   = 0;
     sr->n_gosub   = 0;
+    sr->has_yield   = 0;
+    sr->yield_count = 0;
     int cap = 0;
 
     int pc = 0;
@@ -601,6 +612,14 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
                 }
             }
             sr->has_fclosure = 1;
+        }
+
+        /* P12: track generator yield/resume sites */
+        if (op == OP_initial_yield) {
+            sr->has_yield = 1;
+        } else if (op == OP_yield) {
+            sr->has_yield = 1;
+            sr->yield_count++;
         }
 
         pc += sz;
@@ -917,6 +936,19 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
 
             /* ---- P15b: special_object — pushes one JSVAL ---- */
             case OP_special_object: _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- P12: generator yield/return opcodes ---- */
+            /* OP_initial_yield: pops 0, pushes 0 — no stack effect */
+            case OP_initial_yield: break;
+            /* OP_yield: pops 1 (yield value), pushes 2 (next_val JSVAL, magic JSVAL) */
+            case OP_yield:
+                _TI_DROPN(1);
+                _TI_PUSH(JIT_T_JSVAL); /* next_val */
+                _TI_PUSH(JIT_T_JSVAL); /* magic */
+                break;
+            /* OP_return_async: pops 1 (return value), no push */
+            case OP_return_async:
+                _TI_DROPN(1); sp = 0; break;
 
             /* ---- Return / throw ---- */
             case OP_return: _TI_DROPN(1); sp = 0; break;
@@ -1726,6 +1758,42 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
             }
         }
     }
+
+    /* P12: generator frame setup — emitted when the function has OP_yield.
+     *
+     * On every entry (initial call and every resume) we:
+     *   1. Obtain/create the JSJITGeneratorFrame for this generator invocation.
+     *   2. Check for a pending throw (magic == GEN_MAGIC_THROW) and bail early.
+     *   3. If resume_idx >= 0 (resuming from a prior yield):
+     *        a. Restore all local JSValue slots from _gf->saved_lv[].
+     *        b. Dispatch to the matching _Lresume_N label via switch.
+     */
+    if (sr && sr->has_yield) {
+        int j, k;
+        /* Declare the generator frame pointer */
+        jit_buf_printf(cb,
+            "    JSJITGeneratorFrame *_gf=js_jit_gen_init_frame(ctx,%d);\n",
+            var_count);
+        jit_buf_str(cb,
+            "    if(!_gf){_sp=0;goto _ex;}\n"
+            "    if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
+            "    if(_gf->resume_idx>=0){\n");
+        /* Restore local JSValue slots from saved_lv (transfer ownership) */
+        for (j = 0; j < var_count; j++) {
+            jit_buf_printf(cb,
+                "        _jsv_%s=_gf->saved_lv[%d]; _gf->saved_lv[%d]=JS_UNDEFINED;\n",
+                varnames[arg_count + j], j, j);
+        }
+        /* Dispatch to the resume label matching _gf->resume_idx */
+        jit_buf_str(cb,
+            "        switch(_gf->resume_idx){\n"
+            "        case 0: goto _Lresume_0;\n");
+        for (k = 1; k <= sr->yield_count; k++)
+            jit_buf_printf(cb, "        case %d: goto _Lresume_%d;\n", k, k);
+        jit_buf_str(cb,
+            "        }\n"
+            "    }\n");
+    }
 }
 
 /*
@@ -1854,6 +1922,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 {
     *unsupported_out = 0;
     int pc = 0;
+
+    /* P12: counter for yield resume sites (0 = initial_yield, 1..N = OP_yield sites) */
+    int yield_site_counter = 1; /* starts at 1; 0 is reserved for initial_yield */
+
+    /* P14: compile-time tracking of catch placeholder stack depths.
+     * OP_catch pushes JS_UNDEFINED as a placeholder at slot d and increments
+     * _catch_depth.  The interpreter removes it via OP_nip_catch (which already
+     * emits _catch_depth--) or via OP_drop (which previously did NOT decrement
+     * _catch_depth, causing a one-per-iteration leak in loops with try/catch).
+     *
+     * We track the stack slot d where each catch placeholder sits.  When OP_drop
+     * would discard the innermost placeholder (d-1 == catch_ph_d[catch_ph_n-1]),
+     * we also emit _catch_depth-- to keep the runtime counter in sync. */
+    int catch_ph_d[32];  /* stack depths of live catch placeholders */
+    int catch_ph_n = 0;  /* number of entries in catch_ph_d */
 
     /* P9.2: per-PC stack depth table (from compute_stack_size pass). */
     const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
@@ -2004,6 +2087,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 " _catch_depth++;\n"
                 "    _tsv%d=JS_UNDEFINED; _sp=%d;\n",
                 d, handler_pc, d, d+1);
+            /* Track the slot where the placeholder sits so OP_drop can detect
+             * when it's discarding a catch placeholder and emit _catch_depth--. */
+            if (catch_ph_n < 32) catch_ph_d[catch_ph_n++] = d;
             break;
         }
 
@@ -2012,6 +2098,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * Stack after:  [..., ret_val@cs], sp=cs+1
          * Free intermediate slots cs+1..d-2 (typically none). */
         case OP_nip_catch: {
+            /* _catch_depth-- is emitted inline; also pop the compile-time tracker. */
+            if (catch_ph_n > 0) catch_ph_n--;
             jit_buf_printf(cb,
                 "    { int _cs; _catch_depth--; _cs=_catch_sp[_catch_depth];\n"
                 "      int _j; for(_j=_cs+1;_j<%d;_j++)JS_FreeValue(ctx,*_tsvp[_j]);\n"
@@ -2334,12 +2422,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Stack manipulation ---- */
         /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
         case OP_drop: /* pop top: depth d -> d-1 */
+            /* P14: if the value being dropped is a catch placeholder (pushed by
+             * OP_catch), also decrement _catch_depth to keep the runtime counter
+             * in sync.  The interpreter uses a tagged value on the value stack; the
+             * JIT uses a separate counter that must be explicitly decremented here. */
+            if (d > 0 && catch_ph_n > 0 && d-1 == catch_ph_d[catch_ph_n-1]) {
+                jit_buf_printf(cb, "    _catch_depth--; _FREE(_tsv%d); _sp=%d;\n",
+                               d-1, d-1);
+                catch_ph_n--;
             /* P11.6: typed slot lives in _ti/_tsd — no refcount, no _FREE needed */
             /* P10.3: JIT_T_JIT_FUNC (=4) is a JSValue, not a typed slot — exclude it */
-            if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER && gen_st[gen_sp-1] <= JIT_T_INT)
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER &&
+                       gen_st[gen_sp-1] <= JIT_T_INT) {
                 jit_buf_printf(cb, "    _sp=%d;\n", d-1);
-            else
+            } else {
                 jit_buf_printf(cb, "    _FREE(_tsv%d); _sp=%d;\n", d-1, d-1);
+            }
             break;
         case OP_dup: /* peek top, push copy: depth d -> d+1 */
             /* P11.6: INT uses _ti, NUMBER uses _tsd, JSVAL/other uses _tsv+_DUP */
@@ -4505,6 +4603,94 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P12: generator yield/resume opcodes ---- */
+        case OP_initial_yield: {
+            /* Suspend the generator before any yields have been made.
+             * Stack is empty at this point (d == 0).
+             * Emits: yield_setup(JS_UNDEFINED, resume_idx=0) → return FUNC_RET_INITIAL_YIELD
+             * Then _Lresume_0: — entered by dispatch table on next .next() call.
+             * The first .next(v) argument is ignored per spec; we consume and free it. */
+            jit_buf_str(cb,
+                "    js_jit_gen_yield_setup(ctx,JS_UNDEFINED,0,_gf);\n"
+                "    return JS_NewInt32(ctx,3);\n" /* FUNC_RET_INITIAL_YIELD */
+                "    _Lresume_0:;\n"
+                "    { JSValue _nv0=js_jit_gen_get_next_val(ctx); JS_FreeValue(ctx,_nv0); }\n");
+            break;
+        }
+
+        case OP_yield: {
+            /* Suspend the generator, yielding _tsv{d-1} to the caller.
+             *
+             * On the resume path (_Lresume_N:):
+             *   _tsv{d-1} = .next(v) value    (JSVAL, owned by JIT)
+             *   _tsv{d}   = magic int (0=next, 1=return, 2=throw)  (JS_NewInt32)
+             *   gen_sp updated to d+1
+             *
+             * The next bytecode opcode is always OP_if_false which checks the magic. */
+            int j;
+            int yresi = yield_site_counter++;
+            _P94_ENSURE(d-1); /* box the yield value if it is typed */
+            /* Spill all local JSValues into saved_lv (transfer ownership) */
+            for (j = 0; j < var_count; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
+                    j, LNAME(j), LNAME(j));
+            }
+            jit_buf_printf(cb,
+                "    { JSValue _yv%d=_tsv%d; _sp=%d;\n"
+                "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
+                "    }\n"
+                "    return JS_NewInt32(ctx,1);\n" /* FUNC_RET_YIELD */
+                /* NOTE: local variable restoration is done by the preamble's
+                 * dispatch block before 'goto _Lresume_N'.  Here we only need
+                 * to pick up the .next(v) value and the magic flag from the
+                 * two stack-buffer slots written by js_generator_next. */
+                "    _Lresume_%d:;\n"
+                "    { JSValue _nv%d=js_jit_gen_get_next_val(ctx);\n"
+                "      int _mg%d=js_jit_gen_get_magic_int(ctx);\n"
+                "      _tsv%d=_nv%d; _tsv%d=JS_NewInt32(ctx,_mg%d);\n"
+                "      _sp=%d; }\n",
+                yresi, d-1, d-1,
+                yresi, yresi,
+                yresi,
+                yresi, yresi,
+                d-1, yresi, d, yresi, d+1);
+            /* Update gen-time type stack: d-1 = JSVAL (next_val), d = JSVAL (magic) */
+            if (gen_sp > 0) gen_sp--;          /* pop yield value */
+            if (gen_sp < gen_stk_cap) { gen_st[gen_sp] = JIT_T_JSVAL; gen_hsh[gen_sp] = 0; gen_sp++; } /* next_val */
+            if (gen_sp < gen_stk_cap) { gen_st[gen_sp] = JIT_T_JSVAL; gen_hsh[gen_sp] = 0; gen_sp++; } /* magic */
+            break;
+        }
+
+        case OP_return_async: {
+            /* Generator function return (normal end or via .return(v) / .throw()).
+             *
+             * _tsv{d-1} holds the return value (the value passed to .return(), or
+             * the generator's `return expr` value, or the .next(v) value discarded
+             * by the bytecode's yield→if_false→return_async pattern).
+             *
+             * We store it into stack_start[0] (sf->cur_sp[-1] after yield_setup),
+             * free all lower stack slots and all locals, then return JS_UNDEFINED.
+             * async_func_resume detects JS_UNDEFINED → reads sf->cur_sp[-1] →
+             * frees the frame → delivers the value to the caller.           */
+            int j;
+            _P94_ENSURE(d-1);
+            /* Free stack slots below the return value */
+            for (j = 0; j < d-1; j++)
+                jit_buf_printf(cb, "    _FREE(_tsv%d);\n", j);
+            /* Store return value in stack_start[0] and free JIT locals */
+            jit_buf_printf(cb,
+                "    { JSValue _rv=_tsv%d; _sp=%d;\n", d-1, d-1);
+            for (j = 0; j < var_count; j++)
+                jit_buf_printf(cb, "      _FREE(_jsv_%s);\n", LNAME(j));
+            jit_buf_str(cb,
+                "      js_jit_gen_yield_setup(ctx,_rv,-2,_gf);\n"
+                "    }\n"
+                "    return JS_UNDEFINED;\n");
+            gen_sp = 0;
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -4718,6 +4904,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_return_undef: gen_sp=0; break;
             case OP_throw: gen_sp=0; break;
 
+            /* --- P12: generator opcodes (gen_st updated inline in main switch) --- */
+            case OP_initial_yield: break;   /* no stack change, updated inline */
+            case OP_yield: break;           /* updated inline in OP_yield case above */
+            case OP_return_async: gen_sp=0; break;
+
             /* Everything else: no tracked stack effect (conservative) */
             default: break;
             }
@@ -4796,6 +4987,23 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     /* Phase 5: infer which locals are always numeric → use C double */
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
+
+    /* P12: generators with try/catch or closures are not yet supported.
+     * has_yield generators require spill/restore; mixing with try-frames or
+     * closure capture greatly complicates the save area — defer to P12.1+. */
+    if (sr.has_yield && (sr.has_try || sr.has_fclosure)) {
+        *unsupported = 1;
+        scan_result_free(&sr);
+        free(local_type);
+        return -1;
+    }
+
+    /* P12: force all generator locals to JSVAL so spill/restore is a simple
+     * JSValue copy — avoids boxing/unboxing complexity for typed locals. */
+    if (sr.has_yield && local_type) {
+        for (int i = 0; i < var_count; i++)
+            local_type[i] = JIT_T_JSVAL;
+    }
 
     /* P13.3: force captured locals to JIT_T_JSVAL — typed opt breaks capture semantics */
     if (sr.has_fclosure && local_type) {
