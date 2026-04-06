@@ -21492,6 +21492,14 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
                 JS_FreeValueRT(rt, gf->saved_lv[i]);
             js_free_rt(rt, gf->saved_lv);
         }
+        /* P12.2: release frame-owned refs on saved closure var-refs */
+        if (gf->saved_vrefs) {
+            int i;
+            for (i = 0; i < gf->n_vrefs; i++)
+                if (gf->saved_vrefs[i])
+                    free_var_ref(rt, gf->saved_vrefs[i]);
+            js_free_rt(rt, gf->saved_vrefs);
+        }
         js_free_rt(rt, gf);
         s->jit_gen_frame = NULL;
     }
@@ -21513,7 +21521,7 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
  * currently-executing generator.  Called once at the start of every JIT entry
  * into a generator function.  Returns NULL on OOM (caller should goto _ex).
  */
-JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv)
+JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv, int n_vrefs)
 {
     JSRuntime *rt = ctx->rt;
     JSStackFrame *sf = rt->current_stack_frame;
@@ -21530,6 +21538,7 @@ JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv)
         gf->resume_idx = -1;
         gf->catch_depth = 0;
         gf->n_lv = n_lv;
+        gf->n_vrefs = n_vrefs;
         if (n_lv > 0) {
             gf->saved_lv = js_malloc(ctx, (size_t)n_lv * sizeof(JSValue));
             if (!gf->saved_lv) {
@@ -21540,6 +21549,19 @@ JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv)
                 gf->saved_lv[i] = JS_UNDEFINED;
         } else {
             gf->saved_lv = NULL;
+        }
+        /* P12.2: allocate saved_vrefs array (closure var-ref save area) */
+        if (n_vrefs > 0) {
+            gf->saved_vrefs = js_malloc(ctx, (size_t)n_vrefs * sizeof(JSVarRef *));
+            if (!gf->saved_vrefs) {
+                js_free(ctx, gf->saved_lv);
+                js_free(ctx, gf);
+                return NULL;
+            }
+            for (i = 0; i < n_vrefs; i++)
+                gf->saved_vrefs[i] = NULL;
+        } else {
+            gf->saved_vrefs = NULL;
         }
         /* Pre-initialise the two stack slots used for value handshake. */
         p = JS_VALUE_GET_OBJ(sf->cur_func);
@@ -21620,6 +21642,46 @@ int js_jit_gen_get_magic_int(JSContext *ctx)
     JSFunctionBytecode *b = p->u.func.function_bytecode;
     JSValue *stack_start = sf->var_buf + b->var_count;
     return JS_VALUE_GET_INT(stack_start[1]);
+}
+
+/*
+ * js_jit_gen_save_vrefs — snapshot _sf_vrefs[] into the generator frame.
+ * Called at every OP_yield/OP_await site AFTER js_jit_close_caps() so all
+ * JSVarRefs are already heap-promoted (is_detached==TRUE, pvalue==&value).
+ * Takes an extra reference on each non-NULL entry so the frame keeps them
+ * alive while the generator is suspended.
+ */
+void js_jit_gen_save_vrefs(JSContext *ctx, JSVarRef **vrefs, int n,
+                            JSJITGeneratorFrame *gf)
+{
+    JSRuntime *rt = ctx->rt;
+    int i;
+    for (i = 0; i < n && i < gf->n_vrefs; i++) {
+        /* Release previously saved ref (safety — should be NULL in practice) */
+        if (gf->saved_vrefs[i]) {
+            free_var_ref(rt, gf->saved_vrefs[i]);
+            gf->saved_vrefs[i] = NULL;
+        }
+        if (vrefs[i]) {
+            vrefs[i]->header.ref_count++;
+            gf->saved_vrefs[i] = vrefs[i];
+        }
+    }
+}
+
+/*
+ * js_jit_gen_restore_vrefs — transfer frame-owned JSVarRef pointers back to
+ * the JIT's _sf_vrefs[] C-local array on resume.  The frame relinquishes its
+ * reference (slots cleared to NULL).  The caller then re-attaches each VarRef
+ * to the corresponding _cap_buf / _arg_cap_buf slot.
+ */
+void js_jit_gen_restore_vrefs(JSVarRef **vrefs, int n, JSJITGeneratorFrame *gf)
+{
+    int i;
+    for (i = 0; i < n && i < gf->n_vrefs; i++) {
+        vrefs[i] = gf->saved_vrefs[i]; /* transfer ownership */
+        gf->saved_vrefs[i] = NULL;
+    }
 }
 #endif /* CONFIG_JIT */
 

@@ -257,16 +257,16 @@ const JSJITRuntime js_jit_rt = {
  */
 
 /* func_kind values matching JSFunctionKindEnum in quickjs.c */
-#define JS_JIT_FUNC_NORMAL    0
-#define JS_JIT_FUNC_GENERATOR 1  /* JS_FUNC_GENERATOR */
-#define JS_JIT_FUNC_ASYNC     2  /* JS_FUNC_ASYNC — P12.3 */
+#define JS_JIT_FUNC_NORMAL          0
+#define JS_JIT_FUNC_GENERATOR       1  /* JS_FUNC_GENERATOR */
+#define JS_JIT_FUNC_ASYNC           2  /* JS_FUNC_ASYNC — P12.3 */
+#define JS_JIT_FUNC_ASYNC_GENERATOR 3  /* JS_FUNC_ASYNC_GENERATOR — P12.4 */
 
 int js_jit_is_eligible(JSFunctionBytecode *b)
 {
     uint8_t fk = js_jit_fb_func_kind(b);
-    /* Normal, generator, and async functions are supported.
-     * Async generators (fk==3) are not yet supported. */
-    if (fk != JS_JIT_FUNC_NORMAL && fk != JS_JIT_FUNC_GENERATOR && fk != JS_JIT_FUNC_ASYNC)
+    /* Normal, generator, async, and async generator functions are supported. */
+    if (fk > JS_JIT_FUNC_ASYNC_GENERATOR)
         return 0;
     /* eval() has dynamic variable scoping — incompatible with JIT */
     if (js_jit_fb_is_eval(b))
@@ -631,9 +631,9 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
 
         pc += sz;
     }
-    /* P12.3: async functions always need the generator frame (for OP_return_async),
-     * even if they have no OP_await. */
-    if (sr->func_kind == JS_JIT_FUNC_ASYNC)
+    /* P12.3/P12.4: async functions and async generators always need the generator
+     * frame (for OP_return_async), even if they have no OP_await. */
+    if (sr->func_kind == JS_JIT_FUNC_ASYNC || sr->func_kind == JS_JIT_FUNC_ASYNC_GENERATOR)
         sr->has_yield = 1;
     return 0;
 }
@@ -1634,7 +1634,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          const char *js_func_name,
                          char **varnames,
                          const JSJITScanResult *sr,
-                         int var_ref_count)
+                         int var_ref_count,
+                         JSFunctionBytecode *b)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -1788,8 +1789,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         int j, k;
         /* Declare the generator frame pointer */
         jit_buf_printf(cb,
-            "    JSJITGeneratorFrame *_gf=js_jit_gen_init_frame(ctx,%d);\n",
-            var_count);
+            "    JSJITGeneratorFrame *_gf=js_jit_gen_init_frame(ctx,%d,%d);\n",
+            var_count, var_ref_count);
         jit_buf_str(cb,
             "    if(!_gf){_sp=0;goto _ex;}\n"
             "    if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
@@ -1808,6 +1809,46 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 "            memcpy(_catch_sp,_gf->catch_sp,(size_t)_catch_depth*sizeof(int));\n"
                 "            memcpy(_catch_h,_gf->catch_h,(size_t)_catch_depth*sizeof(int));\n"
                 "        }\n");
+        }
+        /* P12.2: restore closure var-refs from frame and re-attach to _cap_buf / _arg_cap_buf */
+        if (sr->has_fclosure && var_ref_count > 0 && b) {
+            int j;
+            jit_buf_printf(cb,
+                "        js_jit_gen_restore_vrefs(_sf_vrefs,%d,_gf);\n",
+                var_ref_count);
+            /* Re-attach each captured local: _cap_buf[i] ← vref->value (own ref),
+             * vref->pvalue ← &_cap_buf[i], is_detached ← FALSE */
+            for (j = 0; j < var_count && j < 64; j++) {
+                if ((sr->captured_local_mask >> j) & 1) {
+                    int vri = js_jit_fb_get_local_var_ref_idx(b, j);
+                    if (vri >= 0) {
+                        jit_buf_printf(cb,
+                            "        if(_sf_vrefs[%d]&&_sf_vrefs[%d]->is_detached){"
+                            "_cap_buf[%d]=_sf_vrefs[%d]->value;"
+                            "_sf_vrefs[%d]->value=JS_UNDEFINED;"
+                            "_sf_vrefs[%d]->pvalue=&_cap_buf[%d];"
+                            "_sf_vrefs[%d]->is_detached=FALSE;}\n",
+                            vri, vri, j, vri, vri, vri, j, vri);
+                    }
+                }
+            }
+            /* Re-attach each captured arg: _arg_cap_buf[i] ← vref->value (own ref) */
+            if (sr->captured_arg_mask != 0) {
+                for (j = 0; j < arg_count && j < 64; j++) {
+                    if ((sr->captured_arg_mask >> j) & 1) {
+                        int vri = js_jit_fb_get_arg_var_ref_idx(b, j);
+                        if (vri >= 0) {
+                            jit_buf_printf(cb,
+                                "        if(_sf_vrefs[%d]&&_sf_vrefs[%d]->is_detached){"
+                                "_arg_cap_buf[%d]=_sf_vrefs[%d]->value;"
+                                "_sf_vrefs[%d]->value=JS_UNDEFINED;"
+                                "_sf_vrefs[%d]->pvalue=&_arg_cap_buf[%d];"
+                                "_sf_vrefs[%d]->is_detached=FALSE;}\n",
+                                vri, vri, j, vri, vri, vri, j, vri);
+                        }
+                    }
+                }
+            }
         }
         /* Dispatch to the resume label matching _gf->resume_idx */
         jit_buf_str(cb, "        switch(_gf->resume_idx){\n");
@@ -4662,6 +4703,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
                     j, LNAME(j), LNAME(j));
             }
+            /* P12.2: heap-promote captured locals/args and save vrefs to frame */
+            if (sr->has_fclosure && var_ref_count > 0) {
+                jit_buf_printf(cb,
+                    "    js_jit_close_caps(ctx,_sf_vrefs,%d);\n"
+                    "    js_jit_gen_save_vrefs(ctx,_sf_vrefs,%d,_gf);\n",
+                    var_ref_count, var_ref_count);
+            }
             /* P12.1: save catch state so try/catch works across yield */
             if (sr->has_try && stack_size > 0) {
                 jit_buf_str(cb,
@@ -4716,6 +4764,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
                     j, LNAME(j), LNAME(j));
             }
+            /* P12.2: heap-promote captured locals/args and save vrefs to frame */
+            if (sr->has_fclosure && var_ref_count > 0) {
+                jit_buf_printf(cb,
+                    "    js_jit_close_caps(ctx,_sf_vrefs,%d);\n"
+                    "    js_jit_gen_save_vrefs(ctx,_sf_vrefs,%d,_gf);\n",
+                    var_ref_count, var_ref_count);
+            }
             /* P12.1: save catch state */
             if (sr->has_try && stack_size > 0) {
                 jit_buf_str(cb,
@@ -4763,6 +4818,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             /* Store return value in stack_start[0] and free JIT locals */
             jit_buf_printf(cb,
                 "    { JSValue _rv=_tsv%d; _sp=%d;\n", d-1, d-1);
+            /* P12.2: heap-promote caps before the C-local arrays go out of scope */
+            if (sr->has_fclosure) {
+                if (var_ref_count > 0)
+                    jit_buf_printf(cb, "      js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+                for (j = 0; j < var_count && j < 64; j++)
+                    if ((sr->captured_local_mask >> j) & 1)
+                        jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", j);
+                if (sr->captured_arg_mask != 0) {
+                    for (j = 0; j < arg_count && j < 64; j++)
+                        if ((sr->captured_arg_mask >> j) & 1)
+                            jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", j);
+                }
+            }
             for (j = 0; j < var_count; j++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n", LNAME(j));
             jit_buf_str(cb,
@@ -5071,15 +5139,6 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
 
-    /* P12.1: generators/async with closures are not yet supported.
-     * try/catch is now supported via catch state save/restore in the frame. */
-    if (sr.has_yield && sr.has_fclosure) {
-        *unsupported = 1;
-        scan_result_free(&sr);
-        free(local_type);
-        return -1;
-    }
-
     /* P12: force all generator locals to JSVAL so spill/restore is a simple
      * JSValue copy — avoids boxing/unboxing complexity for typed locals. */
     if (sr.has_yield && local_type) {
@@ -5111,7 +5170,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
-                 local_type, js_func_name, varnames, &sr, var_ref_count);
+                 local_type, js_func_name, varnames, &sr, var_ref_count, b);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,

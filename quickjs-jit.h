@@ -321,14 +321,21 @@ typedef struct JSJITGeneratorFrame {
     int      catch_depth;  /* number of active catch frames at last yield */
     int      catch_sp[32]; /* stack depth for each catch frame */
     int      catch_h[32];  /* handler PC for each catch frame */
+    /* P12.2: closure var-ref save area — frame owns one ref per non-NULL entry */
+    int        n_vrefs;        /* size of saved_vrefs[] (= var_ref_count of function) */
+    JSVarRef **saved_vrefs;    /* heap array[n_vrefs] of JSVarRef*, NULL = not live */
 } JSJITGeneratorFrame;
 
-JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv);
+JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv, int n_vrefs);
 int     js_jit_gen_get_throw(JSContext *ctx);
 void    js_jit_gen_yield_setup(JSContext *ctx, JSValue yield_val,
                                int resume_idx, JSJITGeneratorFrame *gf);
 JSValue js_jit_gen_get_next_val(JSContext *ctx);
 int     js_jit_gen_get_magic_int(JSContext *ctx);
+/* P12.2: save/restore _sf_vrefs[] across yield/await */
+void    js_jit_gen_save_vrefs(JSContext *ctx, JSVarRef **vrefs, int n,
+                               JSJITGeneratorFrame *gf);
+void    js_jit_gen_restore_vrefs(JSVarRef **vrefs, int n, JSJITGeneratorFrame *gf);
 #endif
 
 /* ======================================================================= */
