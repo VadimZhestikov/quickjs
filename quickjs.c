@@ -17277,6 +17277,155 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
 static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv, int magic);
 
+#ifdef CONFIG_JIT
+/* ---- P15: JIT iterator helpers ---- */
+
+/* for_in_start: replace *pobj with a for-in iterator object (takes ownership) */
+int js_jit_for_in_start(JSContext *ctx, JSValue *pobj)
+{
+    *pobj = build_for_in_iterator(ctx, *pobj);
+    return JS_IsException(*pobj) ? -1 : 0;
+}
+
+/* for_in_next: produce next key+done from iter (iter is NOT consumed).
+ * On done: *pkey = JS_UNDEFINED, *pdone = JS_TRUE.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_for_in_next(JSContext *ctx, JSValue iter,
+                       JSValue *pkey, JSValue *pdone)
+{
+    JSValue stk[3];
+    JSValue *sp;
+    stk[0] = iter;          /* sp[-1] = iter  (not freed by js_for_in_next) */
+    stk[1] = JS_UNDEFINED;  /* sp[0]  = key out */
+    stk[2] = JS_UNDEFINED;  /* sp[1]  = done out */
+    sp = &stk[1];
+    if (js_for_in_next(ctx, sp) < 0) return -1;
+    *pkey  = stk[1];
+    *pdone = stk[2];
+    return 0;
+}
+
+/* for_of_start: get iterator from obj (obj ownership transferred).
+ * Sets *piter = iterator, *pnext = next method.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_for_of_start(JSContext *ctx,
+                        JSValue *piter, JSValue *pnext, JSValue obj)
+{
+    JSValue stk[2];
+    JSValue *sp;
+    stk[0] = obj;           /* sp[-1] = obj (freed by js_for_of_start) */
+    stk[1] = JS_UNDEFINED;  /* sp[0]  = next out */
+    sp = &stk[1];
+    if (js_for_of_start(ctx, sp, FALSE) < 0) return -1;
+    *piter = stk[0];
+    *pnext = stk[1];
+    return 0;
+}
+
+/* for_of_next: advance for-of iterator.
+ * *piter may be set to JS_UNDEFINED (and freed) if iteration is done.
+ * next is NOT consumed.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_for_of_next(JSContext *ctx, JSValue *piter, JSValue next,
+                       JSValue *pvalue, JSValue *pdone)
+{
+    JSValue stk[5];
+    JSValue *sp;
+    stk[0] = *piter;        /* sp[-3] = iter */
+    stk[1] = next;          /* sp[-2] = next (not freed) */
+    stk[2] = JS_UNDEFINED;  /* sp[-1] = catch_offset placeholder (ignored) */
+    stk[3] = JS_UNDEFINED;  /* sp[0]  = value out */
+    stk[4] = JS_UNDEFINED;  /* sp[1]  = done out */
+    sp = &stk[3];
+    if (js_for_of_next(ctx, sp, -3) < 0) return -1;
+    *piter  = stk[0];   /* may be JS_UNDEFINED now if done */
+    *pvalue = stk[3];
+    *pdone  = stk[4];
+    return 0;
+}
+
+/* iterator_close: close iterator on normal exit (iter and next ownership transferred).
+ * If iter is JS_UNDEFINED (iteration finished normally), just frees next.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_iterator_close(JSContext *ctx, JSValue iter, JSValue next)
+{
+    int r = 0;
+    JS_FreeValue(ctx, next);
+    if (!JS_IsUndefined(iter)) {
+        r = JS_IteratorClose(ctx, iter, FALSE);
+        JS_FreeValue(ctx, iter);
+    }
+    return r;
+}
+
+/* iterator_get_value_done: extract value and done from {value, done} result object.
+ * obj ownership transferred.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_iterator_get_value_done(JSContext *ctx, JSValue obj,
+                                   JSValue *pvalue, JSValue *pdone)
+{
+    BOOL done;
+    JSValue value;
+    if (!JS_IsObject(obj)) {
+        JS_ThrowTypeError(ctx, "iterator must return an object");
+        JS_FreeValue(ctx, obj);
+        return -1;
+    }
+    value = JS_IteratorGetCompleteValue(ctx, obj, &done);
+    JS_FreeValue(ctx, obj);
+    if (JS_IsException(value)) return -1;
+    *pvalue = value;
+    *pdone  = JS_NewBool(ctx, done);
+    return 0;
+}
+
+/* iterator_next_step: call next.call(iter, val); result replaces *presult.
+ * iter and next are NOT consumed.  val ownership transferred.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_iterator_next_step(JSContext *ctx,
+                              JSValue iter, JSValue next,
+                              JSValue val, JSValue *presult)
+{
+    JSValue ret = JS_Call(ctx, next, iter, 1, (JSValueConst *)&val);
+    JS_FreeValue(ctx, val);
+    if (JS_IsException(ret)) return -1;
+    *presult = ret;
+    return 0;
+}
+
+/* iterator_call: call return/throw on iterator; result and ret_flag written.
+ * iter is NOT consumed.  val ownership transferred.
+ * flags: bit0 = use throw (else return), bit1 = no argument.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_iterator_call(JSContext *ctx,
+                         JSValue iter, JSValue val, int flags,
+                         JSValue *presult, int *pret_flag)
+{
+    JSValue method, ret;
+    BOOL ret_flag;
+    method = JS_GetProperty(ctx, iter, (flags & 1) ? JS_ATOM_throw : JS_ATOM_return);
+    if (JS_IsException(method)) { JS_FreeValue(ctx, val); return -1; }
+    if (JS_IsUndefined(method) || JS_IsNull(method)) {
+        JS_FreeValue(ctx, method);
+        JS_FreeValue(ctx, val);
+        ret_flag = TRUE;
+        *presult = JS_UNDEFINED;
+    } else {
+        if (flags & 2) {
+            ret = JS_CallFree(ctx, method, iter, 0, NULL);
+            JS_FreeValue(ctx, val);
+        } else {
+            ret = JS_CallFree(ctx, method, iter, 1, (JSValueConst *)&val);
+        }
+        if (JS_IsException(ret)) return -1;
+        *presult = ret;
+        ret_flag = FALSE;
+    }
+    *pret_flag = ret_flag;
+    return 0;
+}
+#endif /* CONFIG_JIT */
+
 static BOOL js_is_fast_array(JSContext *ctx, JSValueConst obj)
 {
     /* Try and handle fast arrays explicitly */

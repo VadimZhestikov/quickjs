@@ -277,6 +277,23 @@ int            js_jit_poll_interrupts(JSContext *ctx);
 /* P8.3: JIT-to-JIT fast call — checks jit_func, calls directly if compiled */
 JSValue        js_jit_call(JSContext *, JSValue func, JSValue this_val,
                             int argc, JSValue *argv);
+/* P15: iterator helpers */
+int js_jit_for_in_start(JSContext *ctx, JSValue *pobj);
+int js_jit_for_in_next(JSContext *ctx, JSValue iter,
+                       JSValue *pkey, JSValue *pdone);
+int js_jit_for_of_start(JSContext *ctx,
+                        JSValue *piter, JSValue *pnext, JSValue obj);
+int js_jit_for_of_next(JSContext *ctx, JSValue *piter, JSValue next,
+                       JSValue *pvalue, JSValue *pdone);
+int js_jit_iterator_close(JSContext *ctx, JSValue iter, JSValue next);
+int js_jit_iterator_get_value_done(JSContext *ctx, JSValue obj,
+                                   JSValue *pvalue, JSValue *pdone);
+int js_jit_iterator_next_step(JSContext *ctx,
+                              JSValue iter, JSValue next,
+                              JSValue val, JSValue *presult);
+int js_jit_iterator_call(JSContext *ctx,
+                         JSValue iter, JSValue val, int flags,
+                         JSValue *presult, int *pret_flag);
 #endif
 
 /* ======================================================================= */

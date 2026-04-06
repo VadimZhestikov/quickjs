@@ -456,17 +456,9 @@ static int scan_is_unsupported(int op)
     case OP_with_delete_var:
     case OP_with_make_ref:
     case OP_with_get_ref:
-    /* iterators / for-in / for-of */
-    case OP_for_in_start:
-    case OP_for_of_start:
-    case OP_for_in_next:
-    case OP_for_of_next:
+    /* async iterators — not supported (need await/generator machinery) */
+    case OP_for_await_of_start:
     case OP_for_await_of_next:
-    case OP_iterator_check_object:
-    case OP_iterator_get_value_done:
-    case OP_iterator_close:
-    case OP_iterator_next:
-    case OP_iterator_call:
     /* special_object: creates arguments/this_func/new.target — needs sf pointer */
     case OP_special_object:
         return 1;
@@ -898,6 +890,32 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_nip_catch:
                 /* Complex stack collapse: conservative reset to 1 JSVAL */
                 sp = 0; _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- P15: iterators ---- */
+            /* for_in_start: 1-in 1-out (iter replaces obj) */
+            case OP_for_in_start: break;
+            /* for_in_next: keeps iter, pushes key+done (+2) */
+            case OP_for_in_next:
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            /* for_of_start: obj → iter next catch_offset (+2 net) */
+            case OP_for_of_start:
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            /* for_of_next: iter next catch_offset → +2 (value, done) */
+            case OP_for_of_next:
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            /* iterator_close: pops 3 (iter, next, catch_offset) */
+            case OP_iterator_close:
+                _TI_DROPN(3); break;
+            /* iterator_check_object: 1-in 1-out (no change) */
+            case OP_iterator_check_object: break;
+            /* iterator_get_value_done: catch_offset obj → catch_offset value done (+1) */
+            case OP_iterator_get_value_done:
+                _TI_PUSH(JIT_T_JSVAL); break;
+            /* iterator_next: 4-in 4-out (result replaces val, no net change) */
+            case OP_iterator_next: break;
+            /* iterator_call: 4-in 5-out (result replaces val, flag pushed +1) */
+            case OP_iterator_call:
+                _TI_PUSH(JIT_T_JSVAL); break;
 
             /* ---- Return / throw ---- */
             case OP_return: _TI_DROPN(1); sp = 0; break;
@@ -2028,6 +2046,130 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 " goto _ex;\n"
                 "      }\n"
                 "    }\n");
+            break;
+        }
+
+        /* ---- P15: iterators / for-in / for-of ---- */
+
+        /* OP_for_in_start: obj → iter (in-place).
+         * Calls js_jit_for_in_start which replaces *pobj with the iterator. */
+        case OP_for_in_start:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    if(js_jit_for_in_start(ctx,&_tsv%d)<0) goto _ex;\n",
+                d-1);
+            break;
+
+        /* OP_for_in_next: iter → iter key done (+2).
+         * iter stays at d-1; key at d, done at d+1. */
+        case OP_for_in_next:
+            _P94_ENSURE(d+1);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED; _tsv%d=JS_UNDEFINED;\n"
+                "    if(js_jit_for_in_next(ctx,_tsv%d,&_tsv%d,&_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d, d+1,
+                d-1, d, d+1,
+                d+2);
+            break;
+
+        /* OP_for_of_start: obj → iter next catch_placeholder (+2 net).
+         * Calls js_jit_for_of_start(ctx, &iter, &next, obj).
+         * Pushes JS_UNDEFINED as catch_offset placeholder (slot d+1). */
+        case OP_for_of_start:
+            _P94_ENSURE(d+1);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED; _tsv%d=JS_UNDEFINED;\n"
+                "    if(js_jit_for_of_start(ctx,&_tsv%d,&_tsv%d,_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d, d+1,
+                d-1, d, d-1,
+                d+2);
+            break;
+
+        /* OP_for_of_next: iter next catch_ph → iter next catch_ph value done (+2).
+         * iter at d-3, next at d-2, catch_ph at d-1; value→d, done→d+1.
+         * The wrapper may set *piter=JS_UNDEFINED when iteration is done. */
+        case OP_for_of_next:
+            _P94_ENSURE(d+1);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED; _tsv%d=JS_UNDEFINED;\n"
+                "    if(js_jit_for_of_next(ctx,&_tsv%d,_tsv%d,&_tsv%d,&_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d, d+1,
+                d-3, d-2, d, d+1,
+                d+2);
+            break;
+
+        /* OP_iterator_close: iter next catch_ph → (free all, close iter if non-null).
+         * iter at d-3, next at d-2, catch_ph at d-1. */
+        case OP_iterator_close:
+            jit_buf_printf(cb,
+                "    JS_FreeValue(ctx,_tsv%d);\n"      /* free catch_ph */
+                "    if(js_jit_iterator_close(ctx,_tsv%d,_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d-1, d-3, d-2,
+                d-3);
+            break;
+
+        /* OP_iterator_check_object: check sp[-1] is an object. No stack change. */
+        case OP_iterator_check_object:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    if(!JS_IsObject(_tsv%d)){"
+                " JS_ThrowTypeError(ctx,\"iterator must return an object\");"
+                " goto _ex; }\n",
+                d-1);
+            break;
+
+        /* OP_iterator_get_value_done: catch_ph obj → catch_ph value done (+1).
+         * catch_ph at d-2, obj at d-1; value replaces obj at d-1, done at d.
+         * The catch_ph slot (d-2) is reset to JS_UNDEFINED. */
+        case OP_iterator_get_value_done:
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED;\n"
+                "    if(js_jit_iterator_get_value_done(ctx,_tsv%d,&_tsv%d,&_tsv%d)<0)"
+                " goto _ex;\n"
+                "    JS_FreeValue(ctx,_tsv%d); _tsv%d=JS_UNDEFINED;\n"
+                "    _sp=%d;\n",
+                d,
+                d-1, d-1, d,
+                d-2, d-2,
+                d+1);
+            break;
+
+        /* OP_iterator_next: iter next catch_ph val → iter next catch_ph result (0 net).
+         * iter at d-4, next at d-3, catch_ph at d-2, val at d-1.
+         * Calls next.call(iter, val); result replaces val at d-1. */
+        case OP_iterator_next:
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    if(js_jit_iterator_next_step(ctx,_tsv%d,_tsv%d,_tsv%d,&_tsv%d)<0)"
+                " goto _ex;\n",
+                d-4, d-3, d-1, d-1);
+            break;
+
+        /* OP_iterator_call: iter next catch_ph val → iter next catch_ph result flag (+1).
+         * iter at d-4, next at d-3, catch_ph at d-2, val at d-1.
+         * flags byte follows opcode. result replaces val at d-1; flag pushed at d. */
+        case OP_iterator_call: {
+            int _flags = (int)bc[pc+1];
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    { int _rf=0; _tsv%d=JS_UNDEFINED;\n"
+                "      if(js_jit_iterator_call(ctx,_tsv%d,_tsv%d,%d,&_tsv%d,&_rf)<0)"
+                " goto _ex;\n"
+                "      _tsv%d=JS_NewBool(ctx,_rf); }\n"
+                "    _sp=%d;\n",
+                d,
+                d-4, d-1, _flags, d-1,
+                d,
+                d+1);
             break;
         }
 
@@ -4361,6 +4503,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         {
             uint8_t  _gs_push = 255; /* 255 = no push */
             int      _gs_drop = 0;
+            int      _gs_push_n = 1; /* number of times to push _gs_push (1 = normal) */
             uint64_t _gs_hash = 0;   /* P10.3: bc_hash for JIT_T_JIT_FUNC slots */
 
             switch (op) {
@@ -4518,6 +4661,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_ret:       gen_sp=0; break;              /* jumps away */
             case OP_nip_catch: gen_sp=0; break;              /* conservative reset */
 
+            /* --- P15: iterators --- */
+            case OP_for_in_start: break;                              /* 1-in 1-out */
+            case OP_for_in_next:
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
+            case OP_for_of_start:
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
+            case OP_for_of_next:
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
+            case OP_iterator_close:   _gs_drop=3; break;              /* -3 */
+            case OP_iterator_check_object: break;                     /* 0 */
+            case OP_iterator_get_value_done: _gs_push=JIT_T_JSVAL; break; /* +1 */
+            case OP_iterator_next:    break;                          /* 0 */
+            case OP_iterator_call:    _gs_push=JIT_T_JSVAL; break;   /* +1 */
+
             /* --- P16: delete / delete_var → bool (JSVAL) --- */
             case OP_delete:     _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
             case OP_delete_var: _gs_push=JIT_T_JSVAL; break;
@@ -4554,10 +4711,16 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 gen_hsh[gen_sp] = _gs_hash;  /* P10.3: store callee hash (0 if not JIT_T_JIT_FUNC) */
                 gen_sp++;
             }
-            /* post_inc/dec: push a second time (original + result both go on stack) */
+            /* post_inc/dec: push a second time (result at bottom, original at top) */
             if ((op == OP_post_inc || op == OP_post_dec) && gen_sp < gen_stk_cap) {
                 gen_st[gen_sp] = _gs_push;
-                gen_hsh[gen_sp] = 0;   /* post-result is never a JIT func */
+                gen_hsh[gen_sp] = 0;
+                gen_sp++;
+            }
+            /* P15: multi-push for iterator opcodes that push 2 JSVAL items */
+            for (int _pi = 1; _pi < _gs_push_n && gen_sp < gen_stk_cap; _pi++) {
+                gen_st[gen_sp]  = _gs_push;
+                gen_hsh[gen_sp] = 0;
                 gen_sp++;
             }
         }
