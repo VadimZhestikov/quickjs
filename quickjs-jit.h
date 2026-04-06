@@ -225,6 +225,27 @@ typedef struct JSJITRuntime {
     JSValue (*get_ref_value)(JSContext *, JSValue obj, JSValue atom_val);
     /* OP_put_ref_value: write value via ref-pair (CONSUMES obj, atom_val, val) */
     int     (*put_ref_value)(JSContext *, JSValue obj, JSValue atom_val, JSValue val);
+    /* P21: spread / rest / copy */
+    JSValue (*rest)(JSContext *, int first, int argc, JSValue *argv);
+    int     (*append)(JSContext *, JSValue *parray, JSValue *ppos, JSValue enumobj);
+    int     (*copy_data_properties)(JSContext *, JSValue target, JSValue source,
+                                    JSValue excluded);
+    /* P22: private fields */
+    JSValue (*private_symbol)(JSContext *, JSAtom atom);
+    JSValue (*get_private_field)(JSContext *, JSValue obj, JSValue prop);
+    int     (*put_private_field)(JSContext *, JSValue obj, JSValue prop, JSValue val);
+    int     (*define_private_field)(JSContext *, JSValue obj, JSValue prop, JSValue val);
+    JSValue (*private_in)(JSContext *, JSValue obj, JSValue prop);
+    /* P23: OOP / class helpers (check_ctor/init_ctor/define_class deferred) */
+    int     (*check_brand)(JSContext *, JSValue obj, JSValue func);
+    int     (*add_brand)(JSContext *, JSValue obj, JSValue home_obj);
+    JSValue (*get_super_value)(JSContext *, JSValue this_val, JSValue obj, JSValue prop);
+    int     (*put_super_value)(JSContext *, JSValue this_val, JSValue obj,
+                               JSValue prop, JSValue val);
+    int     (*define_method)(JSContext *, JSValue obj, JSValue func,
+                             JSAtom atom, int op_flags);
+    int     (*define_method_computed)(JSContext *, JSValue obj, JSValue key,
+                                      JSValue func, int op_flags);
 } JSJITRuntime;
 
 /*
@@ -623,6 +644,23 @@ int     js_jit_op_make_ref_pair(JSContext *, JSVarRef *, JSAtom, JSValue *, JSVa
 int     js_jit_op_make_var_ref(JSContext *, JSAtom, JSValue *, JSValue *);
 JSValue js_jit_op_get_ref_value(JSContext *, JSValue, JSValue);
 int     js_jit_op_put_ref_value(JSContext *, JSValue, JSValue, JSValue);
+/* P21: spread / rest / copy helpers */
+JSValue js_jit_op_rest(JSContext *, int first, int argc, JSValue *argv);
+int     js_jit_op_append(JSContext *, JSValue *, JSValue *, JSValue);
+int     js_jit_op_copy_data_properties(JSContext *, JSValue, JSValue, JSValue);
+/* P22: private field helpers */
+JSValue js_jit_op_private_symbol(JSContext *, JSAtom);
+JSValue js_jit_op_get_private_field(JSContext *, JSValue, JSValue);
+int     js_jit_op_put_private_field(JSContext *, JSValue, JSValue, JSValue);
+int     js_jit_op_define_private_field(JSContext *, JSValue, JSValue, JSValue);
+JSValue js_jit_op_private_in(JSContext *, JSValue, JSValue);
+/* P23: OOP helpers (check_ctor/init_ctor/define_class* deferred) */
+int     js_jit_op_check_brand(JSContext *, JSValue, JSValue);
+int     js_jit_op_add_brand(JSContext *, JSValue, JSValue);
+JSValue js_jit_op_get_super_value(JSContext *, JSValue, JSValue, JSValue);
+int     js_jit_op_put_super_value(JSContext *, JSValue, JSValue, JSValue, JSValue);
+int     js_jit_op_define_method(JSContext *, JSValue, JSValue, JSAtom, int);
+int     js_jit_op_define_method_computed(JSContext *, JSValue, JSValue, JSValue, int);
 #endif
 
 /* ======================================================================= */

@@ -35,6 +35,9 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 18: type-test opcodes (is_null/undefined/typeof_is_*), stack-shuffle extras (dup3, nip1, insert3/4, perm3/4/5, rot4l/5l, swap2) |
 | [phase18-todo.md](phase18-todo.md) | Phase 19: utility ops (close_loc, get_var_undef, throw_error, to_object/propkey, regexp, set_name_computed, set_proto/home_object, get_array_el2/3, define_array_el, push_bigint_i32) |
 | [phase18-todo.md](phase18-todo.md) | Phase 20: ref-slot ops (make_loc_ref, make_arg_ref, make_var_ref, make_var_ref_ref, get_ref_value, put_ref_value) |
+| [phase18-todo.md](phase18-todo.md) | Phase 21: spread/rest/copy (append, copy_data_properties, rest) — includes gen_st type invalidation fix for append |
+| [phase18-todo.md](phase18-todo.md) | Phase 22: private fields (private_symbol, get/put/define_private_field, private_in) |
+| [phase18-todo.md](phase18-todo.md) | Phase 23: class/OOP (check_ctor_return, check/add_brand, get_super, get/put_super_value, define_method/computed); check_ctor/init_ctor/define_class deferred (need new_target/sf) |
 
 ---
 

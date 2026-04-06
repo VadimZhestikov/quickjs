@@ -24,6 +24,43 @@
     `js_jit_fb_get_arg_var_ref_idx` at codegen time to map local/arg idx → `_sf_vrefs[]` idx.
   - `close_loc` maps through `js_jit_fb_get_local_var_ref_idx` to get `_sf_vrefs[]` index.
 
+**P21 — DONE** (implemented in `quickjs-jit.c`, tested, no regressions).
+  - Helpers added in `quickjs.c`: `js_jit_op_rest`, `js_jit_op_append`,
+    `js_jit_op_copy_data_properties`.
+  - Forward declarations for `js_append_enumerate` and `JS_CopyDataProperties` added before
+    the P21 helpers (both are `static` and defined later in `quickjs.c`).
+  - Function pointers: `rest`, `append`, `copy_data_properties`.
+  - Key fix: `OP_append` gen_st case must invalidate type tracking on array/pos slots
+    (`gen_st[gen_sp-3]` and `gen_st[gen_sp-2]` → `JIT_T_JSVAL`) after the call, since the
+    helper writes new JSValues into those slots. Without this, `_P94_ENSURE` re-boxes stale
+    `_ti` values (e.g., old pos=0 instead of updated pos=3), corrupting subsequent opcodes.
+  - Test: `tests/test_jit_p21p22p23.js`.
+
+**P22 — DONE** (implemented in `quickjs-jit.c`, tested, no regressions).
+  - Helpers added in `quickjs.c`: `js_jit_op_private_symbol`, `js_jit_op_get_private_field`,
+    `js_jit_op_put_private_field`, `js_jit_op_define_private_field`, `js_jit_op_private_in`.
+  - Stack order for `put_private_field`: obj=sp[-3], val=sp[-2], prop=sp[-1]
+    (prop and val in unusual order vs. typical patterns).
+  - `private_in` wraps `js_operator_private_in` which does NOT free op1/op2 on error;
+    the wrapper frees them explicitly on the error path.
+  - Function pointers: `private_symbol`, `get_private_field`, `put_private_field`,
+    `define_private_field`, `private_in`.
+
+**P23 — DONE** (implemented in `quickjs-jit.c`, tested, no regressions).
+  - Deferred opcodes (added to `scan_is_unsupported`): `check_ctor` (needs `new_target`),
+    `init_ctor` (needs `new_target` + `func_obj`), `define_class`/`define_class_computed`
+    (need `JSStackFrame *sf` for closure creation). Functions containing these opcodes are
+    excluded from JIT compilation.
+  - Implemented opcodes: `check_ctor_return` (inlined using `JS_IsObject`/`JS_IsUndefined`),
+    `check_brand`, `add_brand`, `get_super` (inlined using `JS_GetPrototype`),
+    `get_super_value`, `put_super_value`, `define_method`, `define_method_computed`.
+  - Helpers added in `quickjs.c`: `js_jit_op_check_brand`, `js_jit_op_add_brand`,
+    `js_jit_op_get_super_value`, `js_jit_op_put_super_value`, `js_jit_op_define_method`,
+    `js_jit_op_define_method_computed`.
+  - Function pointers: `check_brand`, `add_brand`, `get_super_value`, `put_super_value`,
+    `define_method`, `define_method_computed`.
+  - Tests: `tests/test_jit_p21p22p23.js` covers all implemented opcodes.
+
 ## Overview
 
 57 finalized opcodes (listed in `quickjs-opcode.h` as `DEF(...)`) currently reach the

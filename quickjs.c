@@ -16525,6 +16525,264 @@ int js_jit_op_put_ref_value(JSContext *ctx, JSValue obj, JSValue atom_val, JSVal
 }
 
 /* -----------------------------------------------------------------------
+ * P21 — spread / rest / copy helpers
+ * ----------------------------------------------------------------------- */
+
+/* Forward declarations for static functions used by P21 helpers */
+static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp);
+static __exception int JS_CopyDataProperties(JSContext *ctx,
+                                             JSValueConst target,
+                                             JSValueConst source,
+                                             JSValueConst excluded,
+                                             BOOL setprop);
+
+/* OP_rest: create rest argument array from argv[first..argc]. */
+JSValue js_jit_op_rest(JSContext *ctx, int first, int argc, JSValue *argv)
+{
+    if (first > argc) first = argc;
+    return js_create_array(ctx, argc - first, (JSValueConst *)(argv + first));
+}
+
+/* OP_append: append spread elements from enumobj into array at pos.
+ * Wraps js_append_enumerate.  On success, *parray and *ppos are updated,
+ * enumobj is consumed (freed).  On error, all three are freed. */
+int js_jit_op_append(JSContext *ctx, JSValue *parray, JSValue *ppos, JSValue enumobj)
+{
+    JSValue buf[3];
+    buf[0] = *parray;
+    buf[1] = *ppos;
+    buf[2] = enumobj;
+    if (js_append_enumerate(ctx, buf + 3)) {
+        /* Error: js_append_enumerate did not free buf[0/1/2]. */
+        JS_FreeValue(ctx, buf[0]);
+        JS_FreeValue(ctx, buf[1]);
+        JS_FreeValue(ctx, buf[2]);
+        return -1;
+    }
+    /* Success: buf[2] (enumobj) must be freed; buf[0/1] are updated values. */
+    JS_FreeValue(ctx, buf[2]);
+    *parray = buf[0];
+    *ppos   = buf[1];
+    return 0;
+}
+
+/* OP_copy_data_properties: copy enumerable own props from source to target,
+ * excluding properties found in excluded.  All three are borrowed (not freed). */
+int js_jit_op_copy_data_properties(JSContext *ctx,
+                                    JSValue target, JSValue source,
+                                    JSValue excluded)
+{
+    return JS_CopyDataProperties(ctx, target, source, excluded, 0);
+}
+
+/* -----------------------------------------------------------------------
+ * P22 — private field helpers
+ * ----------------------------------------------------------------------- */
+
+/* OP_private_symbol: push a new private symbol for the given atom. */
+JSValue js_jit_op_private_symbol(JSContext *ctx, JSAtom atom)
+{
+    return JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+}
+
+/* OP_get_private_field: obj(borrowed) prop(borrowed) → value(new ref). */
+JSValue js_jit_op_get_private_field(JSContext *ctx, JSValue obj, JSValue prop)
+{
+    return JS_GetPrivateField(ctx, obj, prop);
+}
+
+/* OP_put_private_field: obj(d-3) val(d-2) prop(d-1) — all consumed.
+ * JS_SetPrivateField consumes val; we free obj and prop. */
+int js_jit_op_put_private_field(JSContext *ctx, JSValue obj,
+                                 JSValue prop, JSValue val)
+{
+    int ret = JS_SetPrivateField(ctx, obj, prop, val); /* val consumed */
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, prop);
+    return ret;
+}
+
+/* OP_define_private_field: obj(borrowed) prop(consumed) val(consumed). */
+int js_jit_op_define_private_field(JSContext *ctx, JSValue obj,
+                                    JSValue prop, JSValue val)
+{
+    int ret = JS_DefinePrivateField(ctx, obj, prop, val); /* val consumed */
+    JS_FreeValue(ctx, prop);
+    return ret;
+}
+
+/* OP_private_in: prop(consumed) obj(consumed) → bool(new JSValue).
+ * Wraps js_operator_private_in — on any error path neither op1 nor op2
+ * are freed by the inner function, so we free them here. */
+JSValue js_jit_op_private_in(JSContext *ctx, JSValue obj, JSValue prop)
+{
+    JSValue buf[2] = {obj, prop};
+    if (js_operator_private_in(ctx, buf + 2)) {
+        /* Error paths in js_operator_private_in do NOT free op1/op2.
+         * buf[0/1] still hold the original values. */
+        JS_FreeValue(ctx, buf[0]);
+        JS_FreeValue(ctx, buf[1]);
+        return JS_EXCEPTION;
+    }
+    /* Success: buf[0] = bool result (obj freed, prop freed by function). */
+    return buf[0];
+}
+
+/* -----------------------------------------------------------------------
+ * P23 — OOP / class helpers (feasible subset; check_ctor/init_ctor/
+ *        define_class/define_class_computed are deferred — need new_target or sf)
+ * ----------------------------------------------------------------------- */
+
+/* OP_check_brand: returns 0 on success, -1 on error or invalid brand. */
+int js_jit_op_check_brand(JSContext *ctx, JSValue obj, JSValue func)
+{
+    int ret = JS_CheckBrand(ctx, obj, func);
+    if (ret < 0) return -1;
+    if (!ret) {
+        JS_ThrowTypeError(ctx, "invalid brand on object");
+        return -1;
+    }
+    return 0;
+}
+
+/* OP_add_brand: obj(borrowed) home_obj(borrowed). */
+int js_jit_op_add_brand(JSContext *ctx, JSValue obj, JSValue home_obj)
+{
+    return JS_AddBrand(ctx, obj, home_obj);
+}
+
+/* OP_get_super_value: this_val(consumed) obj(consumed) prop(consumed) → value. */
+JSValue js_jit_op_get_super_value(JSContext *ctx,
+                                   JSValue this_val, JSValue obj, JSValue prop)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, prop);
+    if (unlikely(atom == JS_ATOM_NULL)) {
+        JS_FreeValue(ctx, this_val);
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, prop);
+        return JS_EXCEPTION;
+    }
+    JSValue val = JS_GetPropertyInternal(ctx, obj, atom, this_val, FALSE);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, this_val);
+    return val;
+}
+
+/* OP_put_super_value: this_val(consumed) obj(consumed) prop(consumed) val(consumed).
+ * Note: val is consumed by JS_SetPropertyInternal. */
+int js_jit_op_put_super_value(JSContext *ctx,
+                               JSValue this_val, JSValue obj,
+                               JSValue prop, JSValue val)
+{
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, this_val);
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, prop);
+        JS_FreeValue(ctx, val);
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return -1;
+    }
+    JSAtom atom = JS_ValueToAtom(ctx, prop);
+    if (unlikely(atom == JS_ATOM_NULL)) {
+        JS_FreeValue(ctx, this_val);
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, prop);
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    int ret = JS_SetPropertyInternal(ctx, obj, atom, val, this_val,
+                                     JS_PROP_THROW_STRICT);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, this_val);
+    return ret;
+}
+
+/* OP_define_method: obj(borrowed) func(consumed) → obj stays.
+ * Bake atom and op_flags at codegen time. */
+int js_jit_op_define_method(JSContext *ctx, JSValue obj, JSValue func,
+                             JSAtom atom, int op_flags_raw)
+{
+#define _OP_DEFINE_METHOD_METHOD     0
+#define _OP_DEFINE_METHOD_GETTER     1
+#define _OP_DEFINE_METHOD_SETTER     2
+#define _OP_DEFINE_METHOD_ENUMERABLE 4
+    int op_flags = op_flags_raw;
+    int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+                JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW;
+    if (op_flags & _OP_DEFINE_METHOD_ENUMERABLE)
+        flags |= JS_PROP_ENUMERABLE;
+    op_flags &= 3;
+    JSValue value = JS_UNDEFINED, getter = JS_UNDEFINED, setter = JS_UNDEFINED;
+    if (op_flags == _OP_DEFINE_METHOD_METHOD) {
+        value = func;
+        flags |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE;
+    } else if (op_flags == _OP_DEFINE_METHOD_GETTER) {
+        getter = func;
+        flags |= JS_PROP_HAS_GET;
+    } else {
+        setter = func;
+        flags |= JS_PROP_HAS_SET;
+    }
+    int ret = js_method_set_properties(ctx, func, atom, flags, obj);
+    if (ret >= 0)
+        ret = JS_DefineProperty(ctx, obj, atom, value, getter, setter, flags);
+    JS_FreeValue(ctx, func);
+    return ret;
+#undef _OP_DEFINE_METHOD_METHOD
+#undef _OP_DEFINE_METHOD_GETTER
+#undef _OP_DEFINE_METHOD_SETTER
+#undef _OP_DEFINE_METHOD_ENUMERABLE
+}
+
+/* OP_define_method_computed: obj(borrowed) key(consumed) func(consumed) → obj stays. */
+int js_jit_op_define_method_computed(JSContext *ctx, JSValue obj, JSValue key,
+                                      JSValue func, int op_flags_raw)
+{
+#define _OP_DEFINE_METHOD_METHOD     0
+#define _OP_DEFINE_METHOD_GETTER     1
+#define _OP_DEFINE_METHOD_SETTER     2
+#define _OP_DEFINE_METHOD_ENUMERABLE 4
+    JSAtom atom = JS_ValueToAtom(ctx, key);
+    if (unlikely(atom == JS_ATOM_NULL)) {
+        JS_FreeValue(ctx, key);
+        JS_FreeValue(ctx, func);
+        return -1;
+    }
+    int op_flags = op_flags_raw;
+    int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+                JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW;
+    if (op_flags & _OP_DEFINE_METHOD_ENUMERABLE)
+        flags |= JS_PROP_ENUMERABLE;
+    op_flags &= 3;
+    JSValue value = JS_UNDEFINED, getter = JS_UNDEFINED, setter = JS_UNDEFINED;
+    if (op_flags == _OP_DEFINE_METHOD_METHOD) {
+        value = func;
+        flags |= JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE;
+    } else if (op_flags == _OP_DEFINE_METHOD_GETTER) {
+        getter = func;
+        flags |= JS_PROP_HAS_GET;
+    } else {
+        setter = func;
+        flags |= JS_PROP_HAS_SET;
+    }
+    int ret = js_method_set_properties(ctx, func, atom, flags, obj);
+    if (ret >= 0)
+        ret = JS_DefineProperty(ctx, obj, atom, value, getter, setter, flags);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, key);
+    JS_FreeValue(ctx, func);
+    return ret;
+#undef _OP_DEFINE_METHOD_METHOD
+#undef _OP_DEFINE_METHOD_GETTER
+#undef _OP_DEFINE_METHOD_SETTER
+#undef _OP_DEFINE_METHOD_ENUMERABLE
+}
+
+/* -----------------------------------------------------------------------
  * Inline Property Cache helpers — Phase 6.2
  * ----------------------------------------------------------------------- */
 

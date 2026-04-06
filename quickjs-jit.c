@@ -254,6 +254,23 @@ const JSJITRuntime js_jit_rt = {
     .make_var_ref     = js_jit_op_make_var_ref,
     .get_ref_value    = js_jit_op_get_ref_value,
     .put_ref_value    = js_jit_op_put_ref_value,
+    /* P21: spread / rest / copy */
+    .rest                  = js_jit_op_rest,
+    .append                = js_jit_op_append,
+    .copy_data_properties  = js_jit_op_copy_data_properties,
+    /* P22: private fields */
+    .private_symbol        = js_jit_op_private_symbol,
+    .get_private_field     = js_jit_op_get_private_field,
+    .put_private_field     = js_jit_op_put_private_field,
+    .define_private_field  = js_jit_op_define_private_field,
+    .private_in            = js_jit_op_private_in,
+    /* P23: OOP / class (feasible subset) */
+    .check_brand           = js_jit_op_check_brand,
+    .add_brand             = js_jit_op_add_brand,
+    .get_super_value       = js_jit_op_get_super_value,
+    .put_super_value       = js_jit_op_put_super_value,
+    .define_method         = js_jit_op_define_method,
+    .define_method_computed = js_jit_op_define_method_computed,
 };
 
 /* -----------------------------------------------------------------------
@@ -495,6 +512,11 @@ static int scan_is_unsupported(int op)
     /* yield* and async yield* — require iterator protocol, not yet supported */
     case OP_yield_star:
     case OP_async_yield_star:
+    /* P23 deferred: these require new_target or JSStackFrame*sf not available in JIT */
+    case OP_check_ctor:        /* needs new_target */
+    case OP_init_ctor:         /* needs new_target + func_obj */
+    case OP_define_class:      /* needs sf (JSStackFrame*) for closure creation */
+    case OP_define_class_computed: /* same */
         return 1;
     default:
         return 0;
@@ -1082,6 +1104,28 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_get_ref_value: _TI_PUSH(JIT_T_JSVAL); break;
             /* put_ref_value: obj atom_val val → (pops all 3) */
             case OP_put_ref_value: _TI_DROPN(3); break;
+
+            /* ---- P21: spread / rest / copy ---- */
+            case OP_rest: _TI_PUSH(JIT_T_JSVAL); break;           /* push restArgs */
+            case OP_append: _TI_DROPN(1); break;                   /* pop enumobj; array+pos stay */
+            case OP_copy_data_properties: break;                   /* net 0 */
+
+            /* ---- P22: private fields ---- */
+            case OP_private_symbol: _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_get_private_field: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break; /* net -1 */
+            case OP_put_private_field: _TI_DROPN(3); break;        /* net -3 */
+            case OP_define_private_field: _TI_DROPN(2); break;     /* net -2 */
+            case OP_private_in: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break; /* net -1 */
+
+            /* ---- P23: OOP / class helpers (feasible) ---- */
+            case OP_check_ctor_return: _TI_PUSH(JIT_T_JSVAL); break; /* net +1 */
+            case OP_check_brand: break;                             /* net 0 (2-in 2-out) */
+            case OP_add_brand: _TI_DROPN(2); break;                 /* net -2 */
+            case OP_get_super: _TI_DROPN(1); _TI_PUSH(JIT_T_JSVAL); break; /* net 0 */
+            case OP_get_super_value: _TI_DROPN(3); _TI_PUSH(JIT_T_JSVAL); break; /* net -2 */
+            case OP_put_super_value: _TI_DROPN(4); break;          /* net -4 */
+            case OP_define_method: _TI_DROPN(1); break;            /* net -1: func consumed, obj stays */
+            case OP_define_method_computed: _TI_DROPN(2); break;   /* net -2 */
 
             default: break;
             }
@@ -5340,6 +5384,224 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P21: spread / rest / copy ---- */
+
+        /* OP_rest: push rest-argument array.  Operand: u16 first. */
+        case OP_rest: {
+            int first = (int)bc_u16(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->rest(ctx,%d,argc,argv);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                first, d, d, d+1);
+            break;
+        }
+
+        /* OP_append: array(d-3) pos(d-2) enumobj(d-1) → array(d-3) pos(d-2).
+         * Helper frees enumobj and updates array/pos via pointers. */
+        case OP_append: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _enu=_tsv%d; _sp=%d;\n"
+                "      if(_RT->append(ctx,&_tsv%d,&_tsv%d,_enu)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-1, d-2, d-3, d-2, d-1);
+            break;
+        }
+
+        /* OP_copy_data_properties: operand=u8 mask encoding offsets.
+         * Borrows target, source, excluded (all stay on stack). Net 0. */
+        case OP_copy_data_properties: {
+            int mask = (int)bc[pc+1];
+            int t_slot = d - 1 - (mask & 3);
+            int s_slot = d - 1 - ((mask >> 2) & 7);
+            int e_slot = d - 1 - ((mask >> 5) & 7);
+            _P94_ENSURE(t_slot);
+            _P94_ENSURE(s_slot);
+            _P94_ENSURE(e_slot);
+            jit_buf_printf(cb,
+                "    if(_RT->copy_data_properties(ctx,_tsv%d,_tsv%d,_tsv%d)<0) goto _ex;\n",
+                t_slot, s_slot, e_slot);
+            break;
+        }
+
+        /* ---- P22: private fields ---- */
+
+        /* OP_private_symbol: push new private symbol. Operand: atom u32. */
+        case OP_private_symbol: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->private_symbol(ctx,(JSAtom)%uu);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                (unsigned)atom, d, d, d+1);
+            break;
+        }
+
+        /* OP_get_private_field: obj(d-2) prop(d-1) → val(d-2). Net -1. */
+        case OP_get_private_field: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _o=_tsv%d,_p=_tsv%d; _sp=%d;\n"
+                "      JSValue _r=_RT->get_private_field(ctx,_o,_p);\n"
+                "      _FREE(_o); _FREE(_p);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d-2, d-2, d-2, d-1);
+            break;
+        }
+
+        /* OP_put_private_field: obj(d-3) val(d-2) prop(d-1) → consumed. Net -3.
+         * Order: sp[-3]=obj, sp[-2]=val, sp[-1]=prop. */
+        case OP_put_private_field: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _o=_tsv%d,_v=_tsv%d,_p=_tsv%d; _sp=%d;\n"
+                "      if(_RT->put_private_field(ctx,_o,_p,_v)<0) goto _ex; }\n",
+                d-3, d-2, d-1, d-3);
+            break;
+        }
+
+        /* OP_define_private_field: obj(d-3) prop(d-2) val(d-1) → obj(d-3). Net -2. */
+        case OP_define_private_field: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _p=_tsv%d,_v=_tsv%d; _sp=%d;\n"
+                "      if(_RT->define_private_field(ctx,_tsv%d,_p,_v)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-2, d-1, d-2, d-3, d-1);
+            break;
+        }
+
+        /* OP_private_in: obj(d-2) prop(d-1) → bool(d-2). Net -1.
+         * Note interpreter: sp[-2]=object, sp[-1]=name/method. */
+        case OP_private_in: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _o=_tsv%d,_p=_tsv%d; _sp=%d;\n"
+                "      JSValue _r=_RT->private_in(ctx,_o,_p);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d-2, d-2, d-2, d-1);
+            break;
+        }
+
+        /* ---- P23: OOP / class helpers (feasible subset) ---- */
+
+        /* OP_check_ctor_return: val(d-1) → val(d-1) bool(d). Net +1.
+         * If val is not object and not undefined → TypeError.
+         * If val is not object → push TRUE (use 'this'), else push FALSE (use val). */
+        case OP_check_ctor_return: {
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { if(!JS_IsObject(_tsv%d)) {\n"
+                "        if(!JS_IsUndefined(_tsv%d)) {\n"
+                "          JS_ThrowTypeError(ctx,\"derived class constructor must return"
+                                             " an object or undefined\");\n"
+                "          goto _ex;\n"
+                "        }\n"
+                "        _tsv%d=JS_TRUE; _sp=%d;\n"
+                "      } else {\n"
+                "        _tsv%d=JS_FALSE; _sp=%d;\n"
+                "      } }\n",
+                d-1, d-1, d, d+1, d, d+1);
+            break;
+        }
+
+        /* OP_check_brand: this_obj(d-2) func(d-1) → same (borrows both). Net 0. */
+        case OP_check_brand: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    if(_RT->check_brand(ctx,_tsv%d,_tsv%d)<0) goto _ex;\n",
+                d-2, d-1);
+            break;
+        }
+
+        /* OP_add_brand: this_obj(d-2) home_obj(d-1) → (both consumed). Net -2. */
+        case OP_add_brand: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _t=_tsv%d,_h=_tsv%d; _sp=%d;\n"
+                "      int _r=_RT->add_brand(ctx,_t,_h);\n"
+                "      _FREE(_t); _FREE(_h);\n"
+                "      if(_r<0) goto _ex; }\n",
+                d-2, d-1, d-2);
+            break;
+        }
+
+        /* OP_get_super: obj(d-1) → proto(d-1). Net 0.
+         * JS_GetPrototype is in the public API (quickjs.h). */
+        case OP_get_super: {
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _o=_tsv%d;\n"
+                "      JSValue _r=JS_GetPrototype(ctx,_o);\n"
+                "      _FREE(_o); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-1, d-1, d-1, d);
+            break;
+        }
+
+        /* OP_get_super_value: this(d-3) obj(d-2) prop(d-1) → val(d-3). Net -2. */
+        case OP_get_super_value: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _tv=_tsv%d,_o=_tsv%d,_p=_tsv%d; _sp=%d;\n"
+                "      JSValue _r=_RT->get_super_value(ctx,_tv,_o,_p);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-3, d-2, d-1, d-3, d-3, d-3, d-2);
+            break;
+        }
+
+        /* OP_put_super_value: this(d-4) obj(d-3) prop(d-2) val(d-1) → consumed. Net -4. */
+        case OP_put_super_value: {
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            _P94_ENSURE(d-4);
+            jit_buf_printf(cb,
+                "    { JSValue _tv=_tsv%d,_o=_tsv%d,_p=_tsv%d,_v=_tsv%d; _sp=%d;\n"
+                "      if(_RT->put_super_value(ctx,_tv,_o,_p,_v)<0) goto _ex; }\n",
+                d-4, d-3, d-2, d-1, d-4);
+            break;
+        }
+
+        /* OP_define_method: obj(d-2) func(d-1) → obj(d-2). Net -1.
+         * Operands: atom u32 + op_flags u8. */
+        case OP_define_method: {
+            uint32_t atom = bc_u32(&bc[pc+1]);
+            int op_flags = (int)bc[pc+5];
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            jit_buf_printf(cb,
+                "    { JSValue _func=_tsv%d; _sp=%d;\n"
+                "      if(_RT->define_method(ctx,_tsv%d,_func,(JSAtom)%uu,%d)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-1, d-1, d-2, (unsigned)atom, op_flags, d-1);
+            break;
+        }
+
+        /* OP_define_method_computed: obj(d-3) key(d-2) func(d-1) → obj(d-3). Net -2.
+         * Operand: op_flags u8. */
+        case OP_define_method_computed: {
+            int op_flags = (int)bc[pc+1];
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-3);
+            jit_buf_printf(cb,
+                "    { JSValue _k=_tsv%d,_func=_tsv%d; _sp=%d;\n"
+                "      if(_RT->define_method_computed(ctx,_tsv%d,_k,_func,%d)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-2, d-1, d-2, d-3, op_flags, d-1);
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -5675,6 +5937,36 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;
             case OP_get_ref_value: _gs_push=JIT_T_JSVAL; break; /* net +1 */
             case OP_put_ref_value: _gs_drop=3; break; /* net -3 */
+
+            /* --- P21: spread / rest / copy --- */
+            case OP_rest: _gs_push=JIT_T_JSVAL; break;
+            case OP_append:
+                /* Helper writes back updated JSValues to array/pos slots;
+                 * invalidate any typed (int/float) tracking on those slots
+                 * so _P94_ENSURE won't re-box stale _ti/_tsd values. */
+                if (gen_sp >= 3) {
+                    gen_st[gen_sp-3] = JIT_T_JSVAL; /* array slot */
+                    gen_st[gen_sp-2] = JIT_T_JSVAL; /* pos slot */
+                }
+                _gs_drop = 1; break;
+            case OP_copy_data_properties: break;
+
+            /* --- P22: private fields --- */
+            case OP_private_symbol: _gs_push=JIT_T_JSVAL; break;
+            case OP_get_private_field: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_put_private_field: _gs_drop=3; break;
+            case OP_define_private_field: _gs_drop=2; break;
+            case OP_private_in: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+
+            /* --- P23: OOP helpers --- */
+            case OP_check_ctor_return: _gs_push=JIT_T_JSVAL; break;
+            case OP_check_brand: break;
+            case OP_add_brand: _gs_drop=2; break;
+            case OP_get_super: _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            case OP_get_super_value: _gs_drop=3; _gs_push=JIT_T_JSVAL; break;
+            case OP_put_super_value: _gs_drop=4; break;
+            case OP_define_method: _gs_drop=1; break;
+            case OP_define_method_computed: _gs_drop=2; break;
 
             /* Everything else: no tracked stack effect (conservative) */
             default: break;
