@@ -5786,11 +5786,15 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
                 JS_FreeValueRT(rt, var_ref->value);
             } else {
                 JSStackFrame *sf = var_ref->stack_frame;
-                assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
-                sf->var_refs[var_ref->var_ref_idx] = NULL;
-                if (sf->js_mode & JS_MODE_ASYNC) {
-                    JSAsyncFunctionState *async_func = container_of(sf, JSAsyncFunctionState, frame);
-                    async_func_free(rt, async_func);
+                /* P13: JIT-owned var_refs have stack_frame=NULL; nothing to clean up
+                 * in the stack frame (js_jit_close_caps handles detachment instead). */
+                if (sf) {
+                    assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
+                    sf->var_refs[var_ref->var_ref_idx] = NULL;
+                    if (sf->js_mode & JS_MODE_ASYNC) {
+                        JSAsyncFunctionState *async_func = container_of(sf, JSAsyncFunctionState, frame);
+                        async_func_free(rt, async_func);
+                    }
                 }
             }
             remove_gc_object(&var_ref->header);
@@ -15804,6 +15808,145 @@ JSAtom js_jit_fb_get_arg_atom(JSFunctionBytecode *b, int arg_idx) {
     if (!b->vardefs) return JS_ATOM_NULL;
     return b->vardefs[arg_idx].var_name;
 }
+/* P13: inner function's cpool entry as JSFunctionBytecode* (NULL if not a function). */
+JSFunctionBytecode *js_jit_cpool_get_fb(JSFunctionBytecode *b, int idx) {
+    if (idx < 0 || idx >= b->cpool_count) return NULL;
+    JSValue v = b->cpool[idx];
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_FUNCTION_BYTECODE) return NULL;
+    return (JSFunctionBytecode *)JS_VALUE_GET_PTR(v);
+}
+/* P13: inner function's closure_var[] accessors. */
+int js_jit_fb_get_inner_cv_type(JSFunctionBytecode *b_inner, int cv_idx) {
+    return (int)b_inner->closure_var[cv_idx].closure_type;
+}
+int js_jit_fb_get_inner_cv_var_idx(JSFunctionBytecode *b_inner, int cv_idx) {
+    return (int)b_inner->closure_var[cv_idx].var_idx;
+}
+/* P13: outer function's var_ref_count (size of sf->var_refs[]). */
+int js_jit_fb_get_var_ref_count(JSFunctionBytecode *b) {
+    return (int)b->var_ref_count;
+}
+/* P13: outer function's per-local/arg captured-variable metadata. */
+int js_jit_fb_get_local_var_ref_idx(JSFunctionBytecode *b, int local_idx) {
+    if (!b->vardefs) return -1;
+    return (int)b->vardefs[b->arg_count + local_idx].var_ref_idx;
+}
+int js_jit_fb_get_arg_var_ref_idx(JSFunctionBytecode *b, int arg_idx) {
+    if (!b->vardefs) return -1;
+    return (int)b->vardefs[arg_idx].var_ref_idx;
+}
+int js_jit_fb_is_local_captured(JSFunctionBytecode *b, int local_idx) {
+    if (!b->vardefs) return 0;
+    return (int)b->vardefs[b->arg_count + local_idx].is_captured;
+}
+int js_jit_fb_is_arg_captured(JSFunctionBytecode *b, int arg_idx) {
+    if (!b->vardefs) return 0;
+    return (int)b->vardefs[arg_idx].is_captured;
+}
+
+/* P13: create a JSVarRef with refcount=1, pvalue=slot, stack_frame=NULL.
+ * Used by JIT-compiled functions to build closure var-refs pointing at
+ * shadow-array slots (_cap_buf / _arg_cap_buf) on the JIT C stack. */
+JSVarRef *js_jit_make_var_ref(JSContext *ctx, JSValue *slot) {
+    JSVarRef *vr = js_malloc(ctx, sizeof(*vr));
+    if (!vr) return NULL;
+    vr->header.ref_count = 1;
+    add_gc_object(ctx->rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+    vr->is_detached  = FALSE;
+    vr->is_lexical   = FALSE;
+    vr->is_const     = FALSE;
+    vr->var_ref_idx  = 0;       /* unused: managed via _sf_vrefs[], not sf->var_refs[] */
+    vr->stack_frame  = NULL;    /* NULL signals JIT ownership to free_var_ref */
+    vr->pvalue       = slot;
+    return vr;
+}
+
+/* P13: heap-promote all live var_refs before the JIT frame exits.
+ * For each non-NULL vrefs[i]: copy *pvalue → var_ref->value, redirect pvalue.
+ * MUST be called on ALL exit paths before _cap_buf/_arg_cap_buf go out of scope. */
+void js_jit_close_caps(JSContext *ctx, JSVarRef **vrefs, int n) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    for (int i = 0; i < n; i++) {
+        if (vrefs[i] && !vrefs[i]->is_detached) {
+            vrefs[i]->value  = JS_DupValueRT(rt, *vrefs[i]->pvalue);
+            vrefs[i]->pvalue = &vrefs[i]->value;
+            vrefs[i]->is_detached = TRUE;
+        }
+    }
+}
+
+/* P13: build a closure function object from pre-constructed var_refs.
+ * bfunc (JS_TAG_FUNCTION_BYTECODE) is consumed (freed on error or stored).
+ * pre_vrefs[0..n_vrefs-1] are pre-filled with refcounts already set by the caller.
+ * On success, the inner function's p->u.func.var_refs[] takes ownership of the entries.
+ * On error, pre_vrefs entries are released (refcount decremented) and JS_EXCEPTION returned. */
+JSValue js_jit_create_closure(JSContext *ctx, JSValue bfunc,
+                               JSVarRef **pre_vrefs, int n_vrefs) {
+    JSFunctionBytecode *b = (JSFunctionBytecode *)JS_VALUE_GET_PTR(bfunc);
+    /* Create the function object with the correct class for the function kind */
+    static const uint16_t fk_to_cid[] = {
+        [JS_FUNC_NORMAL]           = JS_CLASS_BYTECODE_FUNCTION,
+        [JS_FUNC_GENERATOR]        = JS_CLASS_GENERATOR_FUNCTION,
+        [JS_FUNC_ASYNC]            = JS_CLASS_ASYNC_FUNCTION,
+        [JS_FUNC_ASYNC_GENERATOR]  = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
+    };
+    int class_id = (b->func_kind < (int)(sizeof(fk_to_cid)/sizeof(fk_to_cid[0])))
+                   ? fk_to_cid[b->func_kind] : JS_CLASS_BYTECODE_FUNCTION;
+    JSValue func_obj = JS_NewObjectClass(ctx, class_id);
+    if (JS_IsException(func_obj)) {
+        JS_FreeValue(ctx, bfunc);
+        goto fail_no_func;
+    }
+    /* Delegate to js_closure2 with NULL sf/cur_var_refs — but we need to set
+     * var_refs ourselves since js_closure2 uses get_var_ref(sf,...) for LOCAL/ARG.
+     * Instead, call js_closure2 with is_eval=FALSE and cur_var_refs=pre_vrefs,
+     * but since js_closure2 calls get_var_ref for LOCAL/ARG which needs sf, we
+     * cannot use it for those types.  We replicate the js_closure2 logic here for
+     * P13's supported subset (LOCAL/ARG already resolved; REF/GLOBAL_REF passed as-is). */
+    {
+        JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+        p->u.func.function_bytecode = b;
+        p->u.func.home_object = NULL;
+        p->u.func.var_refs = NULL;
+        if (n_vrefs > 0) {
+            JSVarRef **var_refs = js_malloc(ctx, sizeof(*var_refs) * n_vrefs);
+            if (!var_refs) {
+                JS_FreeValue(ctx, func_obj); /* frees bfunc too via bytecode deref */
+                goto fail_no_func;
+            }
+            memcpy(var_refs, pre_vrefs, sizeof(*var_refs) * n_vrefs);
+            p->u.func.var_refs = var_refs;
+        }
+    }
+    /* Set function properties: name and length */
+    {
+        JSAtom name_atom = b->func_name;
+        if (name_atom == JS_ATOM_NULL) name_atom = JS_ATOM_empty_string;
+        js_function_set_properties(ctx, func_obj, name_atom, b->defined_arg_count);
+    }
+    /* Generator prototype setup (mirrors js_closure) */
+    if (b->func_kind & JS_FUNC_GENERATOR) {
+        JSValue proto;
+        int proto_class_id = (b->func_kind == JS_FUNC_ASYNC_GENERATOR)
+                             ? JS_CLASS_ASYNC_GENERATOR : JS_CLASS_GENERATOR;
+        proto = JS_NewObjectProto(ctx, ctx->class_proto[proto_class_id]);
+        if (JS_IsException(proto)) {
+            JS_FreeValue(ctx, func_obj);
+            goto fail_no_func;
+        }
+        JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_prototype, proto, JS_PROP_WRITABLE);
+    } else if (b->has_prototype) {
+        JS_SetConstructorBit(ctx, func_obj, TRUE);
+        JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
+                                  JS_AUTOINIT_ID_PROTOTYPE, NULL, JS_PROP_WRITABLE);
+    }
+    return func_obj;
+fail_no_func:
+    /* bfunc already freed above; release pre_vrefs entries */
+    for (int i = 0; i < n_vrefs; i++)
+        free_var_ref(ctx->rt, pre_vrefs[i]);
+    return JS_EXCEPTION;
+}
 /* P8.2: interrupt poll wrapper — also checks C stack depth.
  * Direct P8.2/P8.3 JIT calls bypass JS_CallInternal's stack overflow check,
  * so we combine the interrupt poll with a stack check here.                  */
@@ -16162,6 +16305,15 @@ _Static_assert(offsetof(JSFunctionBytecode, jit_func)       == JIT_BC_JIT_FUNC_O
                "JIT_BC_JIT_FUNC_OFF mismatch");
 _Static_assert(offsetof(JSFunctionBytecode, jit_bc_hash)    == JIT_BC_BCHASH_OFF,
                "JIT_BC_BCHASH_OFF mismatch");
+/* P13: verify JSClosureTypeEnum values match the JIT_CLOSURE_* constants */
+_Static_assert((int)JS_CLOSURE_LOCAL         == JIT_CLOSURE_LOCAL,         "JIT_CLOSURE_LOCAL mismatch");
+_Static_assert((int)JS_CLOSURE_ARG           == JIT_CLOSURE_ARG,           "JIT_CLOSURE_ARG mismatch");
+_Static_assert((int)JS_CLOSURE_REF           == JIT_CLOSURE_REF,           "JIT_CLOSURE_REF mismatch");
+_Static_assert((int)JS_CLOSURE_GLOBAL_REF    == JIT_CLOSURE_GLOBAL_REF,    "JIT_CLOSURE_GLOBAL_REF mismatch");
+_Static_assert((int)JS_CLOSURE_GLOBAL_DECL   == JIT_CLOSURE_GLOBAL_DECL,   "JIT_CLOSURE_GLOBAL_DECL mismatch");
+_Static_assert((int)JS_CLOSURE_GLOBAL        == JIT_CLOSURE_GLOBAL,        "JIT_CLOSURE_GLOBAL mismatch");
+_Static_assert((int)JS_CLOSURE_MODULE_DECL   == JIT_CLOSURE_MODULE_DECL,   "JIT_CLOSURE_MODULE_DECL mismatch");
+_Static_assert((int)JS_CLOSURE_MODULE_IMPORT == JIT_CLOSURE_MODULE_IMPORT, "JIT_CLOSURE_MODULE_IMPORT mismatch");
 
 /* js_jit_ic_check: shape pointer guard + atom-at-slot ABA guard.
  * The atom check prevents false positives when a shape is freed and its

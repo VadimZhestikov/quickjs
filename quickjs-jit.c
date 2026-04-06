@@ -390,6 +390,10 @@ typedef struct JSJITScanResult {
     int      *targets;    /* sorted array of branch-target offsets */
     int       ntargets;   /* number of entries in targets[]         */
     int       unsupported; /* 1 if an unsupported opcode was found   */
+    /* P13: closure capture analysis (populated by js_jit_scan) */
+    int       has_fclosure;        /* 1 if any OP_fclosure/fclosure8 found */
+    uint64_t  captured_local_mask; /* bit i = local i captured by ≥1 inner closure */
+    uint64_t  captured_arg_mask;   /* bit i = arg i captured by ≥1 inner closure */
 } JSJITScanResult;
 
 static void scan_result_free(JSJITScanResult *sr)
@@ -440,9 +444,6 @@ static inline int16_t bc_get_i16(const uint8_t *pc) {
 static int scan_is_unsupported(int op)
 {
     switch (op) {
-    /* closure creation: needs stack-frame access not available in JIT */
-    case OP_fclosure:
-    case OP_fclosure8:
     /* try/finally frame management */
     case OP_catch:
     case OP_gosub:
@@ -488,6 +489,9 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
     sr->targets    = NULL;
     sr->ntargets   = 0;
     sr->unsupported = 0;
+    sr->has_fclosure        = 0;
+    sr->captured_local_mask = 0;
+    sr->captured_arg_mask   = 0;
     int cap = 0;
 
     int pc = 0;
@@ -542,6 +546,42 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
         default:
             break;
         }
+
+        /* P13: detect OP_fclosure / OP_fclosure8 and compute captured-var masks. */
+        if (op == OP_fclosure || op == OP_fclosure8) {
+            /* Read cpool index (inline bc_u32 since bc_u32 is defined later in this file) */
+            int cpool_idx = (op == OP_fclosure8) ? (int)bc[pc+1] :
+                            (int)((uint32_t)bc[pc+1]|((uint32_t)bc[pc+2]<<8)|
+                                  ((uint32_t)bc[pc+3]<<16)|((uint32_t)bc[pc+4]<<24));
+            JSFunctionBytecode *b_inner = js_jit_cpool_get_fb(b, cpool_idx);
+            if (!b_inner) {
+                /* cpool entry is not a bytecode function — mark unsupported */
+                sr->unsupported = 1;
+                scan_result_free(sr);
+                return -1;
+            }
+            int n_cv = js_jit_fb_get_closure_var_count(b_inner);
+            for (int ci = 0; ci < n_cv; ci++) {
+                int cv_type = js_jit_fb_get_inner_cv_type(b_inner, ci);
+                int cv_vidx = js_jit_fb_get_inner_cv_var_idx(b_inner, ci);
+                if (cv_type == JIT_CLOSURE_LOCAL) {
+                    if (cv_vidx >= 64) { sr->unsupported = 1; scan_result_free(sr); return -1; }
+                    sr->captured_local_mask |= (uint64_t)1 << cv_vidx;
+                } else if (cv_type == JIT_CLOSURE_ARG) {
+                    if (cv_vidx >= 64) { sr->unsupported = 1; scan_result_free(sr); return -1; }
+                    sr->captured_arg_mask |= (uint64_t)1 << cv_vidx;
+                } else if (cv_type == JIT_CLOSURE_REF || cv_type == JIT_CLOSURE_GLOBAL_REF) {
+                    /* Pass-through: already have a JSVarRef* in var_refs[]. No capture mask needed. */
+                } else {
+                    /* GLOBAL_DECL, GLOBAL, MODULE_* — eval/module only, mark unsupported */
+                    sr->unsupported = 1;
+                    scan_result_free(sr);
+                    return -1;
+                }
+            }
+            sr->has_fclosure = 1;
+        }
+
         pc += sz;
     }
     return 0;
@@ -733,6 +773,9 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_lt:  case OP_lte: case OP_gt:  case OP_gte:
             case OP_eq:  case OP_neq: case OP_strict_eq: case OP_strict_neq:
             case OP_instanceof: case OP_in: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
+            /* P13: fclosure pushes a new closure object (JSVAL) */
+            case OP_fclosure:  _TI_PUSH(JIT_T_JSVAL); break;
+            case OP_fclosure8: _TI_PUSH(JIT_T_JSVAL); break;
             /* P16: delete → bool (JSVAL) */
             case OP_delete:     _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break;
             case OP_delete_var: _TI_PUSH(JIT_T_JSVAL); break;
@@ -810,6 +853,7 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_put_field:    _TI_DROPN(2); break;
             case OP_put_array_el: _TI_DROPN(3); break;
             case OP_define_field: _TI_DROPN(1); break;
+            case OP_set_name: break; /* 1-in 1-out, type unchanged */
 
             /* ---- Branches ---- */
             case OP_if_false:  case OP_if_true:
@@ -1482,7 +1526,9 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          char *fname_out, size_t fname_sz,
                          const uint8_t *local_type,
                          const char *js_func_name,
-                         char **varnames)
+                         char **varnames,
+                         const JSJITScanResult *sr,
+                         int var_ref_count)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -1493,6 +1539,7 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                    js_func_name ? js_func_name : "<unknown>");
     jit_buf_str(cb,
         "#include <stdint.h>\n"
+        "#include <string.h>\n"
         "#include <quickjs.h>\n"
         "#include <quickjs-jit.h>\n"
         "#define _RT  (&js_jit_rt)\n"
@@ -1572,6 +1619,41 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 j, j, varnames[j], j, 1u << j);
         jit_buf_str(cb, "    (void)_aim;\n");
     }
+
+    /* P13.4: shadow arrays for closure capture.
+     * Only emitted when the function contains at least one OP_fclosure. */
+    if (sr && sr->has_fclosure) {
+        /* _cap_buf[local_idx]: canonical slot for captured locals.
+         * JSVarRefs point their pvalue here; content equals current local value.
+         * Explicit JS_UNDEFINED initialisation required (memset(0) ≠ JS_UNDEFINED). */
+        if (var_count > 0) {
+            jit_buf_printf(cb, "    JSValue _cap_buf[%d];\n", var_count);
+            for (int j = 0; j < var_count && j < 64; j++) {
+                if ((sr->captured_local_mask >> j) & 1)
+                    jit_buf_printf(cb, "    _cap_buf[%d]=JS_UNDEFINED;\n", j);
+            }
+        }
+        /* _sf_vrefs[var_ref_idx]: shared JSVarRef* cache across all OP_fclosure calls.
+         * Multiple closures capturing the same local share one JSVarRef (refcount>1). */
+        if (var_ref_count > 0) {
+            jit_buf_printf(cb, "    JSVarRef *_sf_vrefs[%d];\n", var_ref_count);
+            jit_buf_printf(cb, "    memset(_sf_vrefs,0,sizeof(_sf_vrefs));\n");
+        } else {
+            /* No var_refs but still has_fclosure (all REF/GLOBAL_REF): emit dummy */
+            jit_buf_str(cb, "    JSVarRef **_sf_vrefs=0; (void)_sf_vrefs;\n");
+        }
+        /* _arg_cap_buf[arg_idx]: canonical slot for captured arguments.
+         * Initialised with DUP from argv so we own a reference throughout. */
+        if (arg_count > 0 && sr->captured_arg_mask != 0) {
+            jit_buf_printf(cb, "    JSValue _arg_cap_buf[%d];\n", arg_count);
+            for (int j = 0; j < arg_count && j < 64; j++) {
+                if ((sr->captured_arg_mask >> j) & 1)
+                    jit_buf_printf(cb,
+                        "    _arg_cap_buf[%d]=(%d<argc)?_DUP(argv[%d]):JS_UNDEFINED;\n",
+                        j, j, j);
+            }
+        }
+    }
 }
 
 /*
@@ -1581,8 +1663,22 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
  * only live slots.
  */
 static void gen_footer(JSJITCodeBuf *cb, int var_count,
-                       int arg_count, char **varnames, int stack_size)
+                       int arg_count, char **varnames, int stack_size,
+                       const JSJITScanResult *sr, int var_ref_count)
 {
+    /* P13.7: heap-promote all live var_refs and free shadow arrays before _ex cleanup */
+    if (sr && sr->has_fclosure) {
+        if (var_ref_count > 0)
+            jit_buf_printf(cb, "    js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+        for (int j = 0; j < var_count && j < 64; j++)
+            if ((sr->captured_local_mask >> j) & 1)
+                jit_buf_printf(cb, "    _FREE(_cap_buf[%d]);\n", j);
+        if (arg_count > 0) {
+            for (int j = 0; j < arg_count && j < 64; j++)
+                if ((sr->captured_arg_mask >> j) & 1)
+                    jit_buf_printf(cb, "    _FREE(_arg_cap_buf[%d]);\n", j);
+        }
+    }
     jit_buf_str(cb, "_ex:\n");
     for (int j = 0; j < var_count; j++)
         jit_buf_printf(cb, "    _FREE(_jsv_%s);\n", varnames[arg_count + j]);
@@ -1662,7 +1758,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     JSFunctionBytecode *b,
                     uint64_t bc_hash,
                     char **varnames,
-                    const uint64_t *var_jit_hash)
+                    const uint64_t *var_jit_hash,
+                    int var_ref_count)
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -1876,8 +1973,72 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 atom, d, d, d+1);
             break;
         }
-        /* OP_fclosure / OP_fclosure8: create closure — needs stack-frame access,
-         * not available in JIT.  Functions using these are kept in interpreter. */
+        /* ---- P13: OP_fclosure / OP_fclosure8 — closure creation via shadow arrays ---- */
+        case OP_fclosure:
+        case OP_fclosure8: {
+            int cpool_idx = (op == OP_fclosure8) ? (int)bc[pc+1] : (int)bc_u32(&bc[pc+1]);
+            JSFunctionBytecode *b_inner = js_jit_cpool_get_fb(b, cpool_idx);
+            if (!b_inner) {
+                fprintf(stderr, "[JIT] gen_body: fclosure cpool[%d] is not a bytecode function\n", cpool_idx);
+                *unsupported_out = 1; free(gen_st); free(gen_hsh); return -1;
+            }
+            int n_cv = js_jit_fb_get_closure_var_count(b_inner);
+
+            /* 1. Declare the per-closure var_ref pointer array */
+            if (n_cv > 0)
+                jit_buf_printf(cb, "    { JSVarRef *_vr_%d[%d];\n", pc, n_cv);
+            else
+                jit_buf_printf(cb, "    {\n");
+
+            /* 2. Fill _vr_PC[i] for each closure_var entry */
+            for (int ci = 0; ci < n_cv; ci++) {
+                int cv_type = js_jit_fb_get_inner_cv_type(b_inner, ci);
+                int cv_vidx = js_jit_fb_get_inner_cv_var_idx(b_inner, ci);
+                if (cv_type == JIT_CLOSURE_LOCAL) {
+                    int vri = js_jit_fb_get_local_var_ref_idx(b, cv_vidx);
+                    /* Create or share JSVarRef for this captured local */
+                    jit_buf_printf(cb,
+                        "      if(!_sf_vrefs[%d]){\n"
+                        "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_cap_buf[%d]);\n"
+                        "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
+                        "      } else { _sf_vrefs[%d]->header.ref_count++; }\n"
+                        "      _vr_%d[%d]=_sf_vrefs[%d];\n",
+                        vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
+                } else if (cv_type == JIT_CLOSURE_ARG) {
+                    int vri = js_jit_fb_get_arg_var_ref_idx(b, cv_vidx);
+                    jit_buf_printf(cb,
+                        "      if(!_sf_vrefs[%d]){\n"
+                        "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_arg_cap_buf[%d]);\n"
+                        "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
+                        "      } else { _sf_vrefs[%d]->header.ref_count++; }\n"
+                        "      _vr_%d[%d]=_sf_vrefs[%d];\n",
+                        vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
+                } else if (cv_type == JIT_CLOSURE_REF || cv_type == JIT_CLOSURE_GLOBAL_REF) {
+                    /* Pass-through: increment ref on the existing var_ref */
+                    jit_buf_printf(cb,
+                        "      var_refs[%d]->header.ref_count++;\n"
+                        "      _vr_%d[%d]=var_refs[%d];\n",
+                        cv_vidx, pc, ci, cv_vidx);
+                }
+                /* other types rejected by scan */
+            }
+
+            /* 3. Create the closure object */
+            jit_buf_printf(cb,
+                "      JSValue _bfunc=_DUP(cpool[%d]); _sp=%d;\n",
+                cpool_idx, d);
+            if (n_cv > 0)
+                jit_buf_printf(cb,
+                    "      JSValue _cl=js_jit_create_closure(ctx,_bfunc,_vr_%d,%d);\n",
+                    pc, n_cv);
+            else
+                jit_buf_printf(cb,
+                    "      JSValue _cl=js_jit_create_closure(ctx,_bfunc,(JSVarRef**)0,0);\n");
+            jit_buf_printf(cb,
+                "      _CHK(_cl); _tsv%d=_cl; _sp=%d; }\n",
+                d, d+1);
+            break;
+        }
 
         /* ---- Stack manipulation ---- */
         /* P9.2: use named slots _tsv{d-1}, _tsv{d}, etc. */
@@ -1963,6 +2124,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
      local_type[(idx)] == JIT_T_NUMBER)
 
 /* P11.6: INT locals use _ti{d}, NUMBER locals use _tsd{d}, JSVAL use _tsv{d}. */
+#define _CAP_LOC(idx) (sr->has_fclosure && (idx) >= 0 && (idx) < 64 && \
+                       (((sr->captured_local_mask) >> (idx)) & 1))
+#define _CAP_ARG(idx) (sr->has_fclosure && (idx) >= 0 && (idx) < 64 && \
+                       (((sr->captured_arg_mask) >> (idx)) & 1))
+
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
         jit_buf_printf(cb, \
@@ -1970,6 +2136,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     else if (_IS_NUM(idx)) \
         jit_buf_printf(cb, \
             "    _tsd%d=_jsd_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
+    else if (_CAP_LOC(idx)) \
+        jit_buf_printf(cb, "    _tsv%d=_DUP(_cap_buf[%d]); _sp=%d;\n", d, (idx), d+1); \
     else \
         jit_buf_printf(cb, "    _tsv%d=_DUP(_jsv_%s); _sp=%d;\n", d, LNAME(idx), d+1); \
 } while(0)
@@ -1995,6 +2163,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             "    { JSValue _t=_tsv%d; _sp=%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, d-1, LNAME(idx)); \
+    } else if (_CAP_LOC(idx)) { \
+        _P94_ENSURE(d-1); \
+        jit_buf_printf(cb, "    _FREE(_cap_buf[%d]); _cap_buf[%d]=_tsv%d; _sp=%d;\n", \
+                       (idx), (idx), d-1, d-1); \
     } else { \
         _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_tsv%d; _sp=%d;\n", \
@@ -2023,6 +2195,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             "    { JSValue _t=_tsv%d;" \
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, LNAME(idx)); \
+    } else if (_CAP_LOC(idx)) { \
+        _P94_ENSURE(d-1); \
+        jit_buf_printf(cb, "    _FREE(_cap_buf[%d]); _cap_buf[%d]=_DUP(_tsv%d);\n", \
+                       (idx), (idx), d-1); \
     } else { \
         _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_tsv%d);\n", \
@@ -2066,7 +2242,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 /* P9.2: arg access macros use _tsv{d} for push, _tsv{d-1} for pop/peek. */
 #define _AI_VALID(idx) ((idx) < 32)
 #define GEN_GET_ARG(idx) do { \
-    if (_AI_VALID(idx)) \
+    if (_CAP_ARG(idx)) \
+        /* Captured arg: read from shadow slot (canonical location for var refs) */ \
+        jit_buf_printf(cb, \
+            "    _tsv%d=_DUP(_arg_cap_buf[%d]); _sp=%d;\n", d, (idx), d+1); \
+    else if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    _tsv%d=((%d)<argc&&(_aim>>%du&1u))" \
             "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
@@ -2079,7 +2259,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 } while(0)
 #define GEN_PUT_ARG(idx) do { \
     _P94_ENSURE(d-1); \
-    if (_AI_VALID(idx)) \
+    if (_CAP_ARG(idx)) \
+        /* Captured arg: update shadow slot, discard argv copy */ \
+        jit_buf_printf(cb, \
+            "    { _FREE(_arg_cap_buf[%d]); _arg_cap_buf[%d]=_tsv%d; _sp=%d; }\n", \
+            (idx), (idx), d-1, d-1); \
+    else if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){ JSValue _t=_tsv%d; _sp=%d;\n" \
             "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
@@ -2092,7 +2277,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 } while(0)
 #define GEN_SET_ARG(idx) do { \
     _P94_ENSURE(d-1); \
-    if (_AI_VALID(idx)) \
+    if (_CAP_ARG(idx)) \
+        /* Captured arg: update shadow slot (set_arg is non-destructive peek) */ \
+        jit_buf_printf(cb, \
+            "    { _FREE(_arg_cap_buf[%d]); _arg_cap_buf[%d]=_DUP(_tsv%d); }\n", \
+            (idx), (idx), d-1); \
+    else if (_AI_VALID(idx)) \
         jit_buf_printf(cb, \
             "    if((%d)<argc){ JSValue _t=_tsv%d;\n" \
             "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
@@ -2668,6 +2858,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 jit_buf_printf(cb, "    _jsi_%s++;\n", LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
                 jit_buf_printf(cb, "    _jsd_%s+=1.0;\n", LNAME(idx));
+            } else if (_CAP_LOC(idx)) {
+                /* Captured JSVAL local: operate on shadow slot _cap_buf[idx] */
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_cap_buf[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _cap_buf[%d]=(ia==INT32_MAX)?JS_NewFloat64(ctx,(double)ia+1)\n"
+                    "                                   :JS_NewInt32(ctx,ia+1);\n"
+                    "      } else { JSValue _r=_RT->add(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _FREE(_cap_buf[%d]); _cap_buf[%d]=_r; } }\n",
+                    idx, idx, idx, idx);
             } else {
                 jit_buf_printf(cb,
                     "    { JSValue _a=_jsv_%s;\n"
@@ -2688,6 +2889,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 jit_buf_printf(cb, "    _jsi_%s--;\n", LNAME(idx));
             } else if (local_type && idx < var_count && local_type[idx] == JIT_T_NUMBER) {
                 jit_buf_printf(cb, "    _jsd_%s-=1.0;\n", LNAME(idx));
+            } else if (_CAP_LOC(idx)) {
+                /* Captured JSVAL local: operate on shadow slot _cap_buf[idx] */
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_cap_buf[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT){\n"
+                    "        int32_t ia=JS_VALUE_GET_INT(_a);\n"
+                    "        _cap_buf[%d]=(ia==INT32_MIN)?JS_NewFloat64(ctx,(double)ia-1)\n"
+                    "                                   :JS_NewInt32(ctx,ia-1);\n"
+                    "      } else { JSValue _r=_RT->sub(ctx,_a,JS_NewInt32(ctx,1));\n"
+                    "               _CHK(_r); _FREE(_cap_buf[%d]); _cap_buf[%d]=_r; } }\n",
+                    idx, idx, idx, idx);
             } else {
                 jit_buf_printf(cb,
                     "    { JSValue _a=_jsv_%s;\n"
@@ -2748,20 +2960,53 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* P11.9: INT source — bypass _P94_ENSURE boxing; read _ti directly.
                  * JSVAL local, int64_t source: handle INT and FLOAT64 local fast paths,
                  * fall back to _RT->add for strings/objects (rare). */
+                const char *_pv_expr = _CAP_LOC(idx) ? "_cap_buf" : "_jsv_";
+                if (_CAP_LOC(idx)) {
+                    jit_buf_printf(cb,
+                        "    { int64_t _b=_ti%d; _sp=%d; JSValue *_pv=&_cap_buf[%d];\n"
+                        "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT){\n"
+                        "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+_b;\n"
+                        "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                        "                              :JS_NewFloat64(ctx,(double)_r);\n"
+                        "      } else if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_FLOAT64){\n"
+                        "        *_pv=JS_NewFloat64(ctx,JS_VALUE_GET_FLOAT64(*_pv)+(double)_b);\n"
+                        "      } else {\n"
+                        "        JSValue _bb=JS_NewInt64(ctx,_b);\n"
+                        "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
+                        "        JSValue _r=_RT->add(ctx,_old,_bb); _CHK(_r); *_pv=_r;\n"
+                        "      } }\n",
+                        d-1, d-1, idx);
+                } else {
+                    jit_buf_printf(cb,
+                        "    { int64_t _b=_ti%d; _sp=%d; JSValue *_pv=&_jsv_%s;\n"
+                        "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT){\n"
+                        "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+_b;\n"
+                        "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                        "                              :JS_NewFloat64(ctx,(double)_r);\n"
+                        "      } else if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_FLOAT64){\n"
+                        "        *_pv=JS_NewFloat64(ctx,JS_VALUE_GET_FLOAT64(*_pv)+(double)_b);\n"
+                        "      } else {\n"
+                        "        JSValue _bb=JS_NewInt64(ctx,_b);\n"
+                        "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
+                        "        JSValue _r=_RT->add(ctx,_old,_bb); _CHK(_r); *_pv=_r;\n"
+                        "      } }\n",
+                        d-1, d-1, LNAME(idx));
+                }
+                (void)_pv_expr;
+            } else if (_CAP_LOC(idx)) {
+                /* Captured JSVAL local, JSVAL source */
+                _P94_ENSURE(d-1);
                 jit_buf_printf(cb,
-                    "    { int64_t _b=_ti%d; _sp=%d; JSValue *_pv=&_jsv_%s;\n"
-                    "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT){\n"
-                    "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+_b;\n"
+                    "    { JSValue _b=_tsv%d; _sp=%d; JSValue *_pv=&_cap_buf[%d];\n"
+                    "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT){\n"
+                    "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+JS_VALUE_GET_INT(_b);\n"
                     "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
                     "                              :JS_NewFloat64(ctx,(double)_r);\n"
-                    "      } else if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_FLOAT64){\n"
-                    "        *_pv=JS_NewFloat64(ctx,JS_VALUE_GET_FLOAT64(*_pv)+(double)_b);\n"
                     "      } else {\n"
-                    "        JSValue _bb=JS_NewInt64(ctx,_b);\n"
                     "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
-                    "        JSValue _r=_RT->add(ctx,_old,_bb); _CHK(_r); *_pv=_r;\n"
+                    "        JSValue _r=_RT->add(ctx,_old,_b); _CHK(_r); *_pv=_r;\n"
                     "      } }\n",
-                    d-1, d-1, LNAME(idx));
+                    d-1, d-1, idx);
             } else {
                 _P94_ENSURE(d-1); /* P9.4: box typed slot before use as JSValue */
                 jit_buf_printf(cb,
@@ -3799,6 +4044,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_return: {
             _P94_ENSURE(d-1); /* P9.4: box typed slot before reading as JSValue */
             jit_buf_printf(cb, "    { JSValue _r=_tsv%d; _sp=%d;\n", d-1, d-1);
+            /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
+            if (sr->has_fclosure) {
+                if (var_ref_count > 0)
+                    jit_buf_printf(cb, "      js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+                for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
+                    if ((sr->captured_local_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
+                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                    if ((sr->captured_arg_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
+            }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
@@ -3810,6 +4066,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* P9.2: OP_return_undef: free _tsv{0}.._tsv{d-1} and all locals */
         case OP_return_undef: {
             jit_buf_str(cb, "    {");
+            /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
+            if (sr->has_fclosure) {
+                if (var_ref_count > 0)
+                    jit_buf_printf(cb, " js_jit_close_caps(ctx,_sf_vrefs,%d);", var_ref_count);
+                for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
+                    if ((sr->captured_local_mask >> _cf) & 1)
+                        jit_buf_printf(cb, " _FREE(_cap_buf[%d]);", _cf);
+                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                    if ((sr->captured_arg_mask >> _cf) & 1)
+                        jit_buf_printf(cb, " _FREE(_arg_cap_buf[%d]);", _cf);
+            }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, " _FREE(_jsv_%s);",
                                varnames[arg_count+_jf]); }
@@ -3839,6 +4106,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
                 d, d, d+1);
             break;
+        /* OP_set_name: set function .name property; stack unchanged (1-in 1-out) */
+        case OP_set_name: {
+            uint32_t _atom = bc_u32(&bc[pc+1]);
+            _P94_ENSURE(d-1); /* ensure top is a boxed JSValue */
+            jit_buf_printf(cb,
+                "    if(JS_IsObject(_tsv%d)) {\n"
+                "      int _r=JS_DefinePropertyValue(ctx,_tsv%d,JS_ATOM_name,"
+                "JS_AtomToString(ctx,(JSAtom)%uu),JS_PROP_CONFIGURABLE);\n"
+                "      if(_r<0) goto _ex;\n"
+                "    }\n",
+                d-1, d-1, _atom);
+            break;
+        }
         /* OP_define_field: obj(_tsv{d-2}) val(_tsv{d-1}) -> obj stays at _tsv{d-2}; depth d -> d-1 */
         case OP_define_field: {
             uint32_t atom = bc_u32(&bc[pc+1]);
@@ -4095,6 +4375,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_call_constructor:
                 { int _n=(int)bc_u16(&bc[pc+1]); _gs_drop=_n+2; _gs_push=JIT_T_JSVAL; break; }
 
+            /* --- P13: fclosure → pushes a closure object (JSVAL) --- */
+            case OP_fclosure:  _gs_push=JIT_T_JSVAL; break;
+            case OP_fclosure8: _gs_push=JIT_T_JSVAL; break;
+            case OP_set_name: break; /* 1-in 1-out, no stack change */
+
             /* --- P16: delete / delete_var → bool (JSVAL) --- */
             case OP_delete:     _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
             case OP_delete_var: _gs_push=JIT_T_JSVAL; break;
@@ -4150,6 +4435,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef _P94_ENSURE
 #undef LNAME
 #undef ANAME
+#undef _CAP_LOC
+#undef _CAP_ARG
 
     free(gen_st);
     free(gen_hsh);
@@ -4182,6 +4469,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     int stack_size     = js_jit_fb_get_stack_size(b);
     int cpool_count    = js_jit_fb_get_cpool_count(b);
     int closure_var_count = js_jit_fb_get_closure_var_count(b);
+    int var_ref_count  = js_jit_fb_get_var_ref_count(b);
 
     int op_sz_count;
     const uint8_t *op_sz = js_jit_get_opcode_size_table(&op_sz_count);
@@ -4189,6 +4477,13 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     /* Phase 5: infer which locals are always numeric → use C double */
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
+
+    /* P13.3: force captured locals to JIT_T_JSVAL — typed opt breaks capture semantics */
+    if (sr.has_fclosure && local_type) {
+        for (int i = 0; i < var_count && i < 64; i++)
+            if ((sr.captured_local_mask >> i) & 1)
+                local_type[i] = JIT_T_JSVAL;
+    }
 
     /* P9.1: build named variable table (fallback to numeric on alloc failure) */
     char **varnames = jit_build_varnames(rt, b, arg_count, var_count);
@@ -4207,12 +4502,12 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
-                 local_type, js_func_name, varnames);
+                 local_type, js_func_name, varnames, &sr, var_ref_count);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
-                 bc_hash, varnames, var_jit_hash) < 0) {
+                 bc_hash, varnames, var_jit_hash, var_ref_count) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);
@@ -4221,7 +4516,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    gen_footer(cb, var_count, arg_count, varnames, stack_size);
+    gen_footer(cb, var_count, arg_count, varnames, stack_size, &sr, var_ref_count);
 
     scan_result_free(&sr);
     free(local_type);

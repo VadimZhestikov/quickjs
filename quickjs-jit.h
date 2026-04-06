@@ -246,6 +246,32 @@ const uint8_t *js_jit_get_opcode_size_table(int *count);
 const char    *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b);
 /* P8.2: function's own name atom (JS_ATOM_NULL if anonymous) */
 JSAtom         js_jit_fb_get_func_atom(JSFunctionBytecode *b);
+/* P13: inner function's cpool entry as JSFunctionBytecode* (NULL if not function) */
+JSFunctionBytecode *js_jit_cpool_get_fb(JSFunctionBytecode *b, int cpool_idx);
+/* P13: JSClosureTypeEnum values — must match quickjs.c (verified by _Static_assert). */
+#define JIT_CLOSURE_LOCAL         0  /* var_idx = local index in outer function */
+#define JIT_CLOSURE_ARG           1  /* var_idx = arg index in outer function */
+#define JIT_CLOSURE_REF           2  /* var_idx = closure-var index (pass-through ref) */
+#define JIT_CLOSURE_GLOBAL_REF    3  /* var_idx = closure-var index (global pass-through) */
+#define JIT_CLOSURE_GLOBAL_DECL   4  /* eval only — unsupported in JIT */
+#define JIT_CLOSURE_GLOBAL        5  /* eval only — unsupported in JIT */
+#define JIT_CLOSURE_MODULE_DECL   6  /* module only — unsupported in JIT */
+#define JIT_CLOSURE_MODULE_IMPORT 7  /* module only — unsupported in JIT */
+/* P13: inner function's closure_var entry accessors */
+int js_jit_fb_get_inner_cv_type(JSFunctionBytecode *b_inner, int cv_idx);
+int js_jit_fb_get_inner_cv_var_idx(JSFunctionBytecode *b_inner, int cv_idx);
+/* P13: outer function's var_ref_count (size of sf->var_refs[]) */
+int js_jit_fb_get_var_ref_count(JSFunctionBytecode *b);
+/* P13: outer function's per-local/arg captured-variable metadata */
+int js_jit_fb_get_local_var_ref_idx(JSFunctionBytecode *b, int local_idx);
+int js_jit_fb_get_arg_var_ref_idx(JSFunctionBytecode *b, int arg_idx);
+int js_jit_fb_is_local_captured(JSFunctionBytecode *b, int local_idx);
+int js_jit_fb_is_arg_captured(JSFunctionBytecode *b, int arg_idx);
+/* P13: runtime helpers for JIT-managed closures */
+JSVarRef  *js_jit_make_var_ref(JSContext *ctx, JSValue *slot);
+void       js_jit_close_caps(JSContext *ctx, JSVarRef **vrefs, int n);
+JSValue    js_jit_create_closure(JSContext *ctx, JSValue bfunc,
+                                  JSVarRef **pre_vrefs, int n_vrefs);
 /* P8.2: interrupt poll — wraps js_poll_interrupts (static inline) for vtable use */
 int            js_jit_poll_interrupts(JSContext *ctx);
 /* P8.3: JIT-to-JIT fast call — checks jit_func, calls directly if compiled */
