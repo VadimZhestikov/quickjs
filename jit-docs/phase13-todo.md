@@ -695,7 +695,7 @@ None of the supported benchmarks use it.  **This group will remain excluded inde
 | Phase | Group | Opcodes | Effort | Unlock |
 |---|---|---|---:|---|
 | P13 ✅ | Closure creation | `OP_fclosure`, `OP_fclosure8`, `OP_set_name` | ~5 days | Functions that define inner functions/closures |
-| P14 | try/catch/finally | `OP_catch`, `OP_gosub`, `OP_nip_catch` | ~4 days | Functions with exception handling |
+| P14 ✅ | try/catch/finally | `OP_catch`, `OP_gosub`, `OP_nip_catch`, `OP_ret` | ~4 days | Functions with exception handling |
 | P15 | Iterators / for-of | `OP_for_in_start` … `OP_iterator_call` | ~6 days | Loops over objects, arrays, generators |
 | P16 ✅ | Property deletion | `OP_delete`, `OP_delete_var` | ~1 day | `delete obj.prop` patterns |
 | P17 ✅ | Spread / apply | `OP_apply`, `OP_apply_eval` | ~1 day | `f(...args)`, `f.apply(this, args)` |

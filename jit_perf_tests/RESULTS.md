@@ -2311,3 +2311,41 @@ profile similar to other opcode phases.
 - [x] **P13-J** OP_set_name codegen (JS_DefinePropertyValue for function name)
 - [x] **P13-K** Type inference and gen-time stack tracking for all new opcodes
 - [x] **P13-L** Correctness tests pass (`tests/test_jit_p13_closures.js` — 8/8)
+
+---
+
+## P14 — try/catch/finally (OP_catch, OP_gosub, OP_ret, OP_nip_catch)
+
+### Changes
+- `quickjs-jit.c`: runtime catch stack (`_catch_depth`, `_catch_sp[32]`, `_catch_h[32]`) in
+  gen_preamble; `_ex:` dispatch checks catch frames before full cleanup; `_tsvp[]` pointer
+  array for runtime-indexed tsv slot cleanup; gen_body handles OP_catch, OP_gosub, OP_ret,
+  OP_nip_catch; scan records catch handler PCs and gosub return PCs
+- `tests/test_jit_p14_try_catch.js`: 9 correctness tests (all pass)
+- `jit_perf_tests/v8bench/test_p14_try_perf.js`: 3 try/catch perf benchmarks
+
+### Benchmark results (2026-04-05, WSL2)
+
+| Benchmark | JIT (ms) | Interp (ms) | Notes |
+|---|---:|---:|---|
+| `try_no_throw(1M)` | 23 | ~23 | Hot loop, catch never fires (nip_catch path) |
+| `try_finally(1M)` | 26 | ~26 | gosub/ret path; finally runs every iteration |
+| `catch_thrown(1M)` | 30 | ~30 | Exception every iteration; catch handler fires |
+
+JIT ≈ interpreter: try/catch overhead is dominated by the exception machinery
+(push/pop catch frame, JS_GetException), not dispatch cost. The JIT eliminates
+bytecode dispatch overhead but the catch stack operations remain.
+
+### P14 task checklist
+
+- [x] **P14-A** `JSJITScanResult` new fields: `has_try`, `catch_handler_pcs[]`, `gosub_ret_pcs[]`
+- [x] **P14-B** Remove OP_catch/gosub/ret/nip_catch from `scan_is_unsupported()`
+- [x] **P14-C** scan: record catch handler PCs and gosub return PCs as branch targets
+- [x] **P14-D** gen_preamble: emit `_tsvp[]` pointer array and catch stack variables
+- [x] **P14-E** gen_footer `_ex:` dispatch: check `_catch_depth`, pop frame, cleanup, jump to handler
+- [x] **P14-F** OP_catch codegen: push catch frame, emit JS_UNDEFINED placeholder
+- [x] **P14-G** OP_nip_catch codegen: pop catch frame, free intermediate slots, move retval
+- [x] **P14-H** OP_gosub codegen: push return PC as JS_TAG_INT, jump to subroutine
+- [x] **P14-I** OP_ret codegen: pop return PC, dispatch via switch over known gosub return PCs
+- [x] **P14-J** Type inference and gen-time stack tracking for all 4 opcodes
+- [x] **P14-K** Correctness tests pass (`tests/test_jit_p14_try_catch.js` — 9/9)
