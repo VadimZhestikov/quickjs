@@ -21528,6 +21528,7 @@ JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv)
         if (!gf)
             return NULL;
         gf->resume_idx = -1;
+        gf->catch_depth = 0;
         gf->n_lv = n_lv;
         if (n_lv > 0) {
             gf->saved_lv = js_malloc(ctx, (size_t)n_lv * sizeof(JSValue));

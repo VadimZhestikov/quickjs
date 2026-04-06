@@ -259,13 +259,14 @@ const JSJITRuntime js_jit_rt = {
 /* func_kind values matching JSFunctionKindEnum in quickjs.c */
 #define JS_JIT_FUNC_NORMAL    0
 #define JS_JIT_FUNC_GENERATOR 1  /* JS_FUNC_GENERATOR */
+#define JS_JIT_FUNC_ASYNC     2  /* JS_FUNC_ASYNC — P12.3 */
 
 int js_jit_is_eligible(JSFunctionBytecode *b)
 {
     uint8_t fk = js_jit_fb_func_kind(b);
-    /* Only normal functions and simple generators are supported.
-     * Async functions (fk==2) and async generators (fk==3) are not. */
-    if (fk != JS_JIT_FUNC_NORMAL && fk != JS_JIT_FUNC_GENERATOR)
+    /* Normal, generator, and async functions are supported.
+     * Async generators (fk==3) are not yet supported. */
+    if (fk != JS_JIT_FUNC_NORMAL && fk != JS_JIT_FUNC_GENERATOR && fk != JS_JIT_FUNC_ASYNC)
         return 0;
     /* eval() has dynamic variable scoping — incompatible with JIT */
     if (js_jit_fb_is_eval(b))
@@ -403,9 +404,10 @@ typedef struct JSJITScanResult {
     int       n_catch;                    /* number of OP_catch instructions */
     int       gosub_ret_pcs[32];          /* return PC (=gosub_pc+5) for each OP_gosub */
     int       n_gosub;                    /* number of OP_gosub instructions */
-    /* P12: generator yield analysis */
-    int       has_yield;   /* 1 if function has OP_yield or OP_initial_yield */
-    int       yield_count; /* number of OP_yield sites (excluding initial_yield) */
+    /* P12: generator/async yield analysis */
+    int       has_yield;   /* 1 if function has OP_yield/OP_initial_yield/OP_await */
+    int       yield_count; /* number of OP_yield/OP_await sites (excluding initial_yield) */
+    int       func_kind;   /* P12.3: JS_JIT_FUNC_{NORMAL,GENERATOR,ASYNC} */
 } JSJITScanResult;
 
 static void scan_result_free(JSJITScanResult *sr)
@@ -498,6 +500,7 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
     sr->n_gosub   = 0;
     sr->has_yield   = 0;
     sr->yield_count = 0;
+    sr->func_kind   = (int)js_jit_fb_func_kind(b);
     int cap = 0;
 
     int pc = 0;
@@ -620,10 +623,18 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
         } else if (op == OP_yield) {
             sr->has_yield = 1;
             sr->yield_count++;
+        } else if (op == OP_await) {
+            /* P12.3: OP_await is the async equivalent of OP_yield */
+            sr->has_yield = 1;
+            sr->yield_count++;
         }
 
         pc += sz;
     }
+    /* P12.3: async functions always need the generator frame (for OP_return_async),
+     * even if they have no OP_await. */
+    if (sr->func_kind == JS_JIT_FUNC_ASYNC)
+        sr->has_yield = 1;
     return 0;
 }
 
@@ -945,6 +956,11 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
                 _TI_DROPN(1);
                 _TI_PUSH(JIT_T_JSVAL); /* next_val */
                 _TI_PUSH(JIT_T_JSVAL); /* magic */
+                break;
+            /* OP_await: pops 1 (awaited value), pushes 1 (resolved value JSVAL) */
+            case OP_await:
+                _TI_DROPN(1);
+                _TI_PUSH(JIT_T_JSVAL);
                 break;
             /* OP_return_async: pops 1 (return value), no push */
             case OP_return_async:
@@ -1784,10 +1800,20 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 "        _jsv_%s=_gf->saved_lv[%d]; _gf->saved_lv[%d]=JS_UNDEFINED;\n",
                 varnames[arg_count + j], j, j);
         }
+        /* P12.1: restore catch state before dispatch so try/catch works across yield */
+        if (sr->has_try && stack_size > 0) {
+            jit_buf_str(cb,
+                "        _catch_depth=_gf->catch_depth;\n"
+                "        if(_catch_depth>0){\n"
+                "            memcpy(_catch_sp,_gf->catch_sp,(size_t)_catch_depth*sizeof(int));\n"
+                "            memcpy(_catch_h,_gf->catch_h,(size_t)_catch_depth*sizeof(int));\n"
+                "        }\n");
+        }
         /* Dispatch to the resume label matching _gf->resume_idx */
-        jit_buf_str(cb,
-            "        switch(_gf->resume_idx){\n"
-            "        case 0: goto _Lresume_0;\n");
+        jit_buf_str(cb, "        switch(_gf->resume_idx){\n");
+        /* P12.3: async functions have no OP_initial_yield so resume_idx is never 0 */
+        if (sr->func_kind != JS_JIT_FUNC_ASYNC)
+            jit_buf_str(cb, "        case 0: goto _Lresume_0;\n");
         for (k = 1; k <= sr->yield_count; k++)
             jit_buf_printf(cb, "        case %d: goto _Lresume_%d;\n", k, k);
         jit_buf_str(cb,
@@ -4636,6 +4662,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
                     j, LNAME(j), LNAME(j));
             }
+            /* P12.1: save catch state so try/catch works across yield */
+            if (sr->has_try && stack_size > 0) {
+                jit_buf_str(cb,
+                    "    _gf->catch_depth=_catch_depth;\n"
+                    "    if(_catch_depth>0){\n"
+                    "        memcpy(_gf->catch_sp,_catch_sp,(size_t)_catch_depth*sizeof(int));\n"
+                    "        memcpy(_gf->catch_h,_catch_h,(size_t)_catch_depth*sizeof(int));\n"
+                    "    }\n");
+            }
             jit_buf_printf(cb,
                 "    { JSValue _yv%d=_tsv%d; _sp=%d;\n"
                 "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
@@ -4662,8 +4697,55 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        case OP_await: {
+            /* P12.3: Async function await — suspends execution, yielding the
+             * awaited value (_tsv{d-1}) to the Promise machinery.
+             *
+             * On resume (_Lresume_N:): only the resolved value is pushed back
+             * (no magic int).  A throw resume sets throw_flag and is handled by
+             * the throw check at the top of every entry (preamble).
+             *
+             * Returns FUNC_RET_AWAIT=0 to async_func_resume.
+             */
+            int j;
+            int yresi = yield_site_counter++;
+            _P94_ENSURE(d-1); /* box the awaited value if it is typed */
+            /* Spill all local JSValues into saved_lv (transfer ownership) */
+            for (j = 0; j < var_count; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
+                    j, LNAME(j), LNAME(j));
+            }
+            /* P12.1: save catch state */
+            if (sr->has_try && stack_size > 0) {
+                jit_buf_str(cb,
+                    "    _gf->catch_depth=_catch_depth;\n"
+                    "    if(_catch_depth>0){\n"
+                    "        memcpy(_gf->catch_sp,_catch_sp,(size_t)_catch_depth*sizeof(int));\n"
+                    "        memcpy(_gf->catch_h,_catch_h,(size_t)_catch_depth*sizeof(int));\n"
+                    "    }\n");
+            }
+            jit_buf_printf(cb,
+                "    { JSValue _yv%d=_tsv%d; _sp=%d;\n"
+                "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
+                "    }\n"
+                "    return JS_NewInt32(ctx,0);\n" /* FUNC_RET_AWAIT */
+                "    _Lresume_%d:;\n"
+                "    if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
+                "    { JSValue _rv%d=js_jit_gen_get_next_val(ctx);\n"
+                "      _tsv%d=_rv%d; _sp=%d; }\n",
+                yresi, d-1, d-1,
+                yresi, yresi,
+                yresi,
+                yresi,
+                d-1, yresi, d);
+            /* Update gen-time type stack: slot d-1 = resolved JSVAL (net 0 change) */
+            if (gen_sp > 0) { gen_st[gen_sp-1] = JIT_T_JSVAL; gen_hsh[gen_sp-1] = 0; }
+            break;
+        }
+
         case OP_return_async: {
-            /* Generator function return (normal end or via .return(v) / .throw()).
+            /* Generator/async function return (normal end or via .return(v) / .throw()).
              *
              * _tsv{d-1} holds the return value (the value passed to .return(), or
              * the generator's `return expr` value, or the .next(v) value discarded
@@ -4904,9 +4986,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_return_undef: gen_sp=0; break;
             case OP_throw: gen_sp=0; break;
 
-            /* --- P12: generator opcodes (gen_st updated inline in main switch) --- */
+            /* --- P12: generator/async opcodes (gen_st updated inline in main switch) --- */
             case OP_initial_yield: break;   /* no stack change, updated inline */
             case OP_yield: break;           /* updated inline in OP_yield case above */
+            case OP_await: break;           /* updated inline in OP_await case above */
             case OP_return_async: gen_sp=0; break;
 
             /* Everything else: no tracked stack effect (conservative) */
@@ -4988,10 +5071,9 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
 
-    /* P12: generators with try/catch or closures are not yet supported.
-     * has_yield generators require spill/restore; mixing with try-frames or
-     * closure capture greatly complicates the save area — defer to P12.1+. */
-    if (sr.has_yield && (sr.has_try || sr.has_fclosure)) {
+    /* P12.1: generators/async with closures are not yet supported.
+     * try/catch is now supported via catch state save/restore in the frame. */
+    if (sr.has_yield && sr.has_fclosure) {
         *unsupported = 1;
         scan_result_free(&sr);
         free(local_type);

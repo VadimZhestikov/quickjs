@@ -317,6 +317,10 @@ typedef struct JSJITGeneratorFrame {
     int      resume_idx;   /* -1=first call; 0=after initial_yield; N=after N-th yield */
     int      n_lv;         /* var_count of the generator function */
     JSValue *saved_lv;     /* heap array[n_lv], JS_UNDEFINED for empty slot */
+    /* P12.1: catch state saved at every yield/await so try/catch works across suspensions */
+    int      catch_depth;  /* number of active catch frames at last yield */
+    int      catch_sp[32]; /* stack depth for each catch frame */
+    int      catch_h[32];  /* handler PC for each catch frame */
 } JSJITGeneratorFrame;
 
 JSJITGeneratorFrame *js_jit_gen_init_frame(JSContext *ctx, int n_lv);
