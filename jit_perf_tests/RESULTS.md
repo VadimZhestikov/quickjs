@@ -2349,3 +2349,52 @@ bytecode dispatch overhead but the catch stack operations remain.
 - [x] **P14-I** OP_ret codegen: pop return PC, dispatch via switch over known gosub return PCs
 - [x] **P14-J** Type inference and gen-time stack tracking for all 4 opcodes
 - [x] **P14-K** Correctness tests pass (`tests/test_jit_p14_try_catch.js` — 9/9)
+
+---
+
+## P15 — Iterators / for-in / for-of
+
+### Changes
+- `quickjs.c`: 8 new `js_jit_*` helpers after iterator static functions inside `#ifdef CONFIG_JIT`:
+  `js_jit_for_in_start`, `js_jit_for_in_next`, `js_jit_for_of_start`, `js_jit_for_of_next`,
+  `js_jit_iterator_close`, `js_jit_iterator_get_value_done`, `js_jit_iterator_next_step`,
+  `js_jit_iterator_call` — each wraps the existing static interpreter helper via small
+  on-stack JSValue array, avoiding code duplication
+- `quickjs-jit.h`: 8 new declarations
+- `quickjs-jit.c`: Removed 9 iterator opcodes from `scan_is_unsupported()`; added type
+  inference, gen_st tracking, and gen_body cases for all 9 opcodes; `_gs_push_n` field added
+  to gen_st loop to support multi-push opcodes (for_in_next/for_of_start/for_of_next push 2)
+- `tests/test_jit_p15_iterators.js`: 11 correctness tests (all pass)
+- `jit_perf_tests/v8bench/test_p15_iter_perf.js`: 3 iterator perf benchmarks
+
+### Design notes
+- `sdt[]` (stack_depth_tab) already tracks correct non-zero stack depth at loop headers —
+  no special `_iter_N` named slots needed; iterator values use regular `_tsv_N` slots
+- `catch_offset` placeholder pushed by `for_of_start` emitted as `JS_UNDEFINED`; the
+  P14 catch stack handles exception cleanup, making it inert
+- Async iterators (`for_await_of_start/next`) remain excluded (require await/generator)
+
+### Benchmark results (2026-04-05, WSL2)
+
+| Benchmark | JIT (ms) | Interp (ms) | Notes |
+|---|---:|---:|---|
+| `for_in(100K, 10-key obj)` | 68 | 71 | Object property enumeration overhead dominates |
+| `for_of(100K, 10-el arr)` | 44 | 43 | Array iterator; JIT ≈ interp |
+| `for_of_string(100K, 5-char)` | 37 | 38 | String iterator; JIT ≈ interp |
+
+Iterator creation and advancement cost dominates — not bytecode dispatch.
+JIT ≈ interpreter as expected.
+
+### P15 task checklist
+
+- [x] **P15-A** Remove iterator opcodes from `scan_is_unsupported()`
+- [x] **P15-B** New `js_jit_*` helpers in `quickjs.c` + declarations in `quickjs-jit.h`
+- [x] **P15-C** Type inference (`jit_infer_types`) for all 9 opcodes
+- [x] **P15-D** `_gs_push_n` multi-push support in gen_st tracking loop
+- [x] **P15-E** gen_st tracking entries for all 9 opcodes
+- [x] **P15-F** gen_body cases: `OP_for_in_start`, `OP_for_in_next`
+- [x] **P15-G** gen_body cases: `OP_for_of_start`, `OP_for_of_next`, `OP_iterator_close`
+- [x] **P15-H** gen_body cases: `OP_iterator_check_object`, `OP_iterator_get_value_done`
+- [x] **P15-I** gen_body cases: `OP_iterator_next`, `OP_iterator_call`
+- [x] **P15-J** Correctness tests pass (`tests/test_jit_p15_iterators.js` — 11/11)
+- [x] **P15-K** P13–P17 regressions all pass
