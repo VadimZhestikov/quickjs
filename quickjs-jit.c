@@ -2737,6 +2737,24 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "      else _jsd_%s+=JS_VALUE_GET_FLOAT64(_b); }\n",
                         d-1, d-1, LNAME(idx), LNAME(idx));
                 }
+            } else if (gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) {
+                /* P11.9: INT source — bypass _P94_ENSURE boxing; read _ti directly.
+                 * JSVAL local, int64_t source: handle INT and FLOAT64 local fast paths,
+                 * fall back to _RT->add for strings/objects (rare). */
+                jit_buf_printf(cb,
+                    "    { int64_t _b=_ti%d; _sp=%d; JSValue *_pv=&_jsv_%s;\n"
+                    "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_INT){\n"
+                    "        int64_t _r=(int64_t)JS_VALUE_GET_INT(*_pv)+_b;\n"
+                    "        *_pv=((int32_t)_r==_r)?JS_NewInt32(ctx,(int32_t)_r)\n"
+                    "                              :JS_NewFloat64(ctx,(double)_r);\n"
+                    "      } else if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_FLOAT64){\n"
+                    "        *_pv=JS_NewFloat64(ctx,JS_VALUE_GET_FLOAT64(*_pv)+(double)_b);\n"
+                    "      } else {\n"
+                    "        JSValue _bb=JS_NewInt64(ctx,_b);\n"
+                    "        JSValue _old=*_pv; *_pv=JS_UNDEFINED;\n"
+                    "        JSValue _r=_RT->add(ctx,_old,_bb); _CHK(_r); *_pv=_r;\n"
+                    "      } }\n",
+                    d-1, d-1, LNAME(idx));
             } else {
                 _P94_ENSURE(d-1); /* P9.4: box typed slot before use as JSValue */
                 jit_buf_printf(cb,

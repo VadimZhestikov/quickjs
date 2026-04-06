@@ -35621,9 +35621,63 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 }
+                /* transformation:
+                   get_loc(n) get_loc/get_arg/get_var_ref(x) get_field add dup put_loc[_check](n) drop
+                   -> get_loc/get_arg/get_var_ref(x) get_field add_loc(n)
+                   Folds property-read accumulation (e.g. s += o.x) into add_loc. */
+                {
+                    CodeContext cc2;
+                    cc2.bc_buf = cc.bc_buf;
+                    cc2.bc_len = cc.bc_len;
+                    if (code_match(&cc2, pos_next, M3(OP_get_loc, OP_get_arg, OP_get_var_ref), -1, -1)) {
+                        int obj_op = cc2.op, obj_idx = cc2.idx;
+                        if (code_match(&cc, cc2.pos, OP_get_field, OP_add, OP_dup, M2(OP_put_loc, OP_put_loc_check), idx, OP_drop, -1)) {
+                            if (cc.line_num >= 0) line_num = cc.line_num;
+                            add_pc2line_info(s, bc_out.size, line_num);
+                            put_short_code(&bc_out, obj_op, obj_idx);
+                            dbuf_putc(&bc_out, OP_get_field);
+                            dbuf_put_u32(&bc_out, cc.atom);
+                            dbuf_putc(&bc_out, OP_add_loc);
+                            dbuf_putc(&bc_out, idx);
+                            pos_next = cc.pos;
+                            break;
+                        }
+                    }
+                }
                 add_pc2line_info(s, bc_out.size, line_num);
                 put_short_code(&bc_out, op, idx);
                 break;
+            }
+            goto no_change;
+        case OP_get_loc_check:
+            /* transformation:
+               get_loc_check(n) get_loc/get_arg/get_var_ref(x) get_field add dup put_loc[_check](n) drop
+               -> get_loc/get_arg/get_var_ref(x) get_field add_loc(n)
+               Folds lexical-var (let/const) property-read accumulation into add_loc. */
+            if (OPTIMIZE) {
+                int idx;
+                idx = get_u16(bc_buf + pos + 1);
+                if (idx >= 256)
+                    goto no_change;
+                {
+                    CodeContext cc2;
+                    cc2.bc_buf = cc.bc_buf;
+                    cc2.bc_len = cc.bc_len;
+                    if (code_match(&cc2, pos_next, M3(OP_get_loc, OP_get_arg, OP_get_var_ref), -1, -1)) {
+                        int obj_op = cc2.op, obj_idx = cc2.idx;
+                        if (code_match(&cc, cc2.pos, OP_get_field, OP_add, OP_dup, M2(OP_put_loc, OP_put_loc_check), idx, OP_drop, -1)) {
+                            if (cc.line_num >= 0) line_num = cc.line_num;
+                            add_pc2line_info(s, bc_out.size, line_num);
+                            put_short_code(&bc_out, obj_op, obj_idx);
+                            dbuf_putc(&bc_out, OP_get_field);
+                            dbuf_put_u32(&bc_out, cc.atom);
+                            dbuf_putc(&bc_out, OP_add_loc);
+                            dbuf_putc(&bc_out, idx);
+                            pos_next = cc.pos;
+                            break;
+                        }
+                    }
+                }
             }
             goto no_change;
 #if SHORT_OPCODES

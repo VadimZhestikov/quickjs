@@ -622,7 +622,95 @@ if (!(_ti0 < _ti1)) goto _L_exit;  // ← direct integer comparison, no JSValue
 
 ---
 
-## P11.9 — OSR (On-Stack Replacement) for top-level loops
+## P11.9 — Fold `s += o.x` into `add_loc` ✓ DONE
+**Effort:** ~1 day  **Risk:** low  **Files:** `quickjs.c`, `quickjs-jit.c`
+
+### Problem
+
+`prop_read` (accumulating `s += o.x` in a loop) was ~52% slower than `prop_write` despite
+both accessing the same IC-cached property.  Root cause: the QuickJS bytecode optimizer
+only folds `s += <simple>` into `add_loc` for trivial sources (`push_i32`, `get_loc/arg`
+directly).  Property reads (`get_field`) were never folded, leaving the loop as:
+
+```
+get_loc_check s  get_arg o  get_field x  add  dup  put_loc_check s  drop
+```
+
+The JIT generates this as 5 DUP/FREE calls plus `_RT->add` (slow JSValue add) per
+iteration.  With `add_loc`, it becomes:
+
+```
+get_arg o  get_field x  add_loc s
+```
+
+The JIT's `add_loc` JSVAL path does an in-place INT×INT fast path: 2 tag checks,
+integer add, `JS_NewInt32` (immediate — no malloc/free).
+
+### Root cause details
+
+1. `s` and `i` are `let` variables → use `OP_get_loc_check` / `OP_put_loc_check`, not the
+   non-checking variants.  The existing `add_loc` optimization in `resolve_labels` only
+   matched `OP_get_loc` (not `OP_get_loc_check`).
+
+2. The inner match used `OP_put_loc` — but `let` variables use `OP_put_loc_check` for
+   assignments.
+
+3. `get_field` wasn't in any existing `add_loc` pattern.
+
+### Fixes
+
+**`quickjs.c` (bytecode optimizer `resolve_labels`)**:
+- Added new pattern for `OP_get_loc` case:
+  `get_loc(n) get_loc/get_arg/get_var_ref(x) get_field add dup put_loc[_check](n) drop`
+  → `get_loc/get_arg/get_var_ref(x) get_field add_loc(n)`
+  Uses `M2(OP_put_loc, OP_put_loc_check)` to match both variants.
+  Two-step `code_match` (save obj opcode/idx from first match, then match `get_field add...`).
+
+- Added new `case OP_get_loc_check:` block with the same transformation to handle `let`
+  variable accumulators (the common case in modern JS).
+
+**`quickjs-jit.c` (JIT codegen)**:
+- Added P11.9 INT source fast path for `add_loc` JSVAL local: when `gen_st` shows the
+  stack top is `JIT_T_INT`, read `_ti{d-1}` directly (bypass `_P94_ENSURE` boxing).
+  Handles INT local fast path, FLOAT64 local fast path, and JSVAL slow path.
+
+### Tasks
+
+- [x] **P11.9-A** Add `OP_get_loc_check` → `add_loc` fold for `get_field` pattern in
+  `resolve_labels` (`quickjs.c`).
+
+- [x] **P11.9-B** Add `OP_get_loc` → `add_loc` fold for `get_field` pattern (handles `var`
+  variables; uses `M2(OP_put_loc, OP_put_loc_check)`).
+
+- [x] **P11.9-C** Add P11.9 INT source fast path in `add_loc` JSVAL local case
+  (`quickjs-jit.c`).
+
+- [x] **P11.9-D** Verify bytecode dump shows `add_loc` for `prop_read` loop body ✓
+
+- [x] **P11.9-E** Verify generated JIT C uses in-place `add_loc` pattern (no DUP/FREE
+  for `_jsv_s_2`) ✓
+
+- [x] **P11.9-F** `make CONFIG_JIT=y test` passes ✓
+
+### Measured results (2026-04-05)
+
+| Benchmark | Before P11.9 | After P11.9 | Change |
+|---|---:|---:|---:|
+| `prop_read(1M)` micro-bench | 5.51 ms/iter | 4.25 ms/iter | **−23%** |
+| `prop_write(1M)` micro-bench | 3.62 ms/iter | 3.62 ms/iter | 0% (unchanged) |
+| prop_read / prop_write ratio | 1.52× slower | 1.17× slower | gap −57% |
+
+Measurements: median of runs 2–5 after JIT warmup, WSL2 noise ±5% for this benchmark.
+V8bench too noisy (WSL2 ±20%) for reliable score comparison.
+
+### Definition of done
+✓ `s += o.x` loop uses `add_loc` in final bytecode.
+✓ JIT generates in-place INT×INT update in `add_loc` (no DUP/FREE for accumulator).
+✓ 23% speedup confirmed, prop_read now 17% slower than prop_write (was 52%).
+
+---
+
+## P11.10 — OSR (On-Stack Replacement) for top-level loops
 **Effort:** ~5 days  **Risk:** high  **Files:** `quickjs-jit.c`, `quickjs.c`, `qjs.c`
 
 ### Problem
