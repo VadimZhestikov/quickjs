@@ -394,6 +394,12 @@ typedef struct JSJITScanResult {
     int       has_fclosure;        /* 1 if any OP_fclosure/fclosure8 found */
     uint64_t  captured_local_mask; /* bit i = local i captured by ≥1 inner closure */
     uint64_t  captured_arg_mask;   /* bit i = arg i captured by ≥1 inner closure */
+    /* P14: try/catch/finally analysis */
+    int       has_try;                    /* 1 if any OP_catch/gosub found */
+    int       catch_handler_pcs[32];      /* target PC of each OP_catch handler */
+    int       n_catch;                    /* number of OP_catch instructions */
+    int       gosub_ret_pcs[32];          /* return PC (=gosub_pc+5) for each OP_gosub */
+    int       n_gosub;                    /* number of OP_gosub instructions */
 } JSJITScanResult;
 
 static void scan_result_free(JSJITScanResult *sr)
@@ -444,10 +450,6 @@ static inline int16_t bc_get_i16(const uint8_t *pc) {
 static int scan_is_unsupported(int op)
 {
     switch (op) {
-    /* try/finally frame management */
-    case OP_catch:
-    case OP_gosub:
-    case OP_nip_catch:
     /* with-statement dynamic scoping */
     case OP_with_get_var:
     case OP_with_put_var:
@@ -492,6 +494,9 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
     sr->has_fclosure        = 0;
     sr->captured_local_mask = 0;
     sr->captured_arg_mask   = 0;
+    sr->has_try   = 0;
+    sr->n_catch   = 0;
+    sr->n_gosub   = 0;
     int cap = 0;
 
     int pc = 0;
@@ -518,13 +523,39 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
         switch (op) {
         case OP_if_false:
         case OP_if_true:
-        case OP_goto:
-        case OP_gosub: {
+        case OP_goto: {
             int32_t delta = bc_get_i32(&bc[pc + 1]);
             int target = pc + 1 + delta;
             if (scan_add_target(sr, target, &cap) < 0) {
                 scan_result_free(sr); return -1;
             }
+            break;
+        }
+        case OP_gosub: {
+            int32_t delta = bc_get_i32(&bc[pc + 1]);
+            int sub_target = pc + 1 + delta;
+            int ret_pc = pc + 5;  /* instruction after gosub (1 opcode + 4 operand bytes) */
+            if (scan_add_target(sr, sub_target, &cap) < 0) {
+                scan_result_free(sr); return -1;
+            }
+            /* return address is also a branch target (OP_ret jumps back to it) */
+            if (scan_add_target(sr, ret_pc, &cap) < 0) {
+                scan_result_free(sr); return -1;
+            }
+            if (sr->n_gosub < 32) sr->gosub_ret_pcs[sr->n_gosub++] = ret_pc;
+            else { sr->unsupported = 1; scan_result_free(sr); return -1; }
+            sr->has_try = 1;
+            break;
+        }
+        case OP_catch: {
+            int32_t delta = bc_get_i32(&bc[pc + 1]);
+            int handler_pc = pc + 1 + delta;
+            if (scan_add_target(sr, handler_pc, &cap) < 0) {
+                scan_result_free(sr); return -1;
+            }
+            if (sr->n_catch < 32) sr->catch_handler_pcs[sr->n_catch++] = handler_pc;
+            else { sr->unsupported = 1; scan_result_free(sr); return -1; }
+            sr->has_try = 1;
             break;
         }
         case OP_if_false8:
@@ -859,6 +890,14 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_if_false:  case OP_if_true:
             case OP_if_false8: case OP_if_true8: _TI_DROPN(1); break;
             case OP_goto: case OP_goto8: case OP_goto16: break;
+
+            /* ---- P14: try/catch/finally ---- */
+            case OP_catch:     _TI_PUSH(JIT_T_JSVAL); break; /* push placeholder */
+            case OP_gosub:     _TI_PUSH(JIT_T_JSVAL); break; /* push return addr */
+            case OP_ret:       _TI_DROPN(1); sp=0; break;    /* pops addr, jumps */
+            case OP_nip_catch:
+                /* Complex stack collapse: conservative reset to 1 JSVAL */
+                sp = 0; _TI_PUSH(JIT_T_JSVAL); break;
 
             /* ---- Return / throw ---- */
             case OP_return: _TI_DROPN(1); sp = 0; break;
@@ -1585,6 +1624,20 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
     jit_buf_str(cb, "    int _sp=0;\n");
     jit_buf_str(cb, "    (void)argc; (void)cpool; (void)var_refs;\n");
 
+    /* P14: try/catch/finally support.
+     * _tsvp[]: pointer array enabling runtime-indexed slot access at _ex dispatch.
+     * _catch_depth / _catch_sp / _catch_h: runtime catch-frame stack. */
+    if (sr && sr->has_try && stack_size > 0) {
+        jit_buf_str(cb, "    JSValue *_tsvp[] = {");
+        for (int j = 0; j < stack_size; j++) {
+            if (j > 0) jit_buf_str(cb, ",");
+            jit_buf_printf(cb, "&_tsv%d", j);
+        }
+        jit_buf_str(cb, "};\n");
+        jit_buf_str(cb,
+            "    int _catch_depth=0, _catch_sp[32], _catch_h[32];\n");
+    }
+
     /* P9.1: named local variable declarations (one scalar per local, not arrays).
      * JSValue  _jsv_<name>_<i>  — always (initialised to JS_UNDEFINED)
      * int64_t  _jsi_<name>_<i>  — INT locals only  (Phase 5/P8.1)
@@ -1680,6 +1733,25 @@ static void gen_footer(JSJITCodeBuf *cb, int var_count,
         }
     }
     jit_buf_str(cb, "_ex:\n");
+    /* P14: catch dispatch — if there is an active catch handler, redirect to it
+     * instead of doing full cleanup.  _tsvp[] allows runtime-indexed slot access. */
+    if (sr && sr->has_try && stack_size > 0) {
+        jit_buf_str(cb,
+            "    if(_catch_depth>0){\n"
+            "        _catch_depth--;\n"
+            "        { int _cs=_catch_sp[_catch_depth];\n"
+            "          int _ch=_catch_h[_catch_depth]; int _j;\n"
+            "          for(_j=_sp-1;_j>_cs;_j--)JS_FreeValue(ctx,*_tsvp[_j]);\n"
+            "          *_tsvp[_cs]=JS_GetException(ctx); _sp=_cs+1;\n"
+            "          switch(_ch){\n");
+        for (int i = 0; i < sr->n_catch; i++)
+            jit_buf_printf(cb, "            case %d: goto _L%d;\n",
+                           sr->catch_handler_pcs[i], sr->catch_handler_pcs[i]);
+        jit_buf_str(cb,
+            "          }\n"
+            "        }\n"
+            "    }\n");
+    }
     for (int j = 0; j < var_count; j++)
         jit_buf_printf(cb, "    _FREE(_jsv_%s);\n", varnames[arg_count + j]);
     /* Unrolled stack cleanup: free _tsv{stack_size-1} down to _tsv{0}
@@ -1898,6 +1970,66 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- nop ---- */
         case OP_nop:
             break;
+
+        /* ---- P14: try/catch/finally ---- */
+
+        /* OP_catch: push a catch frame on the runtime catch stack.
+         * Also push JS_UNDEFINED as a placeholder on the tsv stack
+         * so sdt[] stack depths remain consistent. */
+        case OP_catch: {
+            int32_t diff = (int32_t)bc_u32(&bc[pc+1]);
+            int handler_pc = (pc + 1) + diff;
+            jit_buf_printf(cb,
+                "    _catch_sp[_catch_depth]=%d;"
+                " _catch_h[_catch_depth]=%d;"
+                " _catch_depth++;\n"
+                "    _tsv%d=JS_UNDEFINED; _sp=%d;\n",
+                d, handler_pc, d, d+1);
+            break;
+        }
+
+        /* OP_nip_catch: remove innermost catch frame, keep ret_val.
+         * Stack before: [..., catch_placeholder@cs, ..., ret_val@d-1]
+         * Stack after:  [..., ret_val@cs], sp=cs+1
+         * Free intermediate slots cs+1..d-2 (typically none). */
+        case OP_nip_catch: {
+            jit_buf_printf(cb,
+                "    { int _cs; _catch_depth--; _cs=_catch_sp[_catch_depth];\n"
+                "      int _j; for(_j=_cs+1;_j<%d;_j++)JS_FreeValue(ctx,*_tsvp[_j]);\n"
+                "      *_tsvp[_cs]=*_tsvp[%d]; _sp=_cs+1; }\n",
+                d-1, d-1);
+            break;
+        }
+
+        /* OP_gosub: push return PC as int, jump to finally subroutine. */
+        case OP_gosub: {
+            int32_t diff = (int32_t)bc_u32(&bc[pc+1]);
+            int sub_target = (pc + 1) + diff;
+            int ret_pc = pc + 5;
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_NewInt32(ctx,%d); _sp=%d;\n"
+                "    goto _L%d;\n",
+                d, ret_pc, d+1, sub_target);
+            break;
+        }
+
+        /* OP_ret: pop gosub return address, dispatch to the return PC.
+         * Uses a switch over all known gosub return PCs (from scan). */
+        case OP_ret: {
+            jit_buf_printf(cb,
+                "    { int _rpc=JS_VALUE_GET_INT(_tsv%d); _sp=%d;\n"
+                "      switch(_rpc){\n",
+                d-1, d-1);
+            for (int _ri = 0; _ri < sr->n_gosub; _ri++)
+                jit_buf_printf(cb, "        case %d: goto _L%d;\n",
+                               sr->gosub_ret_pcs[_ri], sr->gosub_ret_pcs[_ri]);
+            jit_buf_str(cb,
+                "        default: JS_ThrowInternalError(ctx,\"invalid ret\");"
+                " goto _ex;\n"
+                "      }\n"
+                "    }\n");
+            break;
+        }
 
         /* ---- Push immediate values ---- */
         /* P11.6: push into _ti{d} (raw int64), skip boxing; _sp = d+1.
@@ -4379,6 +4511,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_fclosure:  _gs_push=JIT_T_JSVAL; break;
             case OP_fclosure8: _gs_push=JIT_T_JSVAL; break;
             case OP_set_name: break; /* 1-in 1-out, no stack change */
+
+            /* --- P14: try/catch/finally --- */
+            case OP_catch:     _gs_push=JIT_T_JSVAL; break; /* push placeholder */
+            case OP_gosub:     _gs_push=JIT_T_JSVAL; break; /* push return addr */
+            case OP_ret:       gen_sp=0; break;              /* jumps away */
+            case OP_nip_catch: gen_sp=0; break;              /* conservative reset */
 
             /* --- P16: delete / delete_var → bool (JSVAL) --- */
             case OP_delete:     _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
