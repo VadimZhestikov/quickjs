@@ -15994,6 +15994,29 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
             if (jf) {
                 if (js_jit_poll_interrupts(ctx))
                     return JS_EXCEPTION;
+                /* Temporarily update cur_func and new_target in the existing
+                 * current_stack_frame so that js_jit_special_object
+                 * (HOME_OBJECT, THIS_FUNC, NEW_TARGET) reads the callee's
+                 * function object, not the caller's.  Without this, super.method()
+                 * in a JIT-to-JIT call would read home_object from the caller's
+                 * function object, causing infinite recursion in 3-level class
+                 * inheritance chains.
+                 *
+                 * We update in-place rather than pushing a new minimal stack
+                 * frame to preserve sf->var_refs, sf->arg_buf, and sf->var_buf
+                 * (used by js_closure2 when define_class captures outer locals).
+                 * The saved values are restored before this function returns. */
+                JSRuntime *rt = ctx->rt;
+                JSStackFrame *caller_sf = rt->current_stack_frame;
+                JSValue saved_cur_func = JS_UNDEFINED;
+                JSValue saved_new_target = JS_UNDEFINED;
+                if (caller_sf) {
+                    saved_cur_func   = caller_sf->cur_func;
+                    saved_new_target = caller_sf->new_target;
+                    caller_sf->cur_func   = func;
+                    caller_sf->new_target = JS_UNDEFINED;
+                }
+
                 /* Always pad argv to arg_count and DUP each element.
                  *
                  * Padding ensures that GEN_PUT_ARG does not access out-of-range
@@ -16016,27 +16039,32 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                  * Pass the actual argc/argv directly — no padding needed and
                  * doing so avoids the bug where argc=0 produces an empty
                  * arguments object inside the callee. */
+                JSValue ret;
                 {
                     int n = b->arg_count;
                     if (n == 0) {
                         /* Variadic: pass actual args; callee DUPs them via
                          * js_build_arguments, never _FREE()s argv directly. */
-                        return jf(ctx, this_val, argc, argv,
-                                  b->cpool, p->u.func.var_refs);
+                        ret = jf(ctx, this_val, argc, argv,
+                                 b->cpool, p->u.func.var_refs);
+                    } else {
+                        JSValue *padded = alloca(sizeof(JSValue) * n);
+                        int i;
+                        for (i = 0; i < argc && i < n; i++)
+                            padded[i] = JS_DupValue(ctx, argv[i]);
+                        for (; i < n; i++)
+                            padded[i] = JS_UNDEFINED;
+                        ret = jf(ctx, this_val, n, padded,
+                                 b->cpool, p->u.func.var_refs);
+                        for (i = 0; i < n; i++)
+                            JS_FreeValue(ctx, padded[i]);
                     }
-                    JSValue *padded = alloca(sizeof(JSValue) * n);
-                    JSValue ret;
-                    int i;
-                    for (i = 0; i < argc && i < n; i++)
-                        padded[i] = JS_DupValue(ctx, argv[i]);
-                    for (; i < n; i++)
-                        padded[i] = JS_UNDEFINED;
-                    ret = jf(ctx, this_val, n, padded,
-                             b->cpool, p->u.func.var_refs);
-                    for (i = 0; i < n; i++)
-                        JS_FreeValue(ctx, padded[i]);
-                    return ret;
                 }
+                if (caller_sf) {
+                    caller_sf->cur_func   = saved_cur_func;
+                    caller_sf->new_target = saved_new_target;
+                }
+                return ret;
             }
         }
     }
@@ -16057,24 +16085,45 @@ JSValue js_jit_ic_direct_call(
     int nargs, JSValue *argv,
     JSJITCallICEntry *ic, JSVarRef **var_refs)
 {
+    /* Temporarily update cur_func / new_target in the existing stack frame
+     * (same rationale as js_jit_call) so that HOME_OBJECT/THIS_FUNC/NEW_TARGET
+     * reads in the callee see the correct function object. */
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *caller_sf = rt->current_stack_frame;
+    JSValue saved_cur_func = JS_UNDEFINED;
+    JSValue saved_new_target = JS_UNDEFINED;
+    if (caller_sf) {
+        saved_cur_func   = caller_sf->cur_func;
+        saved_new_target = caller_sf->new_target;
+        caller_sf->cur_func   = JS_MKPTR(JS_TAG_OBJECT, ic->expected_func);
+        caller_sf->new_target = JS_UNDEFINED;
+    }
+
     int n = ic->callee_arg_count;
+    JSValue ret;
     /* Variadic callee (arg_count == 0): pass actual args directly.
      * The callee accesses them only via js_build_arguments (which DUPs),
      * never _FREE()s argv entries, so no private copy is needed. */
-    if (n == 0)
-        return ic->direct_jit(ctx, this_val, nargs, argv,
-                               ic->callee_cpool, var_refs);
-    /* alloca is safe here: arg counts are small (< 64 typically) */
-    JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * n);
-    int i;
-    for (i = 0; i < nargs && i < n; i++)
-        padded[i] = JS_DupValue(ctx, argv[i]);
-    for (; i < n; i++)
-        padded[i] = JS_UNDEFINED;
-    JSValue ret = ic->direct_jit(ctx, this_val, n, padded,
-                                  ic->callee_cpool, var_refs);
-    for (i = 0; i < n; i++)
-        JS_FreeValue(ctx, padded[i]);
+    if (n == 0) {
+        ret = ic->direct_jit(ctx, this_val, nargs, argv,
+                             ic->callee_cpool, var_refs);
+    } else {
+        /* alloca is safe here: arg counts are small (< 64 typically) */
+        JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * n);
+        int i;
+        for (i = 0; i < nargs && i < n; i++)
+            padded[i] = JS_DupValue(ctx, argv[i]);
+        for (; i < n; i++)
+            padded[i] = JS_UNDEFINED;
+        ret = ic->direct_jit(ctx, this_val, n, padded,
+                             ic->callee_cpool, var_refs);
+        for (i = 0; i < n; i++)
+            JS_FreeValue(ctx, padded[i]);
+    }
+    if (caller_sf) {
+        caller_sf->cur_func   = saved_cur_func;
+        caller_sf->new_target = saved_new_target;
+    }
     return ret;
 }
 

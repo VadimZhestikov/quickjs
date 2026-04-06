@@ -163,8 +163,11 @@ static JSValue jit_rt_call_constructor(JSContext *ctx, JSValue ctor,
                                        JSValue new_target,
                                        int argc, JSValue *argv)
 {
-    (void)new_target; /* Phase 4 will wire up new.target properly */
-    return JS_CallConstructor(ctx, ctor, argc, argv);
+    /* P32: use JS_CallConstructor2 to forward new_target correctly.
+     * For plain `new Foo(args)`, new_target == ctor (same as JS_CallConstructor).
+     * For `super(args)` in a derived class constructor, new_target is the
+     * subclass being instantiated, not the superclass ctor — must be forwarded. */
+    return JS_CallConstructor2(ctx, ctor, new_target, argc, argv);
 }
 
 static JSValue jit_rt_throw_type_error(JSContext *ctx, const char *fmt, ...)
@@ -328,12 +331,13 @@ int js_jit_is_eligible(JSFunctionBytecode *b)
     /* Complex params: destructuring, rest, default values */
     if (!js_jit_fb_has_simple_params(b))
         return 0;
-    /* Class method: needs home_object for super */
-    if (js_jit_fb_need_home_object(b))
-        return 0;
-    /* Derived class constructor: special super() handling required */
-    if (js_jit_fb_is_derived_ctor(b))
-        return 0;
+    /* P31: need_home_object — class methods using super.prop/super.method().
+     * home_object is read by OP_special_object HOME_OBJECT via js_jit_special_object
+     * which reads ctx->rt->current_stack_frame->cur_func->u.func.home_object.
+     * No JIT changes needed — already handled. */
+    /* P32: is_derived_ctor — derived class constructors.
+     * super() calls use OP_call_constructor with correct new_target forwarded via
+     * jit_rt_call_constructor → JS_CallConstructor2. No other changes needed. */
     return 1;
 }
 

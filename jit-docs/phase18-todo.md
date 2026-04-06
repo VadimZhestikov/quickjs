@@ -109,6 +109,37 @@
   - Tests: `tests/test_jit_p29p30.js` covers sync generator delegation (array, nested
     generator, return value, string), async generator delegation.
 
+**P31 — DONE** (need_home_object: class methods using super.prop/super.method()).
+  - `OP_special_object HOME_OBJECT` was already implemented via `js_jit_special_object` which
+    reads `ctx->rt->current_stack_frame->cur_func->u.func.home_object`.
+  - Entire fix: removed the `need_home_object` eligibility check from `js_jit_is_eligible()`.
+  - **Critical bug fixed in `js_jit_call` / `js_jit_ic_direct_call`**: these previously did NOT
+    update `current_stack_frame->cur_func` before calling the callee's JIT function. In a
+    JIT-to-JIT call chain, `cur_func` remained the CALLER's function object, so HOME_OBJECT
+    read the caller's home_object instead of the callee's — causing infinite recursion in
+    3-level inheritance chains (`C.greet → B.greet → B.greet → ...`). Fixed by temporarily
+    swapping `caller_sf->cur_func` to the callee and restoring after return. A minimal fake
+    stack frame (the obvious alternative) would break `js_closure2 / get_var_ref` which relies
+    on `sf->var_refs` and `sf->arg_buf` being valid for the outer scope.
+  - No new helpers, vtable entries, or codegen changes needed.
+  - Tests: `tests/test_jit_p31p32.js` covers `super.method()`, `super.prop` getters,
+    `super.method(args)`, 3-level super chain, static super, subclass methods.
+
+**P32 — DONE** (is_derived_ctor: derived class constructors).
+  - Root cause: `jit_rt_call_constructor` was calling `JS_CallConstructor` and ignoring
+    `new_target`. For `super()` in a derived class, `new_target` is the subclass being
+    instantiated (not the superclass ctor), so it must be forwarded.
+  - Fix: changed `jit_rt_call_constructor` to call `JS_CallConstructor2(ctx, ctor, new_target,
+    argc, argv)` instead.
+  - `OP_init_ctor` (implicit derived ctor), `OP_check_ctor_return`, `OP_get_loc_checkthis`,
+    `OP_set_loc_uninitialized` were all already handled correctly.
+  - Removed the `is_derived_ctor` eligibility check from `js_jit_is_eligible()`.
+  - No new helpers or vtable entries needed.
+  - Tests: `tests/test_jit_p31p32.js` covers basic derived ctor, instanceof chain, 3-level
+    hierarchy, default args (interpreted), return semantics, new.target.name, combined P31+P32.
+  - v8bench score (interp/JIT): Richards 797/1139 (+43%), DeltaBlue 683/837 (+22%),
+    total score 894/1060 (+19%).
+
 **P30 — DONE** (for_await_of_start/next, with_get_var/put_var/delete_var/make_ref/get_ref).
 
   **for_await_of_start/next:**
