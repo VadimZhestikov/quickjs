@@ -16783,6 +16783,108 @@ int js_jit_op_define_method_computed(JSContext *ctx, JSValue obj, JSValue key,
 }
 
 /* -----------------------------------------------------------------------
+ * P26 — constructor / class-definition helpers
+ * ----------------------------------------------------------------------- */
+
+/* Forward declarations for static functions used below */
+static int js_op_define_class(JSContext *ctx, JSValue *sp,
+                              JSAtom class_name, int class_flags,
+                              JSVarRef **cur_var_refs,
+                              JSStackFrame *sf, BOOL is_computed_name);
+static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+                                 JSValueConst options);
+
+/* OP_check_ctor: throw TypeError if not invoked as constructor.
+ * Reads new_target from ctx->rt->current_stack_frame (set by JS_CallInternal). */
+int js_jit_op_check_ctor(JSContext *ctx)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (JS_IsUndefined(sf->new_target)) {
+        JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
+        return -1;
+    }
+    return 0;
+}
+
+/* OP_init_ctor: initialise derived-class `this` via super().
+ * Reads new_target and func_obj from the current stack frame. */
+JSValue js_jit_op_init_ctor(JSContext *ctx, int argc, JSValue *argv)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (JS_IsUndefined(sf->new_target)) {
+        JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
+        return JS_EXCEPTION;
+    }
+    JSValue super = JS_GetPrototype(ctx, sf->cur_func);
+    if (JS_IsException(super))
+        return JS_EXCEPTION;
+    JSValue ret = JS_CallConstructor2(ctx, super, sf->new_target,
+                                     argc, (JSValueConst *)argv);
+    JS_FreeValue(ctx, super);
+    return ret;
+}
+
+/* OP_define_class: parent_class(d-2) bfunc(d-1) → ctor(d-2) proto(d-1).
+ * js_op_define_class consumes both inputs; on error it frees them and
+ * writes JS_UNDEFINED.  Caller must keep _sp=d-2 before the call so the
+ * JIT exception handler does not double-free the consumed slots. */
+int js_jit_op_define_class(JSContext *ctx, JSValue *pparent, JSValue *pbfunc,
+                           JSAtom atom, int class_flags, JSVarRef **var_refs)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSValue stk[2];
+    stk[0] = *pparent;
+    stk[1] = *pbfunc;
+    if (js_op_define_class(ctx, stk + 2, atom, class_flags, var_refs, sf, FALSE) < 0) {
+        /* Inputs were freed by js_op_define_class; write JS_UNDEFINED back so
+         * the JIT exception handler does not attempt a second free. */
+        *pparent = JS_UNDEFINED;
+        *pbfunc  = JS_UNDEFINED;
+        return -1;
+    }
+    *pparent = stk[0]; /* ctor */
+    *pbfunc  = stk[1]; /* proto */
+    return 0;
+}
+
+/* OP_define_class_computed: key(d-3) parent(d-2) bfunc(d-1) → key ctor proto.
+ * key is read-only (not freed by js_op_define_class); parent and bfunc are consumed. */
+int js_jit_op_define_class_computed(JSContext *ctx,
+                                    JSValue *pkey, JSValue *pparent, JSValue *pbfunc,
+                                    JSAtom atom, int class_flags, JSVarRef **var_refs)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSValue stk[3];
+    stk[0] = *pkey;
+    stk[1] = *pparent;
+    stk[2] = *pbfunc;
+    if (js_op_define_class(ctx, stk + 3, atom, class_flags, var_refs, sf, TRUE) < 0) {
+        *pparent = JS_UNDEFINED;
+        *pbfunc  = JS_UNDEFINED;
+        /* *pkey is still valid; JIT exception handler frees it via _tsv{d-3} */
+        return -1;
+    }
+    *pkey    = stk[0]; /* key unchanged */
+    *pparent = stk[1]; /* ctor */
+    *pbfunc  = stk[2]; /* proto */
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * P27 — dynamic import helper
+ * ----------------------------------------------------------------------- */
+
+/* OP_import: specifier(d-2) options(d-1) → promise.
+ * js_dynamic_import does not consume its inputs; we free them after. */
+JSValue js_jit_op_import(JSContext *ctx, JSValue specifier, JSValue options)
+{
+    JSValue ret = js_dynamic_import(ctx, specifier, options);
+    JS_FreeValue(ctx, specifier);
+    JS_FreeValue(ctx, options);
+    return ret;
+}
+
+/* -----------------------------------------------------------------------
  * Inline Property Cache helpers — Phase 6.2
  * ----------------------------------------------------------------------- */
 

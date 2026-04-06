@@ -61,6 +61,43 @@
     `define_method`, `define_method_computed`.
   - Tests: `tests/test_jit_p21p22p23.js` covers all implemented opcodes.
 
+**P25 — DONE** (for-in and generic iterators — verified regression test, already implemented).
+  - `OP_for_in_start`, `OP_for_in_next`, `OP_iterator_next`, `OP_iterator_call` were
+    all implemented in the P15 phase. Regression tests added in `tests/test_jit_p25p26p27p28.js`.
+
+**P26 — DONE** (constructor / class-definition — implemented without signature change).
+  - Key insight: `new_target` and `func_obj` are accessible via
+    `ctx->rt->current_stack_frame` (set by `JS_CallInternal` before invoking the JIT
+    function). `var_refs` is already a JIT function parameter. No signature extension needed.
+  - Removed `check_ctor`, `init_ctor`, `define_class`, `define_class_computed` from
+    `scan_is_unsupported` — classes are now fully JIT-compilable.
+  - Helpers added in `quickjs.c`: `js_jit_op_check_ctor`, `js_jit_op_init_ctor`,
+    `js_jit_op_define_class`, `js_jit_op_define_class_computed`.
+  - Forward declarations added for static `js_op_define_class` and `js_dynamic_import`.
+  - `define_class` error-path: `js_op_define_class` frees the inputs (parent_class, bfunc)
+    on failure and sets `sp[-2]=sp[-1]=JS_UNDEFINED`. The JIT codegen sets `_sp=d-2`
+    before the call, so the exception handler does not double-free consumed slots.
+  - `define_class_computed`: key slot (`sp[-3]`) is read-only; parent and bfunc are consumed.
+    On failure only parent/bfunc are freed by `js_op_define_class`; key stays valid.
+  - Function pointers: `check_ctor`, `init_ctor`, `define_class`, `define_class_computed`.
+  - Tests: `tests/test_jit_p25p26p27p28.js`.
+
+**P27 — DONE** (dynamic import).
+  - `OP_import`: stack effect 2-in 1-out (specifier, options → promise).
+  - Helper `js_jit_op_import` wraps `js_dynamic_import(ctx, specifier, options)` which
+    does NOT consume its inputs; wrapper frees both after the call.
+  - Forward declaration added for static `js_dynamic_import`.
+  - Function pointer: `import_op`.
+  - Tests: `tests/test_jit_p25p26p27p28.js`.
+
+**P28 — DONE** (OP_eval excluded from JIT).
+  - `OP_eval` added to `scan_is_unsupported`. Functions containing direct `eval()` are
+    excluded from JIT compilation and run interpreted.
+  - Rationale: `OP_eval` needs the full scope chain (`scope_idx + ARG_SCOPE_END`) which
+    is not available in the JIT function signature without major refactoring.
+  - Tests: `tests/test_jit_p25p26p27p28.js` verifies that eval-using functions still
+    run correctly (in interpreter mode).
+
 ## Overview
 
 57 finalized opcodes (listed in `quickjs-opcode.h` as `DEF(...)`) currently reach the

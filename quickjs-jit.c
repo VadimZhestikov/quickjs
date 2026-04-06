@@ -271,6 +271,13 @@ const JSJITRuntime js_jit_rt = {
     .put_super_value       = js_jit_op_put_super_value,
     .define_method         = js_jit_op_define_method,
     .define_method_computed = js_jit_op_define_method_computed,
+    /* P26: constructor / class-definition */
+    .check_ctor            = js_jit_op_check_ctor,
+    .init_ctor             = js_jit_op_init_ctor,
+    .define_class          = js_jit_op_define_class,
+    .define_class_computed = js_jit_op_define_class_computed,
+    /* P27: dynamic import */
+    .import_op             = js_jit_op_import,
 };
 
 /* -----------------------------------------------------------------------
@@ -512,11 +519,8 @@ static int scan_is_unsupported(int op)
     /* yield* and async yield* — require iterator protocol, not yet supported */
     case OP_yield_star:
     case OP_async_yield_star:
-    /* P23 deferred: these require new_target or JSStackFrame*sf not available in JIT */
-    case OP_check_ctor:        /* needs new_target */
-    case OP_init_ctor:         /* needs new_target + func_obj */
-    case OP_define_class:      /* needs sf (JSStackFrame*) for closure creation */
-    case OP_define_class_computed: /* same */
+    /* P28: direct eval needs full scope-chain access — exclude rather than implement */
+    case OP_eval:
         return 1;
     default:
         return 0;
@@ -1126,6 +1130,15 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             case OP_put_super_value: _TI_DROPN(4); break;          /* net -4 */
             case OP_define_method: _TI_DROPN(1); break;            /* net -1: func consumed, obj stays */
             case OP_define_method_computed: _TI_DROPN(2); break;   /* net -2 */
+
+            /* ---- P26: constructor / class-definition ---- */
+            case OP_check_ctor: break;                              /* net 0 */
+            case OP_init_ctor: _TI_PUSH(JIT_T_JSVAL); break;       /* net +1 */
+            case OP_define_class: break;                            /* net 0: 2-in 2-out */
+            case OP_define_class_computed: break;                   /* net 0: 3-in 3-out */
+
+            /* ---- P27: dynamic import ---- */
+            case OP_import: _TI_DROPN(2); _TI_PUSH(JIT_T_JSVAL); break; /* net -1 */
 
             default: break;
             }
@@ -5602,6 +5615,70 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P26: constructor / class-definition opcodes ---- */
+
+        /* OP_check_ctor: no stack effect.  Reads new_target via current_stack_frame. */
+        case OP_check_ctor: {
+            jit_buf_printf(cb,
+                "    if(_RT->check_ctor(ctx)<0) goto _ex;\n");
+            break;
+        }
+
+        /* OP_init_ctor: push result of super() on stack.  Reads new_target/func_obj
+         * via current_stack_frame; argc/argv are JIT function parameters. */
+        case OP_init_ctor: {
+            jit_buf_printf(cb,
+                "    { JSValue _r=_RT->init_ctor(ctx,argc,argv);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d, d, d+1);
+            break;
+        }
+
+        /* OP_define_class: parent(d-2) bfunc(d-1) → ctor(d-2) proto(d-1). Net 0.
+         * Operands: atom u32, class_flags u8. */
+        case OP_define_class: {
+            uint32_t atom       = bc_u32(&bc[pc+1]);
+            int      class_flags = (int)bc[pc+5];
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { _sp=%d;\n"
+                "      if(_RT->define_class(ctx,&_tsv%d,&_tsv%d,%uu,%d,var_refs)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-2, d-2, d-1, atom, class_flags, d);
+            break;
+        }
+
+        /* OP_define_class_computed: key(d-3) parent(d-2) bfunc(d-1) → key ctor proto. Net 0.
+         * Operands: atom u32, class_flags u8. */
+        case OP_define_class_computed: {
+            uint32_t atom       = bc_u32(&bc[pc+1]);
+            int      class_flags = (int)bc[pc+5];
+            _P94_ENSURE(d-3);
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { _sp=%d;\n"
+                "      if(_RT->define_class_computed(ctx,&_tsv%d,&_tsv%d,&_tsv%d,%uu,%d,var_refs)<0) goto _ex;\n"
+                "      _sp=%d; }\n",
+                d-2, d-3, d-2, d-1, atom, class_flags, d);
+            break;
+        }
+
+        /* ---- P27: dynamic import ---- */
+
+        /* OP_import: specifier(d-2) options(d-1) → promise(d-2). Net -1. */
+        case OP_import: {
+            _P94_ENSURE(d-2);
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { JSValue _spec=_tsv%d,_opts=_tsv%d,_r;\n"
+                "      _r=_RT->import_op(ctx,_spec,_opts);\n"
+                "      _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n",
+                d-2, d-1, d-2, d-2, d-1);
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -5967,6 +6044,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_put_super_value: _gs_drop=4; break;
             case OP_define_method: _gs_drop=1; break;
             case OP_define_method_computed: _gs_drop=2; break;
+
+            /* --- P26: constructor / class-definition --- */
+            case OP_check_ctor: break;                  /* net 0 */
+            case OP_init_ctor: _gs_push=JIT_T_JSVAL; break; /* net +1 */
+            case OP_define_class: break;                /* net 0 */
+            case OP_define_class_computed: break;       /* net 0 */
+
+            /* --- P27: dynamic import --- */
+            case OP_import: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
 
             /* Everything else: no tracked stack effect (conservative) */
             default: break;

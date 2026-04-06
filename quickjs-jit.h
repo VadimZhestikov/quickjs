@@ -246,6 +246,17 @@ typedef struct JSJITRuntime {
                              JSAtom atom, int op_flags);
     int     (*define_method_computed)(JSContext *, JSValue obj, JSValue key,
                                       JSValue func, int op_flags);
+    /* P26: constructor / class-definition (via ctx->rt->current_stack_frame) */
+    int     (*check_ctor)(JSContext *);
+    JSValue (*init_ctor)(JSContext *, int argc, JSValue *argv);
+    int     (*define_class)(JSContext *, JSValue *pparent, JSValue *pbfunc,
+                            JSAtom atom, int class_flags, JSVarRef **var_refs);
+    int     (*define_class_computed)(JSContext *, JSValue *pkey,
+                                     JSValue *pparent, JSValue *pbfunc,
+                                     JSAtom atom, int class_flags,
+                                     JSVarRef **var_refs);
+    /* P27: dynamic import */
+    JSValue (*import_op)(JSContext *, JSValue specifier, JSValue options);
 } JSJITRuntime;
 
 /*
@@ -654,13 +665,24 @@ JSValue js_jit_op_get_private_field(JSContext *, JSValue, JSValue);
 int     js_jit_op_put_private_field(JSContext *, JSValue, JSValue, JSValue);
 int     js_jit_op_define_private_field(JSContext *, JSValue, JSValue, JSValue);
 JSValue js_jit_op_private_in(JSContext *, JSValue, JSValue);
-/* P23: OOP helpers (check_ctor/init_ctor/define_class* deferred) */
+/* P23: OOP helpers */
 int     js_jit_op_check_brand(JSContext *, JSValue, JSValue);
 int     js_jit_op_add_brand(JSContext *, JSValue, JSValue);
 JSValue js_jit_op_get_super_value(JSContext *, JSValue, JSValue, JSValue);
 int     js_jit_op_put_super_value(JSContext *, JSValue, JSValue, JSValue, JSValue);
 int     js_jit_op_define_method(JSContext *, JSValue, JSValue, JSAtom, int);
 int     js_jit_op_define_method_computed(JSContext *, JSValue, JSValue, JSValue, int);
+/* P26: constructor / class-definition helpers */
+int     js_jit_op_check_ctor(JSContext *);
+JSValue js_jit_op_init_ctor(JSContext *, int argc, JSValue *argv);
+int     js_jit_op_define_class(JSContext *, JSValue *pparent, JSValue *pbfunc,
+                               JSAtom atom, int class_flags, JSVarRef **var_refs);
+int     js_jit_op_define_class_computed(JSContext *, JSValue *pkey,
+                                        JSValue *pparent, JSValue *pbfunc,
+                                        JSAtom atom, int class_flags,
+                                        JSVarRef **var_refs);
+/* P27: dynamic import */
+JSValue js_jit_op_import(JSContext *, JSValue specifier, JSValue options);
 #endif
 
 /* ======================================================================= */

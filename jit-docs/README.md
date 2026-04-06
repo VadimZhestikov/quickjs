@@ -38,6 +38,10 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 21: spread/rest/copy (append, copy_data_properties, rest) — includes gen_st type invalidation fix for append |
 | [phase18-todo.md](phase18-todo.md) | Phase 22: private fields (private_symbol, get/put/define_private_field, private_in) |
 | [phase18-todo.md](phase18-todo.md) | Phase 23: class/OOP (check_ctor_return, check/add_brand, get_super, get/put_super_value, define_method/computed); check_ctor/init_ctor/define_class deferred (need new_target/sf) |
+| [phase18-todo.md](phase18-todo.md) | Phase 25: for-in / iterator protocol (for_in_start, for_in_next, iterator_next, iterator_call) — was already implemented in P15; regression tests added |
+| [phase18-todo.md](phase18-todo.md) | Phase 26: constructors/classes (check_ctor, init_ctor, define_class, define_class_computed) via ctx->rt->current_stack_frame; no signature change needed |
+| [phase18-todo.md](phase18-todo.md) | Phase 27: dynamic import (import_op wrapping js_dynamic_import) |
+| [phase18-todo.md](phase18-todo.md) | Phase 28: OP_eval added to scan_is_unsupported — functions with direct eval run interpreted |
 
 ---
 
