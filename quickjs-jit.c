@@ -408,6 +408,11 @@ typedef struct JSJITScanResult {
     int       has_yield;   /* 1 if function has OP_yield/OP_initial_yield/OP_await */
     int       yield_count; /* number of OP_yield/OP_await sites (excluding initial_yield) */
     int       func_kind;   /* P12.3: JS_JIT_FUNC_{NORMAL,GENERATOR,ASYNC} */
+    /* Stack slots live BELOW the yielded/awaited value at each yield site.
+     * yield_below[0] = for _Lresume_0 (initial_yield → always 0)
+     * yield_below[k] = for _Lresume_k (k=1..yield_count), value = (stack_depth-1) */
+    int       yield_below[64]; /* saved stack slot count per resume label */
+    int       max_below_yield; /* max of yield_below[] — extra saved_lv slots needed */
 } JSJITScanResult;
 
 static void scan_result_free(JSJITScanResult *sr)
@@ -1787,13 +1792,15 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
      */
     if (sr && sr->has_yield) {
         int j, k;
+        /* saved_lv layout: [var_count local JSValues][max_below_yield stack JSValues]
+         * The extra stack slots hold live _tsv{j} values below the yielded value. */
+        int n_lv_total = var_count + sr->max_below_yield;
         /* Declare the generator frame pointer */
         jit_buf_printf(cb,
             "    JSJITGeneratorFrame *_gf=js_jit_gen_init_frame(ctx,%d,%d);\n",
-            var_count, var_ref_count);
+            n_lv_total, var_ref_count);
         jit_buf_str(cb,
             "    if(!_gf){_sp=0;goto _ex;}\n"
-            "    if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
             "    if(_gf->resume_idx>=0){\n");
         /* Restore local JSValue slots from saved_lv (transfer ownership) */
         for (j = 0; j < var_count; j++) {
@@ -1801,7 +1808,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 "        _jsv_%s=_gf->saved_lv[%d]; _gf->saved_lv[%d]=JS_UNDEFINED;\n",
                 varnames[arg_count + j], j, j);
         }
-        /* P12.1: restore catch state before dispatch so try/catch works across yield */
+        /* P12.1: restore catch state before throw check and dispatch so try/catch
+         * handlers are active when the resumed-with-throw path fires goto _ex. */
         if (sr->has_try && stack_size > 0) {
             jit_buf_str(cb,
                 "        _catch_depth=_gf->catch_depth;\n"
@@ -1810,6 +1818,10 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 "            memcpy(_catch_h,_gf->catch_h,(size_t)_catch_depth*sizeof(int));\n"
                 "        }\n");
         }
+        /* Throw check AFTER catch state is restored so that .throw() / rejected
+         * await inside a try block is routed to the correct catch handler. */
+        jit_buf_str(cb,
+            "        if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n");
         /* P12.2: restore closure var-refs from frame and re-attach to _cap_buf / _arg_cap_buf */
         if (sr->has_fclosure && var_ref_count > 0 && b) {
             int j;
@@ -1850,15 +1862,40 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                 }
             }
         }
-        /* Dispatch to the resume label matching _gf->resume_idx */
+        /* Dispatch to the resume label matching _gf->resume_idx.
+         * For each resume label, also restore the live stack temporaries that
+         * were below the yielded value (saved in saved_lv[var_count..] at yield time). */
         jit_buf_str(cb, "        switch(_gf->resume_idx){\n");
         /* P12.3: async functions have no OP_initial_yield so resume_idx is never 0 */
-        if (sr->func_kind != JS_JIT_FUNC_ASYNC)
+        if (sr->func_kind != JS_JIT_FUNC_ASYNC) {
+            /* yield_below[0] is for initial_yield: always 0 */
             jit_buf_str(cb, "        case 0: goto _Lresume_0;\n");
-        for (k = 1; k <= sr->yield_count; k++)
-            jit_buf_printf(cb, "        case %d: goto _Lresume_%d;\n", k, k);
+        }
+        for (k = 1; k <= sr->yield_count; k++) {
+            /* yi_k = index into yield_below[] for this resume label.
+             * For generators/async-generators: yield_below[0]=initial_yield, yield_below[k]=resume_k.
+             * For pure async functions (no OP_initial_yield): yield_below[k-1]=resume_k. */
+            int yi_k = (sr->func_kind == JS_JIT_FUNC_ASYNC) ? k - 1 : k;
+            int below = (yi_k >= 0 && yi_k < 64) ? sr->yield_below[yi_k] : 0;
+            if (below > 0) {
+                jit_buf_printf(cb, "        case %d: {\n", k);
+                for (j = 0; j < below; j++) {
+                    jit_buf_printf(cb,
+                        "            _tsv%d=_gf->saved_lv[%d];"
+                        " _gf->saved_lv[%d]=JS_UNDEFINED;\n",
+                        j, var_count + j, var_count + j);
+                }
+                /* Set _sp so exception cleanup frees the restored stack slots. */
+                jit_buf_printf(cb, "            _sp=%d; goto _Lresume_%d; }\n", below, k);
+            } else {
+                jit_buf_printf(cb, "        case %d: goto _Lresume_%d;\n", k, k);
+            }
+        }
         jit_buf_str(cb,
             "        }\n"
+            "    } else {\n"
+            "        /* Initial call (resume_idx==-1): throw before first next() */\n"
+            "        if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
             "    }\n");
     }
 }
@@ -4703,6 +4740,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
                     j, LNAME(j), LNAME(j));
             }
+            /* Save live stack temporaries BELOW the yield value into saved_lv.
+             * These slots (_tsv0..._tsv{d-2}) survive as C locals but the C stack
+             * frame is destroyed when we return.  Transfer ownership to the frame. */
+            for (j = 0; j < d-1; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_tsv%d; _tsv%d=JS_UNDEFINED;\n",
+                    var_count + j, j, j);
+            }
             /* P12.2: heap-promote captured locals/args and save vrefs to frame */
             if (sr->has_fclosure && var_ref_count > 0) {
                 jit_buf_printf(cb,
@@ -4720,20 +4765,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    }\n");
             }
             jit_buf_printf(cb,
-                "    { JSValue _yv%d=_tsv%d; _sp=%d;\n"
+                "    { JSValue _yv%d=_tsv%d; _sp=0;\n"
                 "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
                 "    }\n"
                 "    return JS_NewInt32(ctx,1);\n" /* FUNC_RET_YIELD */
-                /* NOTE: local variable restoration is done by the preamble's
-                 * dispatch block before 'goto _Lresume_N'.  Here we only need
-                 * to pick up the .next(v) value and the magic flag from the
-                 * two stack-buffer slots written by js_generator_next. */
+                /* Stack-slot restoration (tsv0..d-2) is done in preamble dispatch
+                 * before 'goto _Lresume_N'.  Here we only pick up the .next(v) value
+                 * and the magic flag from the two stack-buffer slots. */
                 "    _Lresume_%d:;\n"
                 "    { JSValue _nv%d=js_jit_gen_get_next_val(ctx);\n"
                 "      int _mg%d=js_jit_gen_get_magic_int(ctx);\n"
                 "      _tsv%d=_nv%d; _tsv%d=JS_NewInt32(ctx,_mg%d);\n"
                 "      _sp=%d; }\n",
-                yresi, d-1, d-1,
+                yresi, d-1,
                 yresi, yresi,
                 yresi,
                 yresi, yresi,
@@ -4764,6 +4808,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
                     j, LNAME(j), LNAME(j));
             }
+            /* Save live stack temporaries BELOW the awaited value into saved_lv.
+             * These slots (_tsv0..._tsv{d-2}) survive as C locals but the C stack
+             * frame is destroyed when we return.  Transfer ownership to the frame. */
+            for (j = 0; j < d-1; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_tsv%d; _tsv%d=JS_UNDEFINED;\n",
+                    var_count + j, j, j);
+            }
             /* P12.2: heap-promote captured locals/args and save vrefs to frame */
             if (sr->has_fclosure && var_ref_count > 0) {
                 jit_buf_printf(cb,
@@ -4781,15 +4833,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    }\n");
             }
             jit_buf_printf(cb,
-                "    { JSValue _yv%d=_tsv%d; _sp=%d;\n"
+                "    { JSValue _yv%d=_tsv%d; _sp=0;\n"
                 "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
                 "    }\n"
                 "    return JS_NewInt32(ctx,0);\n" /* FUNC_RET_AWAIT */
+                /* Stack-slot restoration (tsv0..d-2) is done in preamble dispatch
+                 * before 'goto _Lresume_N'.  The throw check here catches rejected
+                 * awaits that land after the preamble's catch-state restoration. */
                 "    _Lresume_%d:;\n"
-                "    if(js_jit_gen_get_throw(ctx)){_sp=0;goto _ex;}\n"
+                "    if(js_jit_gen_get_throw(ctx)){goto _ex;}\n"
                 "    { JSValue _rv%d=js_jit_gen_get_next_val(ctx);\n"
                 "      _tsv%d=_rv%d; _sp=%d; }\n",
-                yresi, d-1, d-1,
+                yresi, d-1,
                 yresi, yresi,
                 yresi,
                 yresi,
@@ -5135,9 +5190,43 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
     int op_sz_count;
     const uint8_t *op_sz = js_jit_get_opcode_size_table(&op_sz_count);
 
+    /* P12: collect per-yield-site stack depth using the stack_depth_tab.
+     * yield_below[k] = number of live stack slots below the yielded value
+     * at resume label _Lresume_k.  These must be saved/restored across yield. */
+    if (sr.has_yield) {
+        const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
+        int yi = 0;
+        int pc2 = 0;
+        memset(sr.yield_below, 0, sizeof(sr.yield_below));
+        sr.max_below_yield = 0;
+        while (pc2 < bc_len && yi < 64) {
+            int op2 = bc[pc2];
+            if (op2 == OP_initial_yield) {
+                /* resume label 0: no locals below */
+                sr.yield_below[yi++] = 0;
+            } else if (op2 == OP_yield || op2 == OP_await) {
+                int d2 = (sdt && sdt[pc2] != 0xffff) ? (int)sdt[pc2] : 0;
+                int below = d2 - 1; /* slots below the yielded value */
+                if (below < 0) below = 0;
+                sr.yield_below[yi++] = below;
+                if (below > sr.max_below_yield) sr.max_below_yield = below;
+            }
+            pc2 += (op2 < op_sz_count) ? op_sz[op2] : 1;
+        }
+    }
+
     /* Phase 5: infer which locals are always numeric → use C double */
     uint8_t *local_type = jit_infer_types(bc, bc_len, op_sz, op_sz_count,
                                            var_count, stack_size);
+    /* In generator/async functions, typed int/float locals (JIT_T_INT, JIT_T_NUMBER)
+     * are C-stack variables that are NOT saved to JSJITGeneratorFrame.saved_lv[].
+     * Only JSValue locals (_jsv_*) survive yield/await.  Force all locals to
+     * JSVAL so they are correctly spilled and restored across yield boundaries. */
+    if (sr.has_yield && local_type) {
+        int _j;
+        for (_j = 0; _j < var_count; _j++)
+            local_type[_j] = JIT_T_JSVAL;
+    }
 
     /* P12: force all generator locals to JSVAL so spill/restore is a simple
      * JSValue copy — avoids boxing/unboxing complexity for typed locals. */

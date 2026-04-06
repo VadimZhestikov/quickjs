@@ -30,7 +30,7 @@ C as the intermediate representation.
 | [phase9-todo.md](phase9-todo.md) | Phase 9 plan: stackless IR, CF structuring, variable names, typed temporaries |
 | [phase10-todo.md](phase10-todo.md) | Phase 10 plan: combined .so, LTO inter-procedural inlining, direct C calls |
 | [phase11-todo.md](phase11-todo.md) | Phase 11: performance gap analysis, P11.1–P11.4 implemented, P11.5–P11.10 planned |
-| [phase12-todo.md](phase12-todo.md) | Phase 12: generator and async function JIT support (yield/await CPS transform) |
+| [phase12-todo.md](phase12-todo.md) | Phase 12: generator/async JIT (yield/await CPS transform) — P12.1–P12.4 implemented |
 | [phase13-todo.md](phase13-todo.md) | Phase 13–17: closure creation, try/catch, iterators, delete, spread/apply |
 
 ---
