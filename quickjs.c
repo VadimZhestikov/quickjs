@@ -16009,10 +16009,22 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                  *
                  * After the call we free all padded slots: the JIT has already
                  * freed/replaced each slot it touched via put_arg, so this
-                 * correctly frees any slots that were not modified. */
+                 * correctly frees any slots that were not modified.
+                 *
+                 * Variadic functions (arg_count == 0) never use put_arg and
+                 * access arguments via js_build_arguments which DUPs from argv.
+                 * Pass the actual argc/argv directly — no padding needed and
+                 * doing so avoids the bug where argc=0 produces an empty
+                 * arguments object inside the callee. */
                 {
                     int n = b->arg_count;
-                    JSValue *padded = alloca(sizeof(JSValue) * (n > 0 ? n : 1));
+                    if (n == 0) {
+                        /* Variadic: pass actual args; callee DUPs them via
+                         * js_build_arguments, never _FREE()s argv directly. */
+                        return jf(ctx, this_val, argc, argv,
+                                  b->cpool, p->u.func.var_refs);
+                    }
+                    JSValue *padded = alloca(sizeof(JSValue) * n);
                     JSValue ret;
                     int i;
                     for (i = 0; i < argc && i < n; i++)
@@ -16046,8 +16058,14 @@ JSValue js_jit_ic_direct_call(
     JSJITCallICEntry *ic, JSVarRef **var_refs)
 {
     int n = ic->callee_arg_count;
+    /* Variadic callee (arg_count == 0): pass actual args directly.
+     * The callee accesses them only via js_build_arguments (which DUPs),
+     * never _FREE()s argv entries, so no private copy is needed. */
+    if (n == 0)
+        return ic->direct_jit(ctx, this_val, nargs, argv,
+                               ic->callee_cpool, var_refs);
     /* alloca is safe here: arg counts are small (< 64 typically) */
-    JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * (n > 0 ? n : 1));
+    JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * n);
     int i;
     for (i = 0; i < nargs && i < n; i++)
         padded[i] = JS_DupValue(ctx, argv[i]);
