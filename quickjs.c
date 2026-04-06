@@ -17951,6 +17951,96 @@ int js_jit_for_of_start(JSContext *ctx,
     return 0;
 }
 
+/* P30: for_await_of_start — async variant of for_of_start (Symbol.asyncIterator).
+ * obj ownership transferred; sets *piter and *pnext.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_for_await_of_start(JSContext *ctx,
+                               JSValue *piter, JSValue *pnext, JSValue obj)
+{
+    JSValue stk[2];
+    JSValue *sp;
+    stk[0] = obj;           /* sp[-1] = obj (freed by js_for_of_start) */
+    stk[1] = JS_UNDEFINED;  /* sp[0]  = next out */
+    sp = &stk[1];
+    if (js_for_of_start(ctx, sp, TRUE) < 0) return -1;
+    *piter = stk[0];
+    *pnext = stk[1];
+    return 0;
+}
+
+/* P30: for_await_of_next — advance async for-of; returns raw (unawaited) Promise.
+ * iter and next are borrowed (not consumed).
+ * *pcatch_ph is cleared (set to JS_UNDEFINED, old value freed).
+ * *ppromise receives the Promise (caller owns); must follow with OP_await.
+ * Returns -1 on exception, 0 on success. */
+int js_jit_for_await_of_next(JSContext *ctx, JSValue iter, JSValue next,
+                              JSValue *pcatch_ph, JSValue *ppromise)
+{
+    /* Disable the catch offset so that exceptions from next() don't close the iterator */
+    JS_FreeValue(ctx, *pcatch_ph);
+    *pcatch_ph = JS_UNDEFINED;
+    JSValue promise = JS_Call(ctx, next, iter, 0, NULL);
+    if (JS_IsException(promise))
+        return -1;
+    *ppromise = promise;
+    return 0;
+}
+
+/* P30: with_has — combined HasProperty + optional @@unscopables check.
+ * obj borrowed. Returns 1 (found+in-scope), 0 (not found/unscopable), -1 (exception). */
+int js_jit_with_has(JSContext *ctx, JSValue obj, JSAtom atom, int is_with)
+{
+    int ret = JS_HasProperty(ctx, obj, atom);
+    if (ret < 0) return -1;
+    if (ret && is_with) {
+        ret = js_has_unscopable(ctx, obj, atom);
+        if (ret < 0) return -1;
+        return !ret; /* unscopable=1 → treat as not-found=0 */
+    }
+    return ret;
+}
+
+/* P30: with_get_var found path — get property, replace *pobj_val with value.
+ * *pobj_val is in (obj, freed) and out (val, caller owns).
+ * Returns -1 on exception, 0 on success. */
+int js_jit_with_get_var(JSContext *ctx, JSValue *pobj_val, JSAtom atom)
+{
+    JSValue val = JS_GetProperty(ctx, *pobj_val, atom);
+    if (JS_IsException(val)) return -1;
+    JS_FreeValue(ctx, *pobj_val);
+    *pobj_val = val;
+    return 0;
+}
+
+/* P30: with_put_var found path — set property on scope object.
+ * obj borrowed (remains on stack). val is consumed (JS_SetProperty takes ownership).
+ * Returns -1 on exception, 0 on success. */
+int js_jit_with_put_var(JSContext *ctx, JSValue obj, JSAtom atom, JSValue val)
+{
+    return JS_SetProperty(ctx, obj, atom, val);
+}
+
+/* P30: with_delete_var found path — delete property from scope object.
+ * obj borrowed. Returns 1 (deleted), 0 (non-deletable), -1 (exception). */
+int js_jit_with_delete_var(JSContext *ctx, JSValue obj, JSAtom atom)
+{
+    return JS_DeleteProperty(ctx, obj, atom, 0);
+}
+
+/* P30: with_make_ref found path — return atom as a JSValue (for ref-pair).
+ * Caller owns the returned value. */
+JSValue js_jit_with_make_ref(JSContext *ctx, JSAtom atom)
+{
+    return JS_AtomToValue(ctx, atom);
+}
+
+/* P30: with_get_ref found path — get property for method call reference.
+ * obj borrowed. Returns property value (caller owns) or JS_EXCEPTION. */
+JSValue js_jit_with_get_ref(JSContext *ctx, JSValue obj, JSAtom atom)
+{
+    return JS_GetProperty(ctx, obj, atom);
+}
+
 /* for_of_next: advance for-of iterator.
  * *piter may be set to JS_UNDEFINED (and freed) if iteration is done.
  * next is NOT consumed.

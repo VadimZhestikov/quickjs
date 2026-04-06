@@ -278,6 +278,16 @@ const JSJITRuntime js_jit_rt = {
     .define_class_computed = js_jit_op_define_class_computed,
     /* P27: dynamic import */
     .import_op             = js_jit_op_import,
+    /* P30: async for-of */
+    .for_await_of_start    = js_jit_for_await_of_start,
+    .for_await_of_next     = js_jit_for_await_of_next,
+    /* P30: with_* object-environment lookup */
+    .with_has              = js_jit_with_has,
+    .with_get_var          = js_jit_with_get_var,
+    .with_put_var          = js_jit_with_put_var,
+    .with_delete_var       = js_jit_with_delete_var,
+    .with_make_ref         = js_jit_with_make_ref,
+    .with_get_ref          = js_jit_with_get_ref,
 };
 
 /* -----------------------------------------------------------------------
@@ -507,18 +517,6 @@ static inline int16_t bc_get_i16(const uint8_t *pc) {
 static int scan_is_unsupported(int op)
 {
     switch (op) {
-    /* with-statement dynamic scoping */
-    case OP_with_get_var:
-    case OP_with_put_var:
-    case OP_with_delete_var:
-    case OP_with_make_ref:
-    case OP_with_get_ref:
-    /* async iterators — not supported (need await/generator machinery) */
-    case OP_for_await_of_start:
-    case OP_for_await_of_next:
-    /* yield* and async yield* — require iterator protocol, not yet supported */
-    case OP_yield_star:
-    case OP_async_yield_star:
     /* P28: direct eval needs full scope-chain access — exclude rather than implement */
     case OP_eval:
         return 1;
@@ -678,6 +676,21 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
             /* P12.3: OP_await is the async equivalent of OP_yield */
             sr->has_yield = 1;
             sr->yield_count++;
+        } else if (op == OP_yield_star || op == OP_async_yield_star) {
+            /* P29: yield* / async yield* — same suspend/resume machinery as OP_yield */
+            sr->has_yield = 1;
+            sr->yield_count++;
+        }
+
+        /* P30: with_* — register conditional-jump target */
+        if (op == OP_with_get_var || op == OP_with_put_var ||
+            op == OP_with_delete_var || op == OP_with_make_ref ||
+            op == OP_with_get_ref) {
+            int32_t diff = bc_get_i32(&bc[pc + 5]);
+            int target = pc + 5 + diff;
+            if (scan_add_target(sr, target, &cap) < 0) {
+                scan_result_free(sr); return -1;
+            }
         }
 
         pc += sz;
@@ -1054,9 +1067,30 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
                 _TI_DROPN(1);
                 _TI_PUSH(JIT_T_JSVAL);
                 break;
+            /* P29: OP_yield_star / OP_async_yield_star: pops 1, pushes 2 (same as OP_yield) */
+            case OP_yield_star:
+            case OP_async_yield_star:
+                _TI_DROPN(1);
+                _TI_PUSH(JIT_T_JSVAL); /* next_val */
+                _TI_PUSH(JIT_T_JSVAL); /* magic */
+                break;
             /* OP_return_async: pops 1 (return value), no push */
             case OP_return_async:
                 _TI_DROPN(1); sp = 0; break;
+
+            /* P30: for_await_of_start: obj → iter next catch_ph (+2 net) */
+            case OP_for_await_of_start:
+                _TI_PUSH(JIT_T_JSVAL); _TI_PUSH(JIT_T_JSVAL); break;
+            /* P30: for_await_of_next: pushes promise (+1) */
+            case OP_for_await_of_next:
+                _TI_PUSH(JIT_T_JSVAL); break;
+            /* P30: with_* — all fall-through paths pop obj (-1), found paths jump away */
+            case OP_with_get_var:
+            case OP_with_put_var:
+            case OP_with_delete_var:
+            case OP_with_make_ref:
+            case OP_with_get_ref:
+                _TI_DROPN(1); break;
 
             /* ---- Return / throw ---- */
             case OP_return: _TI_DROPN(1); sp = 0; break;
@@ -2460,6 +2494,35 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d, d+1,
                 d-3, d-2, d, d+1,
                 d+2);
+            break;
+
+        /* P30: OP_for_await_of_start: obj → iter next catch_ph (+2 net, async=TRUE).
+         * Same interface as OP_for_of_start but uses Symbol.asyncIterator. */
+        case OP_for_await_of_start:
+            _P94_ENSURE(d+1);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED; _tsv%d=JS_UNDEFINED;\n"
+                "    if(_RT->for_await_of_start(ctx,&_tsv%d,&_tsv%d,_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d, d+1,
+                d-1, d, d-1,
+                d+2);
+            break;
+
+        /* P30: OP_for_await_of_next: iter(d-3) next(d-2) catch_ph(d-1) → +promise(d).
+         * Clears catch_ph, calls next.call(iter), pushes raw Promise.
+         * The caller must follow with OP_await to actually suspend. */
+        case OP_for_await_of_next:
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    _tsv%d=JS_UNDEFINED;\n"
+                "    if(_RT->for_await_of_next(ctx,_tsv%d,_tsv%d,&_tsv%d,&_tsv%d)<0)"
+                " goto _ex;\n"
+                "    _sp=%d;\n",
+                d,
+                d-3, d-2, d-1, d,
+                d+1);
             break;
 
         /* OP_iterator_close: iter next catch_ph → (free all, close iter if non-null).
@@ -5114,6 +5177,69 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        case OP_yield_star:
+        case OP_async_yield_star: {
+            /* P29: Delegate yield — same suspend/resume machinery as OP_yield but
+             * returns FUNC_RET_YIELD_STAR (2) so the generator runtime knows to drive
+             * the full iterator delegation protocol on the outer side.
+             *
+             * On resume (_Lresume_N:): exactly like OP_yield — two values pushed:
+             *   _tsv{d-1} = .next(v) value    (JSVAL)
+             *   _tsv{d}   = magic int (0=next, 1=return, 2=throw)
+             */
+            int j;
+            int yresi = yield_site_counter++;
+            _P94_ENSURE(d-1); /* box the yield* value if it is typed */
+            /* Spill all local JSValues into saved_lv (transfer ownership) */
+            for (j = 0; j < var_count; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_jsv_%s; _jsv_%s=JS_UNDEFINED;\n",
+                    j, LNAME(j), LNAME(j));
+            }
+            /* Save live stack temporaries BELOW the yield* value into saved_lv */
+            for (j = 0; j < d-1; j++) {
+                jit_buf_printf(cb,
+                    "    _gf->saved_lv[%d]=_tsv%d; _tsv%d=JS_UNDEFINED;\n",
+                    var_count + j, j, j);
+            }
+            /* P12.2: heap-promote captured locals/args and save vrefs to frame */
+            if (sr->has_fclosure && var_ref_count > 0) {
+                jit_buf_printf(cb,
+                    "    js_jit_close_caps(ctx,_sf_vrefs,%d);\n"
+                    "    js_jit_gen_save_vrefs(ctx,_sf_vrefs,%d,_gf);\n",
+                    var_ref_count, var_ref_count);
+            }
+            /* P12.1: save catch state so try/catch works across yield* */
+            if (sr->has_try && stack_size > 0) {
+                jit_buf_str(cb,
+                    "    _gf->catch_depth=_catch_depth;\n"
+                    "    if(_catch_depth>0){\n"
+                    "        memcpy(_gf->catch_sp,_catch_sp,(size_t)_catch_depth*sizeof(int));\n"
+                    "        memcpy(_gf->catch_h,_catch_h,(size_t)_catch_depth*sizeof(int));\n"
+                    "    }\n");
+            }
+            jit_buf_printf(cb,
+                "    { JSValue _yv%d=_tsv%d; _sp=0;\n"
+                "      js_jit_gen_yield_setup(ctx,_yv%d,%d,_gf);\n"
+                "    }\n"
+                "    return JS_NewInt32(ctx,2);\n" /* FUNC_RET_YIELD_STAR */
+                "    _Lresume_%d:;\n"
+                "    { JSValue _nv%d=js_jit_gen_get_next_val(ctx);\n"
+                "      int _mg%d=js_jit_gen_get_magic_int(ctx);\n"
+                "      _tsv%d=_nv%d; _tsv%d=JS_NewInt32(ctx,_mg%d);\n"
+                "      _sp=%d; }\n",
+                yresi, d-1,
+                yresi, yresi,
+                yresi,
+                yresi, yresi,
+                d-1, yresi, d, yresi, d+1);
+            /* Update gen-time type stack: d-1 = JSVAL (next_val), d = JSVAL (magic) */
+            if (gen_sp > 0) gen_sp--;          /* pop yield* value */
+            if (gen_sp < gen_stk_cap) { gen_st[gen_sp] = JIT_T_JSVAL; gen_hsh[gen_sp] = 0; gen_sp++; } /* next_val */
+            if (gen_sp < gen_stk_cap) { gen_st[gen_sp] = JIT_T_JSVAL; gen_hsh[gen_sp] = 0; gen_sp++; } /* magic */
+            break;
+        }
+
         case OP_return_async: {
             /* Generator/async function return (normal end or via .return(v) / .throw()).
              *
@@ -5679,6 +5805,140 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         }
 
+        /* ---- P30: with_* — object-environment lookup with conditional PC jump ---- */
+
+        /* Shared codegen pattern for all with_* opcodes:
+         *   1. Check HasProperty + optionally @@unscopables (via _RT->with_has).
+         *   2. If found: perform per-opcode action, then goto _Lpc_TARGET.
+         *   3. If not found: pop obj, fall through.
+         *
+         * Bytecode format: op(1) atom(4) diff(4) is_with(1) = 10 bytes.
+         * Jump target = pc + 5 + diff (matches interpreter's pc-after-operands + (diff-5)). */
+
+        case OP_with_get_var: {
+            /* obj(d-1) → val(d-1) if found (in-place), else pop obj.
+             * Jump diff is measured from atom-start byte (pc+1 in JIT). */
+            uint32_t atom   = bc_u32(&bc[pc+1]);
+            int32_t  diff   = (int32_t)bc_u32(&bc[pc+5]);
+            int      is_with = (int)bc[pc+9];
+            int      target  = pc + 5 + diff;
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _wh=_RT->with_has(ctx,_tsv%d,%uu,%d);\n"
+                "      if(_wh<0) goto _ex;\n"
+                "      if(_wh){\n"
+                "        if(_RT->with_get_var(ctx,&_tsv%d,%uu)<0) goto _ex;\n"
+                "        goto _Lpc_%d;\n"
+                "      }\n"
+                "      _FREE(_tsv%d); _sp=%d; }\n",
+                d-1, atom, is_with,
+                d-1, atom,
+                target,
+                d-1, d-1);
+            break;
+        }
+
+        case OP_with_put_var: {
+            /* val(d-2) obj(d-1) → if found: set val on obj, pop both (sp=d-2); jump.
+             *                     if not found: pop obj only (sp=d-1). */
+            uint32_t atom   = bc_u32(&bc[pc+1]);
+            int32_t  diff   = (int32_t)bc_u32(&bc[pc+5]);
+            int      is_with = (int)bc[pc+9];
+            int      target  = pc + 5 + diff;
+            _P94_ENSURE(d-2); /* val must be boxed before passing to SetProperty */
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _wh=_RT->with_has(ctx,_tsv%d,%uu,%d);\n"
+                "      if(_wh<0) goto _ex;\n"
+                "      if(_wh){\n"
+                "        int _r=_RT->with_put_var(ctx,_tsv%d,%uu,_tsv%d);\n"
+                "        _FREE(_tsv%d); _sp=%d;\n"
+                "        if(_r<0) goto _ex;\n"
+                "        goto _Lpc_%d;\n"
+                "      }\n"
+                "      _FREE(_tsv%d); _sp=%d; }\n",
+                d-1, atom, is_with,
+                d-1, atom, d-2,
+                d-1, d-2,
+                target,
+                d-1, d-1);
+            break;
+        }
+
+        case OP_with_delete_var: {
+            /* obj(d-1) → bool(d-1) if found; else pop obj. */
+            uint32_t atom   = bc_u32(&bc[pc+1]);
+            int32_t  diff   = (int32_t)bc_u32(&bc[pc+5]);
+            int      is_with = (int)bc[pc+9];
+            int      target  = pc + 5 + diff;
+            _P94_ENSURE(d-1);
+            jit_buf_printf(cb,
+                "    { int _wh=_RT->with_has(ctx,_tsv%d,%uu,%d);\n"
+                "      if(_wh<0) goto _ex;\n"
+                "      if(_wh){\n"
+                "        int _r=_RT->with_delete_var(ctx,_tsv%d,%uu);\n"
+                "        if(_r<0) goto _ex;\n"
+                "        _FREE(_tsv%d); _tsv%d=JS_NewBool(ctx,_r);\n"
+                "        goto _Lpc_%d;\n"
+                "      }\n"
+                "      _FREE(_tsv%d); _sp=%d; }\n",
+                d-1, atom, is_with,
+                d-1, atom,
+                d-1, d-1,
+                target,
+                d-1, d-1);
+            break;
+        }
+
+        case OP_with_make_ref: {
+            /* obj(d-1) → obj(d-1) atom_val(d) if found (+1); else pop obj. */
+            uint32_t atom   = bc_u32(&bc[pc+1]);
+            int32_t  diff   = (int32_t)bc_u32(&bc[pc+5]);
+            int      is_with = (int)bc[pc+9];
+            int      target  = pc + 5 + diff;
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    { int _wh=_RT->with_has(ctx,_tsv%d,%uu,%d);\n"
+                "      if(_wh<0) goto _ex;\n"
+                "      if(_wh){\n"
+                "        _tsv%d=_RT->with_make_ref(ctx,%uu); _sp=%d;\n"
+                "        goto _Lpc_%d;\n"
+                "      }\n"
+                "      _FREE(_tsv%d); _sp=%d; }\n",
+                d-1, atom, is_with,
+                d, atom, d+1,
+                target,
+                d-1, d-1);
+            break;
+        }
+
+        case OP_with_get_ref: {
+            /* obj(d-1) → obj(d-1) method_val(d) if found (+1); else pop obj. */
+            uint32_t atom   = bc_u32(&bc[pc+1]);
+            int32_t  diff   = (int32_t)bc_u32(&bc[pc+5]);
+            int      is_with = (int)bc[pc+9];
+            int      target  = pc + 5 + diff;
+            _P94_ENSURE(d-1);
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    { int _wh=_RT->with_has(ctx,_tsv%d,%uu,%d);\n"
+                "      if(_wh<0) goto _ex;\n"
+                "      if(_wh){\n"
+                "        JSValue _gref=_RT->with_get_ref(ctx,_tsv%d,%uu);\n"
+                "        if(JS_IsException(_gref)) goto _ex;\n"
+                "        _tsv%d=_gref; _sp=%d;\n"
+                "        goto _Lpc_%d;\n"
+                "      }\n"
+                "      _FREE(_tsv%d); _sp=%d; }\n",
+                d-1, atom, is_with,
+                d-1, atom,
+                d, d+1,
+                target,
+                d-1, d-1);
+            break;
+        }
+
         /* ---- Unsupported opcodes (caught in scan, but defensive) ---- */
         default:
             fprintf(stderr, "[JIT] gen_body: unhandled opcode 0x%02x at pc=%d\n", op, pc);
@@ -5860,6 +6120,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
             case OP_for_of_next:
                 _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
+            /* --- P30: async for-of --- */
+            case OP_for_await_of_start:
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;           /* +2 */
+            case OP_for_await_of_next:
+                _gs_push=JIT_T_JSVAL; break;                          /* +1 */
+            /* --- P30: with_* — model the fall-through (not-found) path: pop obj --- */
+            case OP_with_get_var:
+            case OP_with_put_var:
+            case OP_with_delete_var:
+            case OP_with_make_ref:
+            case OP_with_get_ref:
+                _gs_drop=1; break;
             case OP_iterator_close:   _gs_drop=3; break;              /* -3 */
             case OP_iterator_check_object: break;                     /* 0 */
             case OP_iterator_get_value_done: _gs_push=JIT_T_JSVAL; break; /* +1 */
@@ -5990,6 +6262,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_initial_yield: break;   /* no stack change, updated inline */
             case OP_yield: break;           /* updated inline in OP_yield case above */
             case OP_await: break;           /* updated inline in OP_await case above */
+            case OP_yield_star: break;      /* updated inline in OP_yield_star case above */
+            case OP_async_yield_star: break; /* updated inline in OP_async_yield_star case above */
             case OP_return_async: gen_sp=0; break;
 
             /* --- P19: utility ops --- */
@@ -6143,7 +6417,8 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
             if (op2 == OP_initial_yield) {
                 /* resume label 0: no locals below */
                 sr.yield_below[yi++] = 0;
-            } else if (op2 == OP_yield || op2 == OP_await) {
+            } else if (op2 == OP_yield || op2 == OP_await ||
+                       op2 == OP_yield_star || op2 == OP_async_yield_star) {
                 int d2 = (sdt && sdt[pc2] != 0xffff) ? (int)sdt[pc2] : 0;
                 int below = d2 - 1; /* slots below the yielded value */
                 if (below < 0) below = 0;

@@ -257,6 +257,29 @@ typedef struct JSJITRuntime {
                                      JSVarRef **var_refs);
     /* P27: dynamic import */
     JSValue (*import_op)(JSContext *, JSValue specifier, JSValue options);
+    /* P30: async for-of */
+    /* for_await_of_start: like for_of_start but uses Symbol.asyncIterator.
+     * obj ownership transferred; sets *piter and *pnext. */
+    int (*for_await_of_start)(JSContext *, JSValue *piter, JSValue *pnext, JSValue obj);
+    /* for_await_of_next: advance async for-of. Clears *pcatch_ph, calls next(iter),
+     * puts raw Promise in *ppromise. iter and next are borrowed (not consumed). */
+    int (*for_await_of_next)(JSContext *, JSValue iter, JSValue next,
+                             JSValue *pcatch_ph, JSValue *ppromise);
+    /* P30: with_* — object-environment-record scope lookup helpers */
+    /* with_has: JS_HasProperty + optional @@unscopables check.
+     * obj borrowed. Returns 1 (found+in-scope), 0 (not found or unscopable), -1 (error). */
+    int     (*with_has)(JSContext *, JSValue obj, JSAtom atom, int is_with);
+    /* with_get_var found path: get property; *pobj_val in=obj out=val (freed & replaced). */
+    int     (*with_get_var)(JSContext *, JSValue *pobj_val, JSAtom atom);
+    /* with_put_var found path: set property. obj borrowed, val consumed. */
+    int     (*with_put_var)(JSContext *, JSValue obj, JSAtom atom, JSValue val);
+    /* with_delete_var found path: delete property. obj borrowed.
+     * Returns 1 (deleted), 0 (non-deletable), -1 (exception). */
+    int     (*with_delete_var)(JSContext *, JSValue obj, JSAtom atom);
+    /* with_make_ref found path: return atom as JSValue (caller owns). */
+    JSValue (*with_make_ref)(JSContext *, JSAtom atom);
+    /* with_get_ref found path: get property for method call ref. obj borrowed. */
+    JSValue (*with_get_ref)(JSContext *, JSValue obj, JSAtom atom);
 } JSJITRuntime;
 
 /*
@@ -369,6 +392,18 @@ int js_jit_for_of_start(JSContext *ctx,
 int js_jit_for_of_next(JSContext *ctx, JSValue *piter, JSValue next,
                        JSValue *pvalue, JSValue *pdone);
 int js_jit_iterator_close(JSContext *ctx, JSValue iter, JSValue next);
+/* P30: async for-of helpers */
+int js_jit_for_await_of_start(JSContext *ctx,
+                               JSValue *piter, JSValue *pnext, JSValue obj);
+int js_jit_for_await_of_next(JSContext *ctx, JSValue iter, JSValue next,
+                              JSValue *pcatch_ph, JSValue *ppromise);
+/* P30: with_* object-environment helpers */
+int     js_jit_with_has(JSContext *ctx, JSValue obj, JSAtom atom, int is_with);
+int     js_jit_with_get_var(JSContext *ctx, JSValue *pobj_val, JSAtom atom);
+int     js_jit_with_put_var(JSContext *ctx, JSValue obj, JSAtom atom, JSValue val);
+int     js_jit_with_delete_var(JSContext *ctx, JSValue obj, JSAtom atom);
+JSValue js_jit_with_make_ref(JSContext *ctx, JSAtom atom);
+JSValue js_jit_with_get_ref(JSContext *ctx, JSValue obj, JSAtom atom);
 int js_jit_iterator_get_value_done(JSContext *ctx, JSValue obj,
                                    JSValue *pvalue, JSValue *pdone);
 int js_jit_iterator_next_step(JSContext *ctx,

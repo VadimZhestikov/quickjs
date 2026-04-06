@@ -42,6 +42,8 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 26: constructors/classes (check_ctor, init_ctor, define_class, define_class_computed) via ctx->rt->current_stack_frame; no signature change needed |
 | [phase18-todo.md](phase18-todo.md) | Phase 27: dynamic import (import_op wrapping js_dynamic_import) |
 | [phase18-todo.md](phase18-todo.md) | Phase 28: OP_eval added to scan_is_unsupported — functions with direct eval run interpreted |
+| [phase18-todo.md](phase18-todo.md) | Phase 29: yield_star/async_yield_star — same CPS machinery as OP_yield but returns FUNC_RET_YIELD_STAR (2); enables `yield*` delegation in both sync and async generators |
+| [phase18-todo.md](phase18-todo.md) | Phase 30: for_await_of_start/next (async iteration), with_get_var/put_var/delete_var/make_ref/get_ref (object-environment-record scope lookup with conditional PC jump) |
 
 ---
 

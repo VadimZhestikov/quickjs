@@ -98,6 +98,44 @@
   - Tests: `tests/test_jit_p25p26p27p28.js` verifies that eval-using functions still
     run correctly (in interpreter mode).
 
+**P29 — DONE** (yield_star, async_yield_star).
+  - Both opcodes use the same suspend/resume machinery as `OP_yield` but return
+    `FUNC_RET_YIELD_STAR` (= 2) instead of `FUNC_RET_YIELD` (= 1).
+  - The generator runtime drives the full iterator delegation protocol; the generator body
+    only needs to suspend and receive the `(value, magic)` pair on resume.
+  - Scan pass: `OP_yield_star` and `OP_async_yield_star` now increment `yield_site_counter`
+    and are included in the `yield_below[]` computation (same as `OP_yield`/`OP_await`).
+  - No new vtable entries or helpers needed — pure inline codegen copied from `OP_yield`.
+  - Tests: `tests/test_jit_p29p30.js` covers sync generator delegation (array, nested
+    generator, return value, string), async generator delegation.
+
+**P30 — DONE** (for_await_of_start/next, with_get_var/put_var/delete_var/make_ref/get_ref).
+
+  **for_await_of_start/next:**
+  - `for_await_of_start`: calls `js_for_of_start(ctx, sp, TRUE)` — same as `for_of_start`
+    but uses `Symbol.asyncIterator`. Helper `js_jit_for_await_of_start` added to `quickjs.c`.
+  - `for_await_of_next`: clears catch placeholder, calls `JS_Call(ctx, next, iter, 0, NULL)`,
+    pushes raw Promise. The `OP_await` that follows in the bytecode performs the suspension.
+    Helper `js_jit_for_await_of_next` added to `quickjs.c`.
+  - Vtable entries: `for_await_of_start`, `for_await_of_next`.
+  - Stack effects: `for_await_of_start` +2 (same as `for_of_start`), `for_await_of_next` +1.
+
+  **with_* opcodes:**
+  - Scan pass: `with_get_var/put_var/delete_var/make_ref/get_ref` — branch targets registered
+    (`target = pc + 5 + diff`).
+  - Codegen: each opcode generates a `_RT->with_has()` check, optional per-opcode action
+    on the found path (with a `goto _Lpc_TARGET`), and a fall-through not-found path that
+    pops the scope object.
+  - Helpers added to `quickjs.c`: `js_jit_with_has` (HasProperty + @@unscopables),
+    `js_jit_with_get_var` (GetProperty in-place), `js_jit_with_put_var` (SetProperty),
+    `js_jit_with_delete_var` (DeleteProperty), `js_jit_with_make_ref` (AtomToValue),
+    `js_jit_with_get_ref` (GetProperty for method call).
+  - Vtable entries: `with_has`, `with_get_var`, `with_put_var`, `with_delete_var`,
+    `with_make_ref`, `with_get_ref`.
+  - Note: `with` is only valid in non-strict mode; the test file omits `"use strict"`.
+  - Tests: `tests/test_jit_p29p30.js` covers with_get_var, with_put_var, with_delete_var,
+    nested with, shadow, and fallthrough.
+
 ## Overview
 
 57 finalized opcodes (listed in `quickjs-opcode.h` as `DEF(...)`) currently reach the
