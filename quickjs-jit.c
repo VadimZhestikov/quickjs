@@ -459,8 +459,6 @@ static int scan_is_unsupported(int op)
     /* async iterators — not supported (need await/generator machinery) */
     case OP_for_await_of_start:
     case OP_for_await_of_next:
-    /* special_object: creates arguments/this_func/new.target — needs sf pointer */
-    case OP_special_object:
         return 1;
     default:
         return 0;
@@ -916,6 +914,9 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
             /* iterator_call: 4-in 5-out (result replaces val, flag pushed +1) */
             case OP_iterator_call:
                 _TI_PUSH(JIT_T_JSVAL); break;
+
+            /* ---- P15b: special_object — pushes one JSVAL ---- */
+            case OP_special_object: _TI_PUSH(JIT_T_JSVAL); break;
 
             /* ---- Return / throw ---- */
             case OP_return: _TI_DROPN(1); sp = 0; break;
@@ -2046,6 +2047,22 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 " goto _ex;\n"
                 "      }\n"
                 "    }\n");
+            break;
+        }
+
+        /* ---- P15b: OP_special_object ---- */
+
+        /* OP_special_object pushes one new JSVAL: arguments, this_func, new.target, etc.
+         * Delegates to js_jit_special_object which reads ctx->rt->current_stack_frame
+         * (set by JS_CallInternal before invoking the JIT function). */
+        case OP_special_object: {
+            int _kind = (int)bc[pc+1];
+            _P94_ENSURE(d);
+            jit_buf_printf(cb,
+                "    { JSValue _so = js_jit_special_object(ctx,%d,argc,argv);\n"
+                "      if(JS_IsException(_so)) goto _ex;\n"
+                "      _tsv%d=_so; _sp=%d; }\n",
+                _kind, d, d+1);
             break;
         }
 
@@ -4674,6 +4691,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_iterator_get_value_done: _gs_push=JIT_T_JSVAL; break; /* +1 */
             case OP_iterator_next:    break;                          /* 0 */
             case OP_iterator_call:    _gs_push=JIT_T_JSVAL; break;   /* +1 */
+            case OP_special_object:   _gs_push=JIT_T_JSVAL; break;   /* +1 */
 
             /* --- P16: delete / delete_var → bool (JSVAL) --- */
             case OP_delete:     _gs_drop=2; _gs_push=JIT_T_JSVAL; break;

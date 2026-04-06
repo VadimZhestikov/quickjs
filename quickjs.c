@@ -332,11 +332,13 @@ typedef struct JSStackFrame {
     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
     JSValue *arg_buf; /* arguments */
     JSValue *var_buf; /* variables */
-    struct JSVarRef **var_refs; /* references to arguments or local variables */ 
+    struct JSVarRef **var_refs; /* references to arguments or local variables */
     const uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                         instruction after the call */
     int arg_count;
     int js_mode; /* not supported for C functions */
+    JSValue new_target; /* new.target value: JS_UNDEFINED for normal calls,
+                           else the constructor function (for OP_special_object) */
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -17424,6 +17426,7 @@ int js_jit_iterator_call(JSContext *ctx,
     *pret_flag = ret_flag;
     return 0;
 }
+
 #endif /* CONFIG_JIT */
 
 static BOOL js_is_fast_array(JSContext *ctx, JSValueConst obj)
@@ -18375,6 +18378,42 @@ typedef enum {
     OP_SPECIAL_OBJECT_IMPORT_META,
 } OPSpecialObjectEnum;
 
+#ifdef CONFIG_JIT
+/* js_jit_special_object — JIT handler for OP_special_object.
+ * Uses ctx->rt->current_stack_frame (set by JS_CallInternal before the JIT call).
+ * new_target is stored in sf->new_target by JS_CallInternal. */
+JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSObject *p;
+
+    switch ((OPSpecialObjectEnum)kind) {
+    case OP_SPECIAL_OBJECT_ARGUMENTS:
+        return js_build_arguments(ctx, argc, (JSValueConst *)argv);
+    case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
+        /* Non-strict mapped arguments: ideally would alias parameters, but the
+         * JIT copies captured args into shadow buffers, breaking the aliasing
+         * invariant.  Use the simple (unmapped) builder — a known JIT limitation. */
+        return js_build_arguments(ctx, argc, (JSValueConst *)argv);
+    case OP_SPECIAL_OBJECT_THIS_FUNC:
+        return JS_DupValue(ctx, sf->cur_func);
+    case OP_SPECIAL_OBJECT_NEW_TARGET:
+        return JS_DupValue(ctx, sf->new_target);
+    case OP_SPECIAL_OBJECT_HOME_OBJECT:
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (p->u.func.home_object)
+            return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object));
+        return JS_UNDEFINED;
+    case OP_SPECIAL_OBJECT_VAR_OBJECT:
+        return JS_NewObjectProto(ctx, JS_NULL);
+    case OP_SPECIAL_OBJECT_IMPORT_META:
+        return js_import_meta(ctx);
+    default:
+        abort();
+    }
+}
+#endif /* CONFIG_JIT */
+
 #define FUNC_RET_AWAIT         0
 #define FUNC_RET_YIELD         1
 #define FUNC_RET_YIELD_STAR    2
@@ -18501,6 +18540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sp = stack_buf;
     pc = b->byte_code_buf;
     sf->prev_frame = rt->current_stack_frame;
+    sf->new_target = (JSValue)new_target; /* P15: stored for OP_special_object in JIT */
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 

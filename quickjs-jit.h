@@ -278,6 +278,7 @@ int            js_jit_poll_interrupts(JSContext *ctx);
 JSValue        js_jit_call(JSContext *, JSValue func, JSValue this_val,
                             int argc, JSValue *argv);
 /* P15: iterator helpers */
+JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv);
 int js_jit_for_in_start(JSContext *ctx, JSValue *pobj);
 int js_jit_for_in_next(JSContext *ctx, JSValue iter,
                        JSValue *pkey, JSValue *pdone);
