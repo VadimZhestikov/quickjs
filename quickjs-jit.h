@@ -484,6 +484,10 @@ typedef struct {
                        * slot will differ, preventing false IC hits. */
     uint8_t   kind;   /* 0=general, 1=float64 typed slot (P8.6) */
     uint8_t   _pad[3];
+    void     *rt;     /* JSRuntime* — cross-runtime ABA guard: static IC entries
+                       * in disk-cached .so files persist across runtimes; checking
+                       * that ic->rt matches the current runtime prevents false hits
+                       * when a new runtime reuses the same shape pointer address. */
 } JSJITICEntry;
 
 /*
@@ -542,14 +546,23 @@ typedef struct {
 #define JIT_BC_BCHASH_OFF         128  /* JSFunctionBytecode.jit_bc_hash (uint64_t) */
 
 /*
- * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard.
+ * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard + runtime-guard.
  * Equivalent to js_jit_ic_check() but expands inline in JIT-generated code
  * so the compiler can see the body and optimize across the IC boundary.
  *
  * Safety: obj and ic must be simple lvalues (evaluated at most twice).
+ *
+ * Runtime guard (ic->rt == ctx->rt): static JSJITICEntry variables in
+ * disk-cached .so files persist their shape/slot/atom across dlopen
+ * invocations.  When a new JSRuntime is created (next test in run-test262),
+ * freed shape memory may be reused at the same address by the new runtime
+ * (ABA problem).  Checking that the cached runtime matches the current one
+ * guarantees a miss on the first call in a new runtime, forcing a refill.
+ * Relies on 'ctx' being in scope (always true in JIT-generated functions).
  */
 #define JIT_IC_CHECK(obj, ic) \
-    ((ic)->shape != NULL && \
+    ((ic)->rt != NULL && \
+     (ic)->rt == (ctx)->rt && \
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
@@ -776,6 +789,17 @@ void js_jit_compile_all(JSContext *ctx, JSFunctionBytecode *b);
  * execution begins.
  */
 void js_jit_drain(void);
+
+/*
+ * js_jit_install_results() — install compiled GCC results into live bytecodes.
+ * Must be called from the main thread after js_jit_drain() has returned.
+ * For each completed GCC job the function looks up the matching live bytecode
+ * via the session map and installs jit_func; bytecodes that were freed during
+ * execution (and removed from the session map by js_jit_free_bytecode) are
+ * skipped — their compiled handle is dlclose()'d to avoid a leak.
+ * Also clears the per-test session map so its pointers don't become stale.
+ */
+void js_jit_install_results(void);
 
 /*
  * js_jit_set_aot_mode() / js_jit_get_aot_mode() — global flag that tells
