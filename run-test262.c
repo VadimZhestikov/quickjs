@@ -38,6 +38,9 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs-libc.h"
+#ifdef CONFIG_JIT
+#include "quickjs-jit.h"
+#endif
 
 /* enable test262 thread support to test SharedArrayBuffer and Atomics */
 #define CONFIG_AGENT
@@ -2050,6 +2053,9 @@ void help(void)
            "-u             update error file\n"
            "-v             verbose: output error messages\n"
            "-T duration    display tests taking more than 'duration' ms\n"
+#ifdef CONFIG_JIT
+           "--jit-threshold-gcc=N  set JIT compilation threshold (default=100; 0=AOT)\n"
+#endif
            "-c file        read configuration from 'file'\n"
            "-d dir         run all test files in directory tree 'dir'\n"
            "-e file        load the known errors from 'file'\n"
@@ -2146,6 +2152,10 @@ int main(int argc, char **argv)
             is_module = TRUE;
         } else if (str_equal(arg, "--count_skipped_features")) {
             count_skipped_features = TRUE;
+#ifdef CONFIG_JIT
+        } else if (has_prefix(arg, "--jit-threshold-gcc=")) {
+            js_jit_set_threshold(atoi(skip_prefix(arg, "--jit-threshold-gcc=")));
+#endif
         } else {
             fatal(1, "unknown option: %s", arg);
             break;
