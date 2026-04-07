@@ -1650,8 +1650,11 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
 
     /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install.
-     * Must happen before any early return so jit_find_bytecode_by_hash works. */
-    jit_link_record(bc_hash, b);
+     * Skip in AOT mode (combined.so already loaded): bytecodes are per-test and
+     * become stale after JS_FreeRuntime(); recording them would leave dangling
+     * pointers in jit_link_bytecodes[] that corrupt jit_find_bytecode_by_hash. */
+    if (!jit_combined_handle)
+        jit_link_record(bc_hash, b);
 
     /* Skip marker: function had an unsupported opcode in a previous run.
      * Avoids re-running code generation and printing noisy messages. */

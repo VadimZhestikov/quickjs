@@ -1275,8 +1275,11 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         if (!JS_IsException(compiled)) {
             if (JS_VALUE_GET_TAG(compiled) == JS_TAG_FUNCTION_BYTECODE)
                 js_jit_compile_all(ctx, JS_VALUE_GET_PTR(compiled));
-            js_jit_drain();
-            js_jit_install_combined_if_exists();
+            /* js_jit_compile_all already installed from combined.so via
+             * js_jit_queue_gcc's manifest fast-path; no extra install needed.
+             * Do NOT call js_jit_install_combined_if_exists() here — it uses
+             * jit_link_bytecodes[] which accumulates stale pointers from
+             * previous tests in the same run, causing GC corruption. */
             res_val = JS_EvalFunction(ctx, compiled);
         } else {
             res_val = compiled;
