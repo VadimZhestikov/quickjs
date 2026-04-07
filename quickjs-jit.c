@@ -1543,6 +1543,14 @@ static void *jit_worker_thread(void *arg)
     return NULL;
 }
 
+/* Runtime override for JIT_THRESHOLD_GCC (set via --jit-threshold-gcc=N).
+ * 0 = compile all static functions before first execution (AOT pre-pass).
+ * N >= 1 = compile after N calls (default: JIT_THRESHOLD_GCC = 100). */
+static int jit_threshold_gcc = JIT_THRESHOLD_GCC;
+
+void js_jit_set_threshold(int n) { jit_threshold_gcc = n; }
+int  js_jit_get_threshold(void)  { return jit_threshold_gcc; }
+
 void js_jit_init(void)
 {
     if (jit_worker.started) {

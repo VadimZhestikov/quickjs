@@ -19442,7 +19442,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          * case GCC finished and installed the pointer since last call. */
         if (!b->jit_no_compile) {
             int cnt = js_jit_fb_inc_count(b);
-            if (unlikely(cnt == JIT_THRESHOLD_GCC)) {
+            int thr = js_jit_get_threshold();
+            if (unlikely(thr >= 1 && cnt == thr)) {
                 js_jit_queue_gcc(caller_ctx, b, var_refs);
             }
         }

@@ -786,6 +786,15 @@ void js_jit_set_aot_mode(int active);
 int  js_jit_get_aot_mode(void);
 
 /*
+ * js_jit_set_threshold() / js_jit_get_threshold() — runtime override for the
+ * JIT_THRESHOLD_GCC compile-time constant.  Set by --jit-threshold-gcc=N.
+ * N=0: compile all static functions before first execution (AOT pre-pass).
+ * N>=1: compile after N calls (default JIT_THRESHOLD_GCC, typically 100).
+ */
+void js_jit_set_threshold(int n);
+int  js_jit_get_threshold(void);
+
+/*
  * js_jit_set_dump_c_mode() — when active, print generated C to stdout
  * for each JIT-compiled function.  Set by --jit-dump-c.
  */

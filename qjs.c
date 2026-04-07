@@ -49,9 +49,10 @@
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
 
-static int jit_aot_mode     = 0; /* set by --jit-aot     */
-static int jit_warmup_mode  = 0; /* set by --jit-warmup  */
-static int jit_link_mode    = 0; /* set by --jit-link    */
+static int jit_aot_mode         = 0; /* set by --jit-aot     */
+static int jit_warmup_mode      = 0; /* set by --jit-warmup  */
+static int jit_link_mode        = 0; /* set by --jit-link    */
+static int jit_threshold_mode   = 0; /* set by --jit-threshold-gcc=N (N=0: AOT pre-pass) */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -78,7 +79,7 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
             val = JS_EvalFunction(ctx, val);
         }
         val = js_std_await(ctx, val);
-    } else if (jit_aot_mode || jit_warmup_mode) {
+    } else if (jit_aot_mode || jit_warmup_mode || jit_threshold_mode) {
 #ifdef CONFIG_JIT
         /* Compile-only pass to gather all functions, then GCC-compile them */
         val = JS_Eval(ctx, buf, buf_len, filename,
@@ -356,6 +357,7 @@ void help(void)
            "    --jit-warmup   compile all functions into cache, then exit\n"
            "    --jit-link     combine cached .c files into one LTO .so after running\n"
            "    --jit-dump-c   print generated C source for each compiled function\n"
+           "    --jit-threshold-gcc=N  compile after N calls (0=AOT pre-pass, default=100)\n"
 #endif
            );
     exit(1);
@@ -511,6 +513,13 @@ int main(int argc, char **argv)
             }
             if (!strcmp(longopt, "jit-dump-c")) {
                 js_jit_set_dump_c_mode(1);
+                continue;
+            }
+            if (!strncmp(longopt, "jit-threshold-gcc=", 18)) {
+                int n = atoi(longopt + 18);
+                js_jit_set_threshold(n);
+                if (n == 0)
+                    jit_threshold_mode = 1; /* trigger AOT pre-pass */
                 continue;
             }
 #endif
