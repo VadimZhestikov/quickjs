@@ -1829,8 +1829,22 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         return;
     }
 
-    /* Phase 7.4: cache hit — load pre-compiled .so without running GCC */
-    char *cache_path = jit_cache_get(bc_hash);
+    /* Phase 7.4: cache hit — load pre-compiled .so without running GCC.
+     *
+     * Guard: run the scan first to confirm this function is eligible.
+     * bc_hash is computed from raw bytecode bytes only; two functions can share
+     * a hash if they have identical opcodes but different closure-variable
+     * metadata (e.g. one inner OP_fclosure8 captures a LOCAL, another captures
+     * a GLOBAL).  Installing a .so compiled for function A into function B would
+     * corrupt the JIT code (unhandled closure types leave _vr_PC[] uninitialised,
+     * producing NULL var_refs entries that crash on OP_get_var). */
+    int _cache_eligible = 0;
+    {
+        JSJITScanResult _sr_check;
+        if (js_jit_scan(b, &_sr_check) == 0) _cache_eligible = 1;
+        scan_result_free(&_sr_check);
+    }
+    char *cache_path = _cache_eligible ? jit_cache_get(bc_hash) : NULL;
     if (cache_path) {
         char fname[64];
         snprintf(fname, sizeof(fname), "__jit_f_%016llx",
