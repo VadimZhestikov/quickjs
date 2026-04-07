@@ -1661,6 +1661,13 @@ int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
 #ifdef CONFIG_AGENT
     js_agent_free(ctx);
 #endif
+#ifdef CONFIG_JIT
+    /* Drain background GCC jobs, then install any completed results into live
+     * bytecodes (skipping those freed during execution) and clear the session
+     * map before the runtime is freed so pointers don't become stale. */
+    js_jit_drain();
+    js_jit_install_results();
+#endif
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 

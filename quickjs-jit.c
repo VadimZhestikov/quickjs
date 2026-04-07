@@ -1437,6 +1437,151 @@ static void                *jit_combined_handle;    /* P10.4: dlopen handle for 
 static JSJITManifestEntry  *jit_combined_manifest;  /* P10.4: manifest array inside combined.so */
 static int                  jit_combined_count;     /* P10.4: manifest entry count */
 
+/* -----------------------------------------------------------------------
+ * Session map — per-test hash→bytecode table used to install GCC results
+ * safely without accessing potentially-freed bytecode pointers from the
+ * worker thread.
+ *
+ * The worker records (bc_hash, func_ptr, handle) in jit_pending_results
+ * instead of writing directly to job->b.  The main thread calls
+ * js_jit_install_results() after js_jit_drain() to look up live bytecodes
+ * by hash and install the compiled function.
+ *
+ * When a bytecode is freed during execution (js_jit_free_bytecode),
+ * it is removed from the session map.  Any pending result whose hash
+ * is not found in the session map means the bytecode is gone; the
+ * compiled .so handle is dlclose()'d to avoid a leak.
+ * ----------------------------------------------------------------------- */
+
+/* Per-test hash→bytecode table. Only accessed from the main thread. */
+static struct {
+    uint64_t            *hashes;
+    JSFunctionBytecode **bytecodes;
+    int count, cap;
+} jit_session_map;
+
+/* Register a bytecode in the session map when a GCC job is queued. */
+static void jit_session_add(uint64_t hash, JSFunctionBytecode *b)
+{
+    if (jit_session_map.count == jit_session_map.cap) {
+        int new_cap = jit_session_map.cap ? jit_session_map.cap * 2 : 64;
+        uint64_t *ha = realloc(jit_session_map.hashes,
+                               (size_t)new_cap * sizeof(*ha));
+        JSFunctionBytecode **ba = realloc(jit_session_map.bytecodes,
+                                          (size_t)new_cap * sizeof(*ba));
+        if (!ha || !ba) return;   /* alloc failure: entry not added */
+        jit_session_map.hashes    = ha;
+        jit_session_map.bytecodes = ba;
+        jit_session_map.cap       = new_cap;
+    }
+    jit_session_map.hashes[jit_session_map.count]    = hash;
+    jit_session_map.bytecodes[jit_session_map.count] = b;
+    jit_session_map.count++;
+}
+
+/* Called by js_jit_free_bytecode() when a bytecode is freed.
+ * Marks the session entry as dead (sets bytecode pointer to NULL).
+ * Only called from main thread (inside free_function_bytecode). */
+static void jit_session_remove(JSFunctionBytecode *b)
+{
+    for (int i = 0; i < jit_session_map.count; i++) {
+        if (jit_session_map.bytecodes[i] == b) {
+            jit_session_map.bytecodes[i] = NULL;   /* mark dead */
+            /* keep hash for deduplication; doesn't matter if bytecode freed */
+            return;
+        }
+    }
+}
+
+static JSFunctionBytecode *jit_session_lookup(uint64_t hash)
+{
+    /* Return the LAST matching live entry (most recently queued wins). */
+    for (int i = jit_session_map.count - 1; i >= 0; i--) {
+        if (jit_session_map.hashes[i] == hash &&
+            jit_session_map.bytecodes[i] != NULL)
+            return jit_session_map.bytecodes[i];
+    }
+    return NULL;
+}
+
+static void jit_session_clear(void)
+{
+    free(jit_session_map.hashes);
+    free(jit_session_map.bytecodes);
+    jit_session_map.hashes    = NULL;
+    jit_session_map.bytecodes = NULL;
+    jit_session_map.count     = 0;
+    jit_session_map.cap       = 0;
+}
+
+/* GCC results produced by the worker — consumed by js_jit_install_results(). */
+typedef struct {
+    uint64_t    bc_hash;
+    char        fname[64];
+    void       *handle;
+    JSJITFunc   func;
+} JITGCCResult;
+
+static struct {
+    pthread_mutex_t lock;
+    JITGCCResult   *items;
+    int count, cap;
+} jit_pending_results = { PTHREAD_MUTEX_INITIALIZER };
+
+static void jit_result_add(uint64_t bc_hash, const char *fname,
+                            void *handle, JSJITFunc func)
+{
+    pthread_mutex_lock(&jit_pending_results.lock);
+    if (jit_pending_results.count == jit_pending_results.cap) {
+        int new_cap = jit_pending_results.cap ? jit_pending_results.cap * 2 : 16;
+        JITGCCResult *a = realloc(jit_pending_results.items,
+                                   (size_t)new_cap * sizeof(*a));
+        if (!a) { pthread_mutex_unlock(&jit_pending_results.lock); return; }
+        jit_pending_results.items = a;
+        jit_pending_results.cap   = new_cap;
+    }
+    JITGCCResult *r = &jit_pending_results.items[jit_pending_results.count++];
+    r->bc_hash = bc_hash;
+    memcpy(r->fname, fname, sizeof(r->fname));
+    r->handle  = handle;
+    r->func    = func;
+    pthread_mutex_unlock(&jit_pending_results.lock);
+}
+
+/* Called from main thread after js_jit_drain().
+ * Installs compiled GCC results into live bytecodes; skips and dlclose()s
+ * results for bytecodes that were freed during execution.
+ * Also clears the session map so stale bytecode pointers are not reused. */
+void js_jit_install_results(void)
+{
+    /* Snapshot the results list under the lock. */
+    pthread_mutex_lock(&jit_pending_results.lock);
+    int n               = jit_pending_results.count;
+    JITGCCResult *items = jit_pending_results.items;
+    jit_pending_results.items = NULL;
+    jit_pending_results.count = 0;
+    jit_pending_results.cap   = 0;
+    pthread_mutex_unlock(&jit_pending_results.lock);
+
+    for (int i = 0; i < n; i++) {
+        JITGCCResult *r = &items[i];
+        JSFunctionBytecode *b = jit_session_lookup(r->bc_hash);
+        if (b) {
+            /* Bytecode is still alive — install the JIT function. */
+            js_jit_fb_set_bc_hash(b, r->bc_hash);
+            js_jit_fb_set_func(b, r->func, r->handle, 2);
+        } else {
+            /* Bytecode was freed during execution — discard the .so. */
+            if (r->handle)
+                dlclose(r->handle);
+        }
+    }
+    free(items);
+
+    /* Clear session map: bytecode pointers become stale after FreeRuntime. */
+    jit_session_clear();
+}
+
 void js_jit_set_link_mode(int active) { jit_link_mode = active; }
 
 /* Record hash+bytecode unconditionally (both needed for P10.4 manifest install). */
@@ -1528,11 +1673,15 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, job->fname);
     if (!f) { dlclose(handle); goto fail; }
 
-    js_jit_fb_set_bc_hash(job->b, job->bc_hash);
-    js_jit_fb_set_func(job->b, f, handle, 2);
+    /* Record the result for the main thread to install safely.
+     * The worker must NOT write to job->b: the bytecode may be freed by the
+     * main thread (local closure goes out of scope) before the job completes.
+     * js_jit_install_results() looks up the live bytecode by hash after drain. */
+    jit_result_add(job->bc_hash, job->fname, handle, f);
     return;
 fail:
-    js_jit_fb_set_no_compile(job->b);
+    jit_cache_put_skip(job->bc_hash);
+    /* job->b is NOT accessed here — the bytecode may already be freed. */
 }
 
 static void *jit_worker_thread(void *arg)
@@ -1748,6 +1897,12 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         const char *src = js_jit_fb_get_source(b, &src_len);
         jit_cache_put_js_src(bc_hash, src, src_len);
     }
+
+    /* Record hash→bytecode in the session map so js_jit_install_results()
+     * can find the live bytecode after drain without using job->b directly.
+     * If the bytecode is freed before install time, js_jit_free_bytecode()
+     * marks the entry dead (NULL) and install_results discards the result. */
+    jit_session_add(bc_hash, b);
 
     job->c_src   = cb.buf;   /* transfer buffer ownership to job */
     cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */
@@ -6945,6 +7100,10 @@ int js_jit_install_combined_if_exists(void)
 
 void js_jit_free_bytecode(JSFunctionBytecode *b)
 {
+    /* Mark this bytecode dead in the session map so js_jit_install_results()
+     * does not try to write into freed memory if a GCC result arrives later. */
+    jit_session_remove(b);
+
     uint8_t tier   = js_jit_fb_get_tier(b);
     void   *handle = js_jit_fb_get_handle(b);
 
