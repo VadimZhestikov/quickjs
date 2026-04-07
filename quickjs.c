@@ -19423,6 +19423,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue jit_ret = jf(ctx, (JSValue)this_obj, jit_argc,
                                  arg_buf, b->cpool, var_refs);
             rt->current_stack_frame = sf->prev_frame;
+            /* Close any JSVarRefs created by the interpreter inside this JIT
+             * call (e.g. js_closure2 called from js_jit_op_define_class sets
+             * sf->var_refs[i] for captured args/locals).  The interpreter's
+             * normal return path always calls close_var_refs; the JIT fast
+             * exit path must do the same, otherwise closures created inside
+             * the JIT function hold dangling pvalue pointers into the dead
+             * C stack frame. */
+            close_var_refs(rt, b, sf);
             if (unlikely(arg_allocated_size)) {
                 for (i = 0; i < arg_allocated_size; i++)
                     JS_FreeValue(ctx, arg_buf[i]);
