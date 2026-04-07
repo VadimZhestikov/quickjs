@@ -349,6 +349,7 @@ JSAtom         js_jit_fb_get_arg_atom  (JSFunctionBytecode *b, int arg_idx);
 const uint8_t *js_jit_get_opcode_size_table(int *count);
 /* Function name as a C string (static buf — for debug/logging only) */
 const char    *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b);
+const char    *js_jit_fb_get_source(JSFunctionBytecode *b, int *len_out);
 /* P8.2: function's own name atom (JS_ATOM_NULL if anonymous) */
 JSAtom         js_jit_fb_get_func_atom(JSFunctionBytecode *b);
 /* P13: inner function's cpool entry as JSFunctionBytecode* (NULL if not function) */
@@ -799,6 +800,13 @@ int  js_jit_get_threshold(void);
  * for each JIT-compiled function.  Set by --jit-dump-c.
  */
 void js_jit_set_dump_c_mode(int active);
+
+/*
+ * js_jit_set_save_sources() — when active, write the original JS source of
+ * each JIT-compiled function to <cache>/<hash>.js alongside the .c and .so.
+ * Set by --jit-save-sources.  No-op if debug info is stripped (-s flag).
+ */
+void js_jit_set_save_sources(int active);
 
 /*
  * js_jit_cache_has_c_src() — returns 1 if a .c source file exists in the

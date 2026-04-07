@@ -1399,9 +1399,26 @@ static char *jit_cache_get_c_src(uint64_t hash)
     return NULL;
 }
 
-static int  jit_dump_c_mode;  /* set by --jit-dump-c */
+/* Save JS source text to <cache>/<hash>.js (--jit-save-sources).
+ * Skipped silently if source is unavailable or cache is disabled. */
+static void jit_cache_put_js_src(uint64_t hash, const char *src, int src_len)
+{
+    if (!jit_cache_enabled || !src || src_len <= 0) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%016llx.js",
+             jit_cache_dir, (unsigned long long)hash);
+    if (access(path, F_OK) == 0) return;  /* already cached */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return;
+    write(fd, src, (size_t)src_len);
+    close(fd);
+}
 
-void js_jit_set_dump_c_mode(int active) { jit_dump_c_mode = active; }
+static int  jit_dump_c_mode;     /* set by --jit-dump-c        */
+static int  jit_save_sources;   /* set by --jit-save-sources  */
+
+void js_jit_set_dump_c_mode(int active)   { jit_dump_c_mode = active; }
+void js_jit_set_save_sources(int active)  { jit_save_sources = active; }
 
 /* =======================================================================
  * P10.2/P10.4 — hash registry for --jit-link combiner and manifest install
@@ -1721,6 +1738,13 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     if (jit_dump_c_mode)
         fprintf(stdout, "/* ==== JIT: %s [%016llx] ==== */\n%s\n",
                 js_name ? js_name : "(anon)", (unsigned long long)bc_hash, cb.buf);
+
+    /* --jit-save-sources: write the original JS source to <cache>/<hash>.js */
+    if (jit_save_sources) {
+        int src_len = 0;
+        const char *src = js_jit_fb_get_source(b, &src_len);
+        jit_cache_put_js_src(bc_hash, src, src_len);
+    }
 
     job->c_src   = cb.buf;   /* transfer buffer ownership to job */
     cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */

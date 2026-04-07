@@ -16217,6 +16217,15 @@ const char *js_jit_fb_get_func_name(JSRuntime *rt, JSFunctionBytecode *b)
     const char *s = JS_AtomGetStrRT(rt, buf, sizeof(buf), b->func_name);
     return s ? s : "<unknown>";
 }
+/* Return the JS source text for b (from debug info), or NULL if unavailable.
+ * *len_out receives the byte length (not NUL-terminated). */
+const char *js_jit_fb_get_source(JSFunctionBytecode *b, int *len_out)
+{
+    if (!b->has_debug || !b->debug.source) { *len_out = 0; return NULL; }
+    *len_out = b->debug.source_len;
+    return b->debug.source;
+}
+
 /* Opcode size table — built from quickjs-opcode.h so the JIT scan pass
  * can iterate bytecode without seeing the static opcode_info[] array.  */
 const uint8_t *js_jit_get_opcode_size_table(int *count)

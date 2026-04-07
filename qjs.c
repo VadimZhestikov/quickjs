@@ -358,6 +358,7 @@ void help(void)
            "    --jit-link     combine cached .c files into one LTO .so after running\n"
            "    --jit-dump-c   print generated C source for each compiled function\n"
            "    --jit-threshold-gcc=N  compile after N calls (0=AOT pre-pass, default=100)\n"
+           "    --jit-save-sources     save original JS source of each compiled function to cache as <hash>.js\n"
 #endif
            );
     exit(1);
@@ -513,6 +514,10 @@ int main(int argc, char **argv)
             }
             if (!strcmp(longopt, "jit-dump-c")) {
                 js_jit_set_dump_c_mode(1);
+                continue;
+            }
+            if (!strcmp(longopt, "jit-save-sources")) {
+                js_jit_set_save_sources(1);
                 continue;
             }
             if (!strncmp(longopt, "jit-threshold-gcc=", 18)) {
