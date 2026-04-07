@@ -61,7 +61,7 @@ calls transparently invoke the native version.
 | `quickjs.c` | Bytecode interpreter; JIT hot-path probe (§18055); IC helpers |
 | `quickjs-jit.c` | Code generator, cache manager, GCC driver, IC check macro |
 | `quickjs-jit.h` | Public JIT API; `JSJITICEntry`; `JIT_IC_CHECK` macro |
-| `qjs.c` | CLI wiring for `--jit-aot`, `--jit-warmup`, `--jit-link`, `--jit-dump-c`, `--jit-threshold-gcc` |
+| `qjs.c` | CLI wiring for `--jit-aot`, `--jit-warmup`, `--jit-link`, `--jit-dump-c`, `--jit-threshold-gcc`, `--jit-save-sources` |
 | `quickjs-libc.c` | `js_loadScript` AOT hook: installs combined.so for `load()`'d files |
 
 ### 2.2 Hot-path probe
@@ -223,6 +223,32 @@ constant (default 100).  No rebuild required.
 The threshold is stored in `jit_threshold_gcc` (in `quickjs-jit.c`), accessed via
 `js_jit_get_threshold()` / `js_jit_set_threshold()`.
 
+### `--jit-save-sources`
+
+**Save original JS source alongside compiled artifacts.**  For each JIT-compiled
+function, writes the original JavaScript source text to `<cache>/<hash>.js`
+next to the existing `<hash>.c` and `<hash>.so`.
+
+```sh
+./qjs --jit-save-sources script.js
+ls ~/.cache/qjs-jit/
+# 05230537aa4ad0b0.js   ← original JS source of the function
+# 05230537aa4ad0b0.c    ← generated C source
+# 05230537aa4ad0b0.so   ← compiled native library
+```
+
+Source text comes from `b->debug.source` (set by the parser).  **No-op if the
+script is run with `-s` / `--strip-source`** — stripped bytecode has no debug info.
+Files that already exist in the cache are not overwritten.
+
+Useful for:
+- **Debugging** — immediately see which JS function produced a given `.so` without
+  searching the original script.
+- **Self-documenting cache** — the cache directory becomes a complete record of
+  what was compiled and what native code it produced.
+- **Tooling** — scripts correlating hash → function name → source can read `.js`
+  directly instead of parsing the `/* JS function: name */` comment in `.c`.
+
 ---
 
 ## 5. Execution Modes
@@ -290,6 +316,7 @@ QJS_JIT_CACHE=/path/to/dir ./qjs ...
 
 | Pattern | Description |
 |---|---|
+| `<hash>.js` | Original JS source of the function (only with `--jit-save-sources`) |
 | `<hash>.c` | Generated C source for the function |
 | `<hash>.so` | Individually compiled shared object |
 | `<hash>.skip` | Empty marker: function has unsupported opcodes; skip permanently |
@@ -701,8 +728,8 @@ ls ~/.cache/qjs-jit/*.skip
 ```
 
 Each `.skip` file corresponds to a function whose code generation failed.  The file
-name is the hash; cross-reference with `--jit-dump-c` output to find the function
-name.
+name is the hash; cross-reference with `--jit-dump-c` output or the corresponding
+`<hash>.js` file (if `--jit-save-sources` was active) to find the function.
 
 ### 13.3 Count installed functions
 

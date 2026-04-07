@@ -49,6 +49,7 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 33: has_simple_parameter_list=false — rest params, default params, destructuring params; GEN_GET/PUT/SET_ARG made unconditional for complex params; jit_argc passes original argc for OP_rest; COPY_ARGV buffer overread fixed for spread/apply calls |
 | [MANUAL.md](MANUAL.md) | Fix: close_var_refs missing from JIT exit path — js_closure2 (called from define_class inside JIT) creates JSVarRefs attached to sf; without close_var_refs on JIT return, closures held dangling pvalue pointers; crashes on 2nd cached run |
 | [MANUAL.md](MANUAL.md) | Feature: --jit-threshold-gcc=N — runtime override for JIT_THRESHOLD_GCC; N=0 triggers AOT pre-pass (compile_all+drain) before execution; N>=1 sets call-count threshold |
+| [MANUAL.md](MANUAL.md) | Feature: --jit-save-sources — writes original JS source of each JIT-compiled function to <hash>.js in cache; self-documenting cache, useful for debugging and tooling |
 
 ---
 
@@ -598,6 +599,10 @@ rebuild using `--jit-threshold-gcc=N`.
 ./qjs --jit-threshold-gcc=1  script.js   # JIT from the very first call
 ./qjs --jit-threshold-gcc=10 script.js   # faster warm-up for short scripts
 ./qjs --jit-threshold-gcc=0  script.js   # AOT pre-pass then continue (like --jit-aot)
+
+# Inspect / debug:
+./qjs --jit-save-sources script.js   # save original JS source as <hash>.js in cache
+./qjs --jit-dump-c       script.js   # print generated C source to stdout
 
 # Recommended AOT workflow (Phase 10, fully implemented):
 ./qjs --jit-warmup        script.js   # Step 1: warm all functions, write .so + .c to cache

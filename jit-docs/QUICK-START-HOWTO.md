@@ -47,7 +47,9 @@ cache and skip recompilation.
 To watch what the JIT is doing:
 
 ```sh
-./qjs --jit-dump-c my_script.js 2>/dev/null | head -60   # print generated C
+./qjs --jit-dump-c       my_script.js 2>/dev/null | head -60  # print generated C
+./qjs --jit-save-sources my_script.js                         # save <hash>.js per function
+ls ~/.cache/qjs-jit/*.js                                      # see which functions were compiled
 ```
 
 ---
@@ -155,7 +157,7 @@ cd jit_perf_tests/v8bench
 
 | Variable | Default | Description |
 |---|---|---|
-| `QJS_JIT_CACHE` | `~/.cache/qjs-jit` | Cache directory for `.so`, `.c`, `.skip` files |
+| `QJS_JIT_CACHE` | `~/.cache/qjs-jit` | Cache directory for `.so`, `.c`, `.js`, `.skip` files |
 
 ---
 
