@@ -47,6 +47,8 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 31: need_home_object — class methods with super.prop/super.method(); eligibility check removed, already handled via js_jit_special_object HOME_OBJECT |
 | [phase18-todo.md](phase18-todo.md) | Phase 32: is_derived_ctor — derived class constructors; fixed jit_rt_call_constructor to forward new_target via JS_CallConstructor2; +19% v8bench score |
 | [phase18-todo.md](phase18-todo.md) | Phase 33: has_simple_parameter_list=false — rest params, default params, destructuring params; GEN_GET/PUT/SET_ARG made unconditional for complex params; jit_argc passes original argc for OP_rest; COPY_ARGV buffer overread fixed for spread/apply calls |
+| [MANUAL.md](MANUAL.md) | Fix: close_var_refs missing from JIT exit path — js_closure2 (called from define_class inside JIT) creates JSVarRefs attached to sf; without close_var_refs on JIT return, closures held dangling pvalue pointers; crashes on 2nd cached run |
+| [MANUAL.md](MANUAL.md) | Feature: --jit-threshold-gcc=N — runtime override for JIT_THRESHOLD_GCC; N=0 triggers AOT pre-pass (compile_all+drain) before execution; N>=1 sets call-count threshold |
 
 ---
 
@@ -578,12 +580,12 @@ P10.3 is what enables GCC to produce tight XMM loops for float-heavy benchmarks
 
 ```sh
 make CONFIG_JIT=y qjs                      # JIT with default threshold (100)
-make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs  # threshold=2 (benchmark mode)
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs  # compile-time threshold=2 (benchmark mode)
 ```
 
-`JIT_THRESHOLD_GCC` controls how many calls before GCC compilation is queued.
-Lower = JIT fires sooner (useful for benchmarks); higher = only truly hot functions
-are compiled (good for startup-sensitive workloads).
+`JIT_THRESHOLD_GCC` sets the compile-time default for how many calls before GCC
+compilation is queued.  The threshold can also be overridden at runtime without a
+rebuild using `--jit-threshold-gcc=N`.
 
 ## CLI flags
 
@@ -591,6 +593,11 @@ are compiled (good for startup-sensitive workloads).
 ./qjs              script.js   # normal: JIT triggers at threshold during execution
 ./qjs --jit-warmup script.js   # compile all functions → cache, then exit   (Phase 7)
 ./qjs --jit-aot    script.js   # compile all functions → cache (or hit), then execute (Phase 7)
+
+# Runtime threshold override (no rebuild required):
+./qjs --jit-threshold-gcc=1  script.js   # JIT from the very first call
+./qjs --jit-threshold-gcc=10 script.js   # faster warm-up for short scripts
+./qjs --jit-threshold-gcc=0  script.js   # AOT pre-pass then continue (like --jit-aot)
 
 # Recommended AOT workflow (Phase 10, fully implemented):
 ./qjs --jit-warmup        script.js   # Step 1: warm all functions, write .so + .c to cache

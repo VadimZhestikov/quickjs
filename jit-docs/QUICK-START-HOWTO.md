@@ -24,6 +24,14 @@ To change the threshold at build time:
 make CONFIG_JIT=y JIT_THRESHOLD_GCC=50
 ```
 
+Or override it at runtime without rebuilding:
+
+```sh
+./qjs --jit-threshold-gcc=10 my_script.js   # compile after 10 calls
+./qjs --jit-threshold-gcc=1  my_script.js   # compile on first call
+./qjs --jit-threshold-gcc=0  my_script.js   # AOT pre-pass before execution
+```
+
 ---
 
 ## Step 2 — Run a script (on-demand JIT)

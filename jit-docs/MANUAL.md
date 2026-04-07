@@ -61,7 +61,7 @@ calls transparently invoke the native version.
 | `quickjs.c` | Bytecode interpreter; JIT hot-path probe (§18055); IC helpers |
 | `quickjs-jit.c` | Code generator, cache manager, GCC driver, IC check macro |
 | `quickjs-jit.h` | Public JIT API; `JSJITICEntry`; `JIT_IC_CHECK` macro |
-| `qjs.c` | CLI wiring for `--jit-aot`, `--jit-warmup`, `--jit-link`, `--jit-dump-c` |
+| `qjs.c` | CLI wiring for `--jit-aot`, `--jit-warmup`, `--jit-link`, `--jit-dump-c`, `--jit-threshold-gcc` |
 | `quickjs-libc.c` | `js_loadScript` AOT hook: installs combined.so for `load()`'d files |
 
 ### 2.2 Hot-path probe
@@ -74,7 +74,8 @@ if (unlikely(jf != NULL)) {
     return jf(ctx, this_obj, argc, argv, b->cpool, var_refs);
 }
 if (!b->jit_no_compile) {
-    if (++b->jit_call_count == JIT_THRESHOLD_GCC)
+    int thr = js_jit_get_threshold();  /* runtime override via --jit-threshold-gcc */
+    if (thr >= 1 && ++b->jit_call_count == thr)
         js_jit_queue_gcc(ctx, b, var_refs);
 }
 ```
@@ -130,13 +131,14 @@ make CONFIG_JIT=y CONFIG_ASAN=y qjs   # AddressSanitizer build
 | Variable | Default | Description |
 |---|---|---|
 | `CONFIG_JIT=y` | (off) | Compile in the GCC JIT tier |
-| `JIT_THRESHOLD_GCC` | `100` | Call count before GCC compilation fires |
+| `JIT_THRESHOLD_GCC` | `100` | Default call count before GCC compilation fires (overridable at runtime with `--jit-threshold-gcc=N`) |
 | `JIT_INCLUDE_DIR` | `$(pwd)` | `-I` path for JIT-generated C files (must contain `quickjs-jit.h`) |
 
 Example — low threshold for testing:
 
 ```sh
-make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs
+make CONFIG_JIT=y JIT_THRESHOLD_GCC=2 qjs   # compile-time default
+./qjs --jit-threshold-gcc=2 script.js        # runtime override (no rebuild needed)
 ```
 
 ### 3.3 What `CONFIG_JIT=y` adds
@@ -200,6 +202,26 @@ generator to `stderr`, with a header comment:
 
 Useful for inspecting what code the generator produces and for debugging unsupported
 opcodes.
+
+### `--jit-threshold-gcc=N`
+
+**Runtime threshold override.**  Sets the number of calls before a function is
+enqueued for GCC compilation, overriding the compile-time `JIT_THRESHOLD_GCC`
+constant (default 100).  No rebuild required.
+
+| Value | Behaviour |
+|---|---|
+| `N >= 1` | Compile after N calls.  `N=1` means JIT kicks in from the second call onward. |
+| `N = 0` | AOT pre-pass: all statically-visible functions are compiled before execution starts (same as `--jit-aot` but without requiring a prior `--jit-warmup`). Dynamic closures created at runtime use the counter path with threshold disabled — they run interpreted. |
+
+```sh
+./qjs --jit-threshold-gcc=1  script.js   # JIT from first call
+./qjs --jit-threshold-gcc=10 script.js   # faster warm-up for short scripts
+./qjs --jit-threshold-gcc=0  script.js   # AOT pre-pass, then continue running
+```
+
+The threshold is stored in `jit_threshold_gcc` (in `quickjs-jit.c`), accessed via
+`js_jit_get_threshold()` / `js_jit_set_threshold()`.
 
 ---
 
@@ -750,7 +772,8 @@ it does, Richards scores ~3300 vs ~860 for the interpreter (~3.9× speedup).
   consist mostly of regexp calls gain nothing.
 - **Functions with unsupported opcodes** — they fall back to the interpreter.
 - **Short-lived functions** — a function called fewer than `JIT_THRESHOLD_GCC` times
-  never gets compiled.
+  (default 100) never gets compiled.  Use `--jit-threshold-gcc=N` with a lower N to
+  lower the bar, or `--jit-threshold-gcc=0` for an AOT pre-pass.
 - **First run after cache clear** — GCC compilation adds latency proportional to the
   number of hot functions; use `--jit-aot` to front-load this.
 

@@ -827,12 +827,12 @@ Current baseline: P11.3+P11.4 AOT median **~1063** (~2.8% of Node).
 | P11.2 Slot init | Eliminate JSValue zero-init on entry | 1 day | low | **done** | included in baseline; Splay −24% → +39% |
 | P11.3 Call IC | Monomorphic method dispatch | 2 days | medium | **done** | baseline **1063** (+12% over P11.2) |
 | P11.4 Array IC | Inline dense array element fast path | 0.5 day | low | **done** | included in baseline |
-| P11.5 Elide CHK | Remove exception checks from safe ops | 1 day | low | pending | **+8–12%** → ~1150–1190 |
-| P11.6 INT32 types | Native int32 arithmetic, no boxing | 2 days | medium | pending | **+15–25%** cumulative → ~1350–1500 |
-| P11.7 Persist IC | Warm property ICs on AOT startup | 1.5 days | medium | pending | **+5–8%** (variance ↓, floor ↑) → ~1420–1620 |
-| P11.8 get_length→INT32 | Enables P11.6 for array-bounded loops | 0.25 day | trivial | pending | feeds P11.6; standalone +2–5% |
+| P11.5 Elide CHK | Remove exception checks from safe ops | 1 day | low | **done** | ~+1% (slow-path checks dominate; fast-path already guarded) |
+| P11.6 INT32 types | Native int32 arithmetic, no boxing | 2 days | medium | **done** | +15–25% cumulative |
+| P11.7 Persist IC | Warm property ICs on AOT startup | 1.5 days | medium | pending | **+5–8%** (variance ↓, floor ↑) |
+| P11.8 get_length→INT32 | Enables P11.6 for array-bounded loops | 0.25 day | trivial | **done** | feeds P11.6; standalone +2–5% |
 | P11.9 OSR | JIT activates for top-level loops | 5 days | high | pending | **+5–8%** V8bench; larger on real workloads |
-| P11.10 Speculative | Guard-based type specialization + deopt | 10+ days | very high | pending | **+150–300%** → ~3000–5000 |
+| P11.10 Speculative | Guard-based type specialization + deopt | 10+ days | very high | not feasible in C-as-IR (see investigation note below) | **+150–300%** theoretical |
 | **P11.5–P11.8 total** | | **~4.75 days** | | | **~1400–1650** score |
 | **All P11 total** | | **~21 days** | | | **~3000–5000** score (~8–13% of Node) |
 
@@ -890,6 +890,34 @@ code (e.g., `int32_t a = argv[0]` after a tag check), with a `_deopt:` path back
 the interpreter on type mismatch.  V8/JSC/SM get their 10–50× gains entirely from this.
 Even a conservative implementation covering INT32 and FLOAT64 would close 5–10× of
 the current gap with Node.
+
+---
+
+## P11.10 Speculative — Feasibility Note (C-as-IR)
+
+**Conclusion: not feasible as originally envisioned in the C-as-IR architecture.**
+
+True speculation+deoptimization requires maintaining a live mapping from
+**bytecode PC → native code location** so mid-execution bail-back to the
+interpreter is possible at any point.  GCC destroys this mapping — it reorders,
+merges, and eliminates C statements.  The only viable deopt in C-as-IR is a
+**function-boundary bail** (`return js_jit_deopt(...)`), which requires eager
+guards at every operation, boxing all typed locals on deopt, and restarting
+`JS_CallInternal` from the saved PC.
+
+**Practical alternatives in C-as-IR:**
+
+| Approach | Effort | Gain |
+|---|---|---|
+| Type-specialized function variants (profile-guided, 2–3 monomorphic .so variants per function) | ~3–4 days | +30–50% |
+| Inline type guards without deopt (extend existing INT32 fast-paths to more sites) | ~2–3 days | +5–15% |
+| P11.7 Persist IC state across warmup/AOT | ~1.5 days | +5–8% |
+| P11.9 OSR for top-level loops | ~5 days | +5–8% V8bench |
+
+Full P11.10 as designed would require rewriting the JIT execution model to maintain
+bytecode↔code correspondence — at that point the C-as-IR approach is no longer the
+right foundation.  Recommended: implement P11.7 + P11.9 + type-specialized variants
+for a realistic +40–70% gain over the current baseline.
 
 ---
 
