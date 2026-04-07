@@ -2308,5 +2308,8 @@ int main(int argc, char **argv)
     free(error_file);
 
     /* Signal that the error file is out of date. */
+#ifdef CONFIG_JIT
+    js_jit_drain(); /* wait for any background GCC compilations to finish */
+#endif
     return new_errors || changed_errors || fixed_errors;
 }
