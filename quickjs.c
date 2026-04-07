@@ -16043,11 +16043,31 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                 {
                     int n = b->arg_count;
                     if (n == 0) {
-                        /* Variadic: pass actual args; callee DUPs them via
-                         * js_build_arguments, never _FREE()s argv directly. */
+                        /* Variadic (arg_count=0): pass actual args; callee DUPs
+                         * them via js_build_arguments, never _FREE()s argv. */
                         ret = jf(ctx, this_val, argc, argv,
                                  b->cpool, p->u.func.var_refs);
+                    } else if (!b->has_simple_parameter_list) {
+                        /* P33: complex params (rest/defaults/destructuring).
+                         * Must pass REAL argc so OP_rest sees extras beyond
+                         * b->arg_count, and GEN_GET_ARG correctly detects
+                         * "not supplied" args for default-value checks.
+                         * Allocate max(argc, n) slots: named slots need
+                         * to be writable (GEN_PUT_ARG), extra rest slots
+                         * need to survive until OP_rest consumes them. */
+                        int total = argc > n ? argc : n;
+                        JSValue *padded = alloca(sizeof(JSValue) * total);
+                        int i;
+                        for (i = 0; i < argc; i++)
+                            padded[i] = JS_DupValue(ctx, argv[i]);
+                        for (; i < total; i++)
+                            padded[i] = JS_UNDEFINED;
+                        ret = jf(ctx, this_val, argc, padded,
+                                 b->cpool, p->u.func.var_refs);
+                        for (i = 0; i < total; i++)
+                            JS_FreeValue(ctx, padded[i]);
                     } else {
+                        /* Simple params: pad argv to exactly n slots. */
                         JSValue *padded = alloca(sizeof(JSValue) * n);
                         int i;
                         for (i = 0; i < argc && i < n; i++)
@@ -16101,14 +16121,25 @@ JSValue js_jit_ic_direct_call(
 
     int n = ic->callee_arg_count;
     JSValue ret;
-    /* Variadic callee (arg_count == 0): pass actual args directly.
-     * The callee accesses them only via js_build_arguments (which DUPs),
-     * never _FREE()s argv entries, so no private copy is needed. */
     if (n == 0) {
+        /* Variadic callee (arg_count == 0): pass actual args directly. */
         ret = ic->direct_jit(ctx, this_val, nargs, argv,
                              ic->callee_cpool, var_refs);
+    } else if (!ic->expected_bc->has_simple_parameter_list) {
+        /* P33: complex params — pass real nargs and all args. */
+        int total = nargs > n ? nargs : n;
+        JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * total);
+        int i;
+        for (i = 0; i < nargs; i++)
+            padded[i] = JS_DupValue(ctx, argv[i]);
+        for (; i < total; i++)
+            padded[i] = JS_UNDEFINED;
+        ret = ic->direct_jit(ctx, this_val, nargs, padded,
+                             ic->callee_cpool, var_refs);
+        for (i = 0; i < total; i++)
+            JS_FreeValue(ctx, padded[i]);
     } else {
-        /* alloca is safe here: arg counts are small (< 64 typically) */
+        /* Simple params: pad to exactly n slots. */
         JSValue *padded = (JSValue *)alloca(sizeof(JSValue) * n);
         int i;
         for (i = 0; i < nargs && i < n; i++)
@@ -19286,6 +19317,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
+#ifdef CONFIG_JIT
+        /* P33: for complex-param JIT functions (rest/default/destructuring),
+         * arg_buf must cover ALL argc slots so that OP_rest can read
+         * argv[arg_count..argc].  JS_Call always sets COPY_ARGV, which would
+         * otherwise truncate arg_buf to just arg_count slots while the JIT
+         * still receives the original argc — causing a buffer overread.
+         * We only need the extension when argc > arg_count. */
+        if (!b->has_simple_parameter_list && argc > b->arg_count)
+            arg_allocated_size = argc;
+#endif
     } else {
         arg_allocated_size = 0;
     }
@@ -19304,13 +19345,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     local_buf = alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
-        int n = min_int(argc, b->arg_count);
+        /* Copy min(argc, arg_allocated_size) provided args, then pad to
+         * arg_allocated_size with JS_UNDEFINED.  For complex-param JIT
+         * functions (P33) arg_allocated_size may equal argc (> arg_count).
+         * For simple-param functions it always equals arg_count. */
+        int n = min_int(argc, arg_allocated_size);
         arg_buf = local_buf;
         for(i = 0; i < n; i++)
             arg_buf[i] = JS_DupValue(caller_ctx, argv[i]);
-        for(; i < b->arg_count; i++)
+        for(; i < arg_allocated_size; i++)
             arg_buf[i] = JS_UNDEFINED;
-        sf->arg_count = b->arg_count;
+        /* Simple params: override sf->arg_count so GEN_PUT_ARG checks pass
+         * for all arg slots.  Complex params: leave sf->arg_count = original
+         * argc so OP_rest computes the correct rest-element count; the JIT's
+         * GEN_GET/PUT_ARG are unconditional for complex params. */
+        if (b->has_simple_parameter_list || arg_allocated_size == b->arg_count)
+            sf->arg_count = b->arg_count;
     }
     var_buf = local_buf + arg_allocated_size;
     sf->var_buf = var_buf;
@@ -19360,7 +19410,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * the bytecode — the JIT does not track PC so we cannot give an
              * exact line, but the function name and source file appear. */
             sf->cur_pc = pc; /* pc == b->byte_code_buf at this point */
-            JSValue jit_ret = jf(ctx, (JSValue)this_obj, sf->arg_count,
+            /* P33: for complex-param functions (rest/default/destructuring)
+             * pass the ORIGINAL argc so OP_rest computes the correct count.
+             * The JIT's GEN_GET/PUT_ARG are unconditional for complex params
+             * (arg_buf is always padded to at least arg_count), so they work
+             * correctly regardless of the argc value.
+             *
+             * For simple-param functions pass sf->arg_count (= b->arg_count
+             * when argc was padded) so the argc-gated GEN_PUT_ARG checks in
+             * the JIT succeed for all named parameter slots. */
+            int jit_argc = b->has_simple_parameter_list ? sf->arg_count : argc;
+            JSValue jit_ret = jf(ctx, (JSValue)this_obj, jit_argc,
                                  arg_buf, b->cpool, var_refs);
             rt->current_stack_frame = sf->prev_frame;
             if (unlikely(arg_allocated_size)) {

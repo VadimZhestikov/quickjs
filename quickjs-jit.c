@@ -328,9 +328,9 @@ int js_jit_is_eligible(JSFunctionBytecode *b)
     /* eval() has dynamic variable scoping — incompatible with JIT */
     if (js_jit_fb_is_eval(b))
         return 0;
-    /* Complex params: destructuring, rest, default values */
-    if (!js_jit_fb_has_simple_params(b))
-        return 0;
+    /* P33: complex params (destructuring, rest, default values) — now supported.
+     * js_jit_call / js_jit_ic_direct_call pass real argc + all args for these
+     * functions so OP_rest can see extras beyond b->arg_count. */
     /* P31: need_home_object — class methods using super.prop/super.method().
      * home_object is read by OP_special_object HOME_OBJECT via js_jit_special_object
      * which reads ctx->rt->current_stack_frame->cur_func->u.func.home_object.
@@ -2229,6 +2229,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     int catch_ph_d[32];  /* stack depths of live catch placeholders */
     int catch_ph_n = 0;  /* number of entries in catch_ph_d */
 
+    /* P33: flag for complex-param functions (rest/default/destructuring args).
+     * GEN_GET/PUT/SET_ARG must be unconditional for these because:
+     *  - arg_buf is always padded to arg_count by the caller
+     *  - OP_rest needs the ORIGINAL argc (not the padded arg_count)
+     *  - so we pass original argc to the JIT, and bypass the argc-bound check
+     *    in arg access since all slots 0..arg_count-1 are always valid. */
+    const int _has_complex_params = (b && !js_jit_fb_has_simple_params(b));
+
     /* P9.2: per-PC stack depth table (from compute_stack_size pass). */
     const uint16_t *sdt = js_jit_fb_get_stack_depth_tab(b);
 
@@ -3017,21 +3025,40 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * GEN_PUT/SET_ARG: keep _ai[i] and _aim consistent on arg writes. */
 /* P9.2: arg access macros use _tsv{d} for push, _tsv{d-1} for pop/peek. */
 #define _AI_VALID(idx) ((idx) < 32)
+/* P33 note: for complex-param functions (_has_complex_params), arg_buf is
+ * always padded to arg_count by the caller and the JIT receives the ORIGINAL
+ * argc (not the padded count).  All arg slots 0..arg_count-1 are therefore
+ * valid to read/write unconditionally — the argc-bound checks would give wrong
+ * results for rest/default slots beyond the original argc.
+ * For simple-param functions the argc check is still correct. */
 #define GEN_GET_ARG(idx) do { \
     if (_CAP_ARG(idx)) \
         /* Captured arg: read from shadow slot (canonical location for var refs) */ \
         jit_buf_printf(cb, \
             "    _tsv%d=_DUP(_arg_cap_buf[%d]); _sp=%d;\n", d, (idx), d+1); \
-    else if (_AI_VALID(idx)) \
-        jit_buf_printf(cb, \
-            "    _tsv%d=((%d)<argc&&(_aim>>%du&1u))" \
-            "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
-            ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
-            d, idx, (unsigned)(idx), ANAME(idx), idx, idx, d+1); \
-    else \
-        jit_buf_printf(cb, \
-            "    _tsv%d=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
-            d, idx, idx, d+1); \
+    else if (_AI_VALID(idx)) { \
+        if (_has_complex_params) \
+            /* Complex params: unconditional — arg_buf padded, argc is original */ \
+            jit_buf_printf(cb, \
+                "    _tsv%d=((_aim>>%du&1u))" \
+                "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
+                ":_DUP(argv[%d]); _sp=%d;\n", \
+                d, (unsigned)(idx), ANAME(idx), idx, d+1); \
+        else \
+            jit_buf_printf(cb, \
+                "    _tsv%d=((%d)<argc&&(_aim>>%du&1u))" \
+                "?JS_MKVAL(JS_TAG_INT,_jai_%s)" \
+                ":((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
+                d, idx, (unsigned)(idx), ANAME(idx), idx, idx, d+1); \
+    } else { \
+        if (_has_complex_params) \
+            jit_buf_printf(cb, \
+                "    _tsv%d=_DUP(argv[%d]); _sp=%d;\n", d, idx, d+1); \
+        else \
+            jit_buf_printf(cb, \
+                "    _tsv%d=((%d)<argc?_DUP(argv[%d]):JS_UNDEFINED); _sp=%d;\n", \
+                d, idx, idx, d+1); \
+    } \
 } while(0)
 #define GEN_PUT_ARG(idx) do { \
     _P94_ENSURE(d-1); \
@@ -3040,16 +3067,31 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         jit_buf_printf(cb, \
             "    { _FREE(_arg_cap_buf[%d]); _arg_cap_buf[%d]=_tsv%d; _sp=%d; }\n", \
             (idx), (idx), d-1, d-1); \
-    else if (_AI_VALID(idx)) \
-        jit_buf_printf(cb, \
-            "    if((%d)<argc){ JSValue _t=_tsv%d; _sp=%d;\n" \
-            "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
-            "      _FREE(argv[%d]);argv[%d]=_t;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
-            idx, d-1, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx, d-1, d-1); \
-    else \
-        jit_buf_printf(cb, \
-            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_tsv%d; _sp=%d;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
-            idx, idx, idx, d-1, d-1, d-1, d-1); \
+    else if (_AI_VALID(idx)) { \
+        if (_has_complex_params) \
+            /* Complex params: unconditional write (all slots always valid) */ \
+            jit_buf_printf(cb, \
+                "    { JSValue _t=_tsv%d; _sp=%d;\n" \
+                "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+                "      _FREE(argv[%d]);argv[%d]=_t; }\n", \
+                d-1, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+        else \
+            jit_buf_printf(cb, \
+                "    if((%d)<argc){ JSValue _t=_tsv%d; _sp=%d;\n" \
+                "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+                "      _FREE(argv[%d]);argv[%d]=_t;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
+                idx, d-1, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx, d-1, d-1); \
+    } else { \
+        if (_has_complex_params) \
+            /* Complex params: unconditional write */ \
+            jit_buf_printf(cb, \
+                "    { _FREE(argv[%d]); argv[%d]=_tsv%d; _sp=%d; }\n", \
+                idx, idx, d-1, d-1); \
+        else \
+            jit_buf_printf(cb, \
+                "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_tsv%d; _sp=%d;}else{ _FREE(_tsv%d); _sp=%d; }\n", \
+                idx, idx, idx, d-1, d-1, d-1, d-1); \
+    } \
 } while(0)
 #define GEN_SET_ARG(idx) do { \
     _P94_ENSURE(d-1); \
@@ -3058,16 +3100,30 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         jit_buf_printf(cb, \
             "    { _FREE(_arg_cap_buf[%d]); _arg_cap_buf[%d]=_DUP(_tsv%d); }\n", \
             (idx), (idx), d-1); \
-    else if (_AI_VALID(idx)) \
-        jit_buf_printf(cb, \
-            "    if((%d)<argc){ JSValue _t=_tsv%d;\n" \
-            "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
-            "      _FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
-            idx, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
-    else \
-        jit_buf_printf(cb, \
-            "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_tsv%d);};\n", \
-            idx, idx, idx, d-1); \
+    else if (_AI_VALID(idx)) { \
+        if (_has_complex_params) \
+            /* Complex params: unconditional */ \
+            jit_buf_printf(cb, \
+                "    { JSValue _t=_tsv%d;\n" \
+                "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+                "      _FREE(argv[%d]);argv[%d]=_DUP(_t); };\n", \
+                d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+        else \
+            jit_buf_printf(cb, \
+                "    if((%d)<argc){ JSValue _t=_tsv%d;\n" \
+                "      if(JS_VALUE_GET_TAG(_t)==JS_TAG_INT){_jai_%s=JS_VALUE_GET_INT(_t);_aim|=%uu;}else{_aim&=~%uu;}\n" \
+                "      _FREE(argv[%d]);argv[%d]=_DUP(_t);};\n", \
+                idx, d-1, ANAME(idx), 1u<<(unsigned)(idx), 1u<<(unsigned)(idx), idx, idx); \
+    } else { \
+        if (_has_complex_params) \
+            jit_buf_printf(cb, \
+                "    { _FREE(argv[%d]); argv[%d]=_DUP(_tsv%d); };\n", \
+                idx, idx, d-1); \
+        else \
+            jit_buf_printf(cb, \
+                "    if((%d)<argc){_FREE(argv[%d]); argv[%d]=_DUP(_tsv%d);};\n", \
+                idx, idx, idx, d-1); \
+    } \
 } while(0)
 
         case OP_get_arg: GEN_GET_ARG((int)bc_u16(&bc[pc+1])); break;

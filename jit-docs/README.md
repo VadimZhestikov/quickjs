@@ -46,6 +46,7 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 30: for_await_of_start/next (async iteration), with_get_var/put_var/delete_var/make_ref/get_ref (object-environment-record scope lookup with conditional PC jump) |
 | [phase18-todo.md](phase18-todo.md) | Phase 31: need_home_object — class methods with super.prop/super.method(); eligibility check removed, already handled via js_jit_special_object HOME_OBJECT |
 | [phase18-todo.md](phase18-todo.md) | Phase 32: is_derived_ctor — derived class constructors; fixed jit_rt_call_constructor to forward new_target via JS_CallConstructor2; +19% v8bench score |
+| [phase18-todo.md](phase18-todo.md) | Phase 33: has_simple_parameter_list=false — rest params, default params, destructuring params; GEN_GET/PUT/SET_ARG made unconditional for complex params; jit_argc passes original argc for OP_rest; COPY_ARGV buffer overread fixed for spread/apply calls |
 
 ---
 

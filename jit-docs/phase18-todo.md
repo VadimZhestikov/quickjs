@@ -140,6 +140,35 @@
   - v8bench score (interp/JIT): Richards 797/1139 (+43%), DeltaBlue 683/837 (+22%),
     total score 894/1060 (+19%).
 
+**P33 — DONE** (`has_simple_parameter_list = false`: rest params, default params, destructuring params).
+  - Functions with any complex parameter (rest `...args`, default `x=5`, or destructuring `{x}`)
+    have `has_simple_parameter_list = false` in the bytecode. Previously these were excluded from
+    JIT compilation via the eligibility check.
+  - **Key invariant**: `arg_count` includes the rest slot (e.g., `f(a,b,...rest)` → `arg_count=3`).
+    The interpreter always pads `arg_buf` to `arg_count` slots, so all named arg slots are
+    unconditionally accessible regardless of original `argc`.
+  - **GEN_GET_ARG / GEN_PUT_ARG / GEN_SET_ARG changes**: Added `_has_complex_params` flag
+    (true when `!js_jit_fb_has_simple_params(b)`). For complex-param functions, all three macros
+    emit unconditional argv accesses (no `argc` guard), relying on the padding guarantee.
+    Simple-param functions retain the original conditional form for safety.
+  - **`jit_argc` selection** (interpreter hot-path, `JS_CallInternal`): For simple params,
+    pass `sf->arg_count` (padded count so all named slots satisfy the argc guard). For complex
+    params, pass original `argc` so `OP_rest` computes the correct rest-element count
+    (`rest_len = argc - first_rest_idx`).
+  - **COPY_ARGV buffer overread fix**: `JS_Call` always sets `JS_CALL_FLAG_COPY_ARGV`, which
+    previously capped `arg_allocated_size = b->arg_count`. For complex-param functions called
+    with `argc > b->arg_count` (spread/apply), this caused buffer overread when `OP_rest` read
+    beyond the allocated buffer. Fix: extend `arg_allocated_size = argc` in this case so all
+    original argv slots are copied.
+  - Removed `has_simple_parameter_list` eligibility check from `js_jit_is_eligible()`.
+  - No new helpers or vtable entries needed — `OP_rest` was already implemented in P21.
+  - Tests: `tests/test_jit_p33.js` covers rest (zero, exact, only, sum, spread, apply, identity),
+    default (single, first, multiple, expression, combined with rest), destructuring (object,
+    array, with defaults, mixed), and combined scenarios (class rest method, recursive rest,
+    closure capturing rest, nested rest).
+  - v8bench score (interp/JIT): ~1066/~938 (highly variable due to background GCC compilation
+    during JIT cache warm-up; stable after cache is warm).
+
 **P30 — DONE** (for_await_of_start/next, with_get_var/put_var/delete_var/make_ref/get_ref).
 
   **for_await_of_start/next:**
