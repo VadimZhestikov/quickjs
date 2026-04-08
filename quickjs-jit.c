@@ -2544,22 +2544,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             gen_sp = (sdt != NULL) ? (int)sdt[pc] : 0;
             if (gen_sp < 0 || gen_sp > gen_stk_cap) gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
-            /* P9.3: if this PC is a while loop header, open while(1){.
-             * Do-while loops are excluded: their back-edge is a conditional
-             * branch (OP_if_true/if_false), not OP_goto, so the closer at the
-             * OP_goto case would never fire and the block would stay open. */
-            if (n_cf > 0 && p93_depth < 16) {
-                for (int _ci = 0; _ci < n_cf; _ci++) {
-                    if (cf_annots[_ci].kind == JIT_CF_WHILE_LOOP &&
-                        (uint32_t)pc == cf_annots[_ci].header_pc) {
-                        jit_buf_str(cb, "while(1) {\n");
-                        p93_active[p93_depth].header_pc = cf_annots[_ci].header_pc;
-                        p93_active[p93_depth].exit_pc   = cf_annots[_ci].exit_pc;
-                        p93_depth++;
-                        break;
-                    }
-                }
-            }
+            /* P9.3: while(1){} restructuring disabled.
+             * It is unsafe whenever a loop's back-edge is a conditional branch
+             * rather than OP_goto — the while(1) block opens but never closes.
+             * This occurs for do-while loops and any multi-exit loop where the
+             * CF annotation heuristic misclassifies the back-edge type.
+             * The optimizer correctly handles backward gotos directly. */
+            (void)p93_depth; (void)p93_active; (void)n_cf; (void)cf_annots;
         }
 
         /* P9.4: if gen_sp has drifted above d (due to pop-ops missing from gen_st),
@@ -4511,20 +4502,6 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_goto: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
-            /* P9.3: check if this is a loop back-edge or break-to-exit */
-            if (p93_depth > 0) {
-                P93Loop *_cl = &p93_active[p93_depth - 1];
-                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
-                    /* Back-edge: close while(1){ */
-                    jit_buf_str(cb, "} /* while */\n");
-                    p93_depth--;
-                    break;
-                }
-                if ((uint32_t)tgt == _cl->exit_pc) {
-                    jit_buf_str(cb, "    break;\n");
-                    break;
-                }
-            }
             /* P9.4: box typed surviving slots before goto — target label resets gen_st */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
@@ -4566,19 +4543,6 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_goto8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
-            /* P9.3: check if this is a loop back-edge or break-to-exit */
-            if (p93_depth > 0) {
-                P93Loop *_cl = &p93_active[p93_depth - 1];
-                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
-                    jit_buf_str(cb, "} /* while */\n");
-                    p93_depth--;
-                    break;
-                }
-                if ((uint32_t)tgt == _cl->exit_pc) {
-                    jit_buf_str(cb, "    break;\n");
-                    break;
-                }
-            }
             /* P9.4: box typed surviving slots before goto */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
@@ -4586,19 +4550,6 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_goto16: {
             int tgt = pc + 1 + (int)(int16_t)bc_u16(&bc[pc+1]);
-            /* P9.3: check if this is a loop back-edge or break-to-exit */
-            if (p93_depth > 0) {
-                P93Loop *_cl = &p93_active[p93_depth - 1];
-                if ((uint32_t)tgt == _cl->header_pc && tgt <= pc) {
-                    jit_buf_str(cb, "} /* while */\n");
-                    p93_depth--;
-                    break;
-                }
-                if ((uint32_t)tgt == _cl->exit_pc) {
-                    jit_buf_str(cb, "    break;\n");
-                    break;
-                }
-            }
             /* P9.4: box typed surviving slots before goto */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
