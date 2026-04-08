@@ -2043,8 +2043,16 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
     jit_buf_str(cb,
         "#include <stdint.h>\n"
         "#include <string.h>\n"
+        "#include <math.h>\n"
         "#include <quickjs.h>\n"
         "#include <quickjs-jit.h>\n"
+        /* quickjs.h undefines js_unlikely at its end (it's an internal macro
+         * not intended for embedders).  Redefine it here for generated code. */
+        "#ifdef __GNUC__\n"
+        "#define js_unlikely(x) __builtin_expect(!!(x),0)\n"
+        "#else\n"
+        "#define js_unlikely(x) (x)\n"
+        "#endif\n"
         "#define _RT  (&js_jit_rt)\n"
         /* JS_DupValue / JS_FreeValue are static inline in quickjs.h;
          * GCC will inline them entirely, eliminating vtable dispatch. */
@@ -2538,11 +2546,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             gen_sp = (sdt != NULL) ? (int)sdt[pc] : 0;
             if (gen_sp < 0 || gen_sp > gen_stk_cap) gen_sp = 0;
             jit_buf_printf(cb, "_L%d:;\n", pc);
-            /* P9.3: if this PC is a while/do-while loop header, open while(1){ */
+            /* P9.3: if this PC is a while loop header, open while(1){.
+             * Do-while loops are excluded: their back-edge is a conditional
+             * branch (OP_if_true/if_false), not OP_goto, so the closer at the
+             * OP_goto case would never fire and the block would stay open. */
             if (n_cf > 0 && p93_depth < 16) {
                 for (int _ci = 0; _ci < n_cf; _ci++) {
-                    if ((cf_annots[_ci].kind == JIT_CF_WHILE_LOOP ||
-                         cf_annots[_ci].kind == JIT_CF_DOWHILE_LOOP) &&
+                    if (cf_annots[_ci].kind == JIT_CF_WHILE_LOOP &&
                         (uint32_t)pc == cf_annots[_ci].header_pc) {
                         jit_buf_str(cb, "while(1) {\n");
                         p93_active[p93_depth].header_pc = cf_annots[_ci].header_pc;
@@ -2912,7 +2922,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "      if(!_sf_vrefs[%d]){\n"
                         "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_cap_buf[%d]);\n"
                         "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
-                        "      } else { _sf_vrefs[%d]->header.ref_count++; }\n"
+                        "      } else { js_jit_var_ref_dup(_sf_vrefs[%d]); }\n"
                         "      _vr_%d[%d]=_sf_vrefs[%d];\n",
                         vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
                 } else if (cv_type == JIT_CLOSURE_ARG) {
@@ -2921,15 +2931,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "      if(!_sf_vrefs[%d]){\n"
                         "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_arg_cap_buf[%d]);\n"
                         "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
-                        "      } else { _sf_vrefs[%d]->header.ref_count++; }\n"
+                        "      } else { js_jit_var_ref_dup(_sf_vrefs[%d]); }\n"
                         "      _vr_%d[%d]=_sf_vrefs[%d];\n",
                         vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
                 } else if (cv_type == JIT_CLOSURE_REF || cv_type == JIT_CLOSURE_GLOBAL_REF) {
                     /* Pass-through: increment ref on the existing var_ref */
                     jit_buf_printf(cb,
-                        "      var_refs[%d]->header.ref_count++;\n"
-                        "      _vr_%d[%d]=var_refs[%d];\n",
-                        cv_vidx, pc, ci, cv_vidx);
+                        "      _vr_%d[%d]=js_jit_var_ref_dup(var_refs[%d]);\n",
+                        pc, ci, cv_vidx);
                 }
                 /* other types rejected by scan */
             }
@@ -4764,6 +4773,27 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* P9.4: box any typed arg slots before building the args array */
                 for (int _aj = 0; _aj < nargs; _aj++)
                     _P94_ENSURE(d-nargs+_aj);
+                /* P10.3: emit file-scope extern declarations BEFORE the inner
+                 * { } block so they remain visible to subsequent call sites
+                 * within the same function body. */
+                if (is_jit) {
+                    int _p103_already = 0;
+                    for (int _pi = 0; _pi < p103_nexterns; _pi++)
+                        if (p103_externs[_pi] == jit_callee_hash) { _p103_already = 1; break; }
+                    if (!_p103_already && p103_nexterns < 16) {
+                        jit_buf_printf(cb,
+                            "extern JSValue __jit_f_%016llx"
+                            "(JSContext*,JSValue,int,JSValue*,JSValue*,JSVarRef**);\n",
+                            (unsigned long long)jit_callee_hash);
+                        p103_externs[p103_nexterns++] = jit_callee_hash;
+                    }
+                    if (!p103_cae_declared) {
+                        jit_buf_str(cb,
+                            "extern int js_jit_check_and_extract"
+                            "(JSValue,JSJITFunc,JSValue**,JSVarRef***);\n");
+                        p103_cae_declared = 1;
+                    }
+                }
                 jit_buf_printf(cb, "    { JSValue _f=_tsv%d;\n", fslot);
                 /* Build args array */
                 if (nargs > 0) {
@@ -4786,23 +4816,6 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                             "      JSValue _r=%s(ctx,JS_UNDEFINED,0,NULL,cpool,var_refs);\n",
                             self_jit_sym);
                 } else if (is_jit) {
-                    /* P10.3: emit extern declaration once per callee hash */
-                    int _p103_already = 0;
-                    for (int _pi = 0; _pi < p103_nexterns; _pi++)
-                        if (p103_externs[_pi] == jit_callee_hash) { _p103_already = 1; break; }
-                    if (!_p103_already && p103_nexterns < 16) {
-                        jit_buf_printf(cb,
-                            "extern JSValue __jit_f_%016llx"
-                            "(JSContext*,JSValue,int,JSValue*,JSValue*,JSVarRef**);\n",
-                            (unsigned long long)jit_callee_hash);
-                        p103_externs[p103_nexterns++] = jit_callee_hash;
-                    }
-                    if (!p103_cae_declared) {
-                        jit_buf_str(cb,
-                            "extern int js_jit_check_and_extract"
-                            "(JSValue,JSJITFunc,JSValue**,JSVarRef***);\n");
-                        p103_cae_declared = 1;
-                    }
                     jit_buf_str(cb, "      JSValue *_dc; JSVarRef **_dv; JSValue _r;\n");
                     jit_buf_printf(cb,
                         "      if(js_jit_check_and_extract(_f,(JSJITFunc)__jit_f_%016llx,&_dc,&_dv)){\n"
@@ -5192,11 +5205,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             _P94_ENSURE(d-1); /* ensure top is a boxed JSValue */
             jit_buf_printf(cb,
                 "    if(JS_IsObject(_tsv%d)) {\n"
-                "      int _r=JS_DefinePropertyValue(ctx,_tsv%d,JS_ATOM_name,"
+                "      int _r=JS_DefinePropertyValue(ctx,_tsv%d,(JSAtom)%uu,"
                 "JS_AtomToString(ctx,(JSAtom)%uu),JS_PROP_CONFIGURABLE);\n"
                 "      if(_r<0) goto _ex;\n"
                 "    }\n",
-                d-1, d-1, _atom);
+                d-1, d-1, (unsigned)JS_ATOM_name, _atom);
             break;
         }
         /* OP_define_field: obj(_tsv{d-2}) val(_tsv{d-1}) -> obj stays at _tsv{d-2}; depth d -> d-1 */
@@ -6073,7 +6086,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* Shared codegen pattern for all with_* opcodes:
          *   1. Check HasProperty + optionally @@unscopables (via _RT->with_has).
-         *   2. If found: perform per-opcode action, then goto _Lpc_TARGET.
+         *   2. If found: perform per-opcode action, then goto _L<TARGET>.
          *   3. If not found: pop obj, fall through.
          *
          * Bytecode format: op(1) atom(4) diff(4) is_with(1) = 10 bytes.
@@ -6092,7 +6105,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      if(_wh<0) goto _ex;\n"
                 "      if(_wh){\n"
                 "        if(_RT->with_get_var(ctx,&_tsv%d,%uu)<0) goto _ex;\n"
-                "        goto _Lpc_%d;\n"
+                "        goto _L%d;\n"
                 "      }\n"
                 "      _FREE(_tsv%d); _sp=%d; }\n",
                 d-1, atom, is_with,
@@ -6118,7 +6131,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "        int _r=_RT->with_put_var(ctx,_tsv%d,%uu,_tsv%d);\n"
                 "        _FREE(_tsv%d); _sp=%d;\n"
                 "        if(_r<0) goto _ex;\n"
-                "        goto _Lpc_%d;\n"
+                "        goto _L%d;\n"
                 "      }\n"
                 "      _FREE(_tsv%d); _sp=%d; }\n",
                 d-1, atom, is_with,
@@ -6143,7 +6156,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "        int _r=_RT->with_delete_var(ctx,_tsv%d,%uu);\n"
                 "        if(_r<0) goto _ex;\n"
                 "        _FREE(_tsv%d); _tsv%d=JS_NewBool(ctx,_r);\n"
-                "        goto _Lpc_%d;\n"
+                "        goto _L%d;\n"
                 "      }\n"
                 "      _FREE(_tsv%d); _sp=%d; }\n",
                 d-1, atom, is_with,
@@ -6167,7 +6180,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      if(_wh<0) goto _ex;\n"
                 "      if(_wh){\n"
                 "        _tsv%d=_RT->with_make_ref(ctx,%uu); _sp=%d;\n"
-                "        goto _Lpc_%d;\n"
+                "        goto _L%d;\n"
                 "      }\n"
                 "      _FREE(_tsv%d); _sp=%d; }\n",
                 d-1, atom, is_with,
@@ -6192,7 +6205,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "        JSValue _gref=_RT->with_get_ref(ctx,_tsv%d,%uu);\n"
                 "        if(JS_IsException(_gref)) goto _ex;\n"
                 "        _tsv%d=_gref; _sp=%d;\n"
-                "        goto _Lpc_%d;\n"
+                "        goto _L%d;\n"
                 "      }\n"
                 "      _FREE(_tsv%d); _sp=%d; }\n",
                 d-1, atom, is_with,

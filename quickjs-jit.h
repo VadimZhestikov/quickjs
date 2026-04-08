@@ -464,6 +464,9 @@ void    js_jit_gen_restore_vrefs(JSVarRef **vrefs, int n, JSJITGeneratorFrame *g
  * Generated C cannot access JSVarRef->pvalue directly since JSVarRef is
  * defined in quickjs.c (not a public header). */
 JSValue *js_jit_var_ref_value(JSVarRef *ref);
+/* Increment JSVarRef refcount and return the same ref.
+ * Used in JIT-generated code where JSVarRef is an incomplete type. */
+JSVarRef *js_jit_var_ref_dup(JSVarRef *ref);
 #endif
 
 /* ======================================================================= */
@@ -552,7 +555,7 @@ typedef struct {
  *
  * Safety: obj and ic must be simple lvalues (evaluated at most twice).
  *
- * Runtime guard (ic->rt == ctx->rt): static JSJITICEntry variables in
+ * Runtime guard (ic->rt == JS_GetRuntime(ctx)): static JSJITICEntry variables in
  * disk-cached .so files persist their shape/slot/atom across dlopen
  * invocations.  When a new JSRuntime is created (next test in run-test262),
  * freed shape memory may be reused at the same address by the new runtime
@@ -562,7 +565,7 @@ typedef struct {
  */
 #define JIT_IC_CHECK(obj, ic) \
     ((ic)->rt != NULL && \
-     (ic)->rt == (ctx)->rt && \
+     (ic)->rt == JS_GetRuntime(ctx) && \
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \

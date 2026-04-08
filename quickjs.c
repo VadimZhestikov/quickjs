@@ -15665,6 +15665,7 @@ int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count
 /* Return pointer to the JSValue inside a JSVarRef.  Used by generated C code
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
 JSValue *js_jit_var_ref_value(JSVarRef *ref) { return ref->pvalue; }
+JSVarRef *js_jit_var_ref_dup(JSVarRef *ref) { ref->header.ref_count++; return ref; }
 
 /* P10.4: public wrapper for OP_instanceof — routes through JS_IsInstanceOf
  * (which handles Symbol.hasInstance), matching the interpreter behaviour.
