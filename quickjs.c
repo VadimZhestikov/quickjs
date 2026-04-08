@@ -15666,6 +15666,14 @@ int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
 JSValue *js_jit_var_ref_value(JSVarRef *ref) { return ref->pvalue; }
 JSVarRef *js_jit_var_ref_dup(JSVarRef *ref) { ref->header.ref_count++; return ref; }
+void js_jit_varref_reattach(JSVarRef *vr, JSValue *slot) {
+    if (vr && vr->is_detached) {
+        *slot = vr->value;
+        vr->value = JS_UNDEFINED;
+        vr->pvalue = slot;
+        vr->is_detached = FALSE;
+    }
+}
 
 /* P10.4: public wrapper for OP_instanceof — routes through JS_IsInstanceOf
  * (which handles Symbol.hasInstance), matching the interpreter behaviour.

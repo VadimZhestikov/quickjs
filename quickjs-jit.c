@@ -2240,12 +2240,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                     int vri = js_jit_fb_get_local_var_ref_idx(b, j);
                     if (vri >= 0) {
                         jit_buf_printf(cb,
-                            "        if(_sf_vrefs[%d]&&_sf_vrefs[%d]->is_detached){"
-                            "_cap_buf[%d]=_sf_vrefs[%d]->value;"
-                            "_sf_vrefs[%d]->value=JS_UNDEFINED;"
-                            "_sf_vrefs[%d]->pvalue=&_cap_buf[%d];"
-                            "_sf_vrefs[%d]->is_detached=FALSE;}\n",
-                            vri, vri, j, vri, vri, vri, j, vri);
+                            "        js_jit_varref_reattach(_sf_vrefs[%d],&_cap_buf[%d]);\n",
+                            vri, j);
                     }
                 }
             }
@@ -2256,12 +2252,8 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                         int vri = js_jit_fb_get_arg_var_ref_idx(b, j);
                         if (vri >= 0) {
                             jit_buf_printf(cb,
-                                "        if(_sf_vrefs[%d]&&_sf_vrefs[%d]->is_detached){"
-                                "_arg_cap_buf[%d]=_sf_vrefs[%d]->value;"
-                                "_sf_vrefs[%d]->value=JS_UNDEFINED;"
-                                "_sf_vrefs[%d]->pvalue=&_arg_cap_buf[%d];"
-                                "_sf_vrefs[%d]->is_detached=FALSE;}\n",
-                                vri, vri, j, vri, vri, vri, j, vri);
+                                "        js_jit_varref_reattach(_sf_vrefs[%d],&_arg_cap_buf[%d]);\n",
+                                vri, j);
                         }
                     }
                 }

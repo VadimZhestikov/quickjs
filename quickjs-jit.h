@@ -467,6 +467,11 @@ JSValue *js_jit_var_ref_value(JSVarRef *ref);
 /* Increment JSVarRef refcount and return the same ref.
  * Used in JIT-generated code where JSVarRef is an incomplete type. */
 JSVarRef *js_jit_var_ref_dup(JSVarRef *ref);
+/* Reattach a detached JSVarRef to a local cap_buf slot.
+ * If vr is non-NULL and detached, copies vr->value into *slot, resets
+ * vr->pvalue to slot and clears is_detached.  Used in generator resume
+ * codegen where JSVarRef fields cannot be accessed directly. */
+void js_jit_varref_reattach(JSVarRef *vr, JSValue *slot);
 #endif
 
 /* ======================================================================= */
