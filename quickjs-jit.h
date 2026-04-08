@@ -485,17 +485,27 @@ void js_jit_varref_reattach(JSVarRef *vr, JSValue *slot);
  * shape == NULL and are always treated as misses.
  */
 typedef struct {
-    void     *shape;  /* JSShape* — opaque outside quickjs.c */
-    uint32_t  slot;   /* index into JSObject->prop[] */
-    uint32_t  atom;   /* JSAtom at slot — ABA guard: if shape is freed and
-                       * reallocated for a different layout, the atom at this
-                       * slot will differ, preventing false IC hits. */
-    uint8_t   kind;   /* 0=general, 1=float64 typed slot (P8.6) */
-    uint8_t   _pad[3];
-    void     *rt;     /* JSRuntime* — cross-runtime ABA guard: static IC entries
-                       * in disk-cached .so files persist across runtimes; checking
-                       * that ic->rt matches the current runtime prevents false hits
-                       * when a new runtime reuses the same shape pointer address. */
+    void     *shape;    /* JSShape* — opaque outside quickjs.c */
+    uint32_t  slot;     /* index into JSObject->prop[] */
+    uint32_t  atom;     /* JSAtom at slot — ABA guard: if shape is freed and
+                         * reallocated for a different layout, the atom at this
+                         * slot will differ, preventing false IC hits. */
+    uint8_t   kind;     /* 0=general, 1=float64 typed slot (P8.6) */
+    uint8_t   _pad0;    /* explicit padding (was _pad[0]) */
+    uint16_t  shape_gen;/* JSShape generation counter — within-runtime shape ABA guard:
+                         * if a JSShape is freed and a new one is allocated at the same
+                         * address, the new shape gets a higher shape_gen (mod 2^16),
+                         * so the IC check fails and the entry is safely refilled.
+                         * Set by js_jit_ic_fill_get/put; checked in JIT_IC_CHECK. */
+    uint32_t  rt_gen;   /* JSRuntime generation counter — ABA guard: even if a new
+                         * runtime is allocated at the same address as a freed one
+                         * (making ic->rt match), the monotonically-increasing
+                         * generation counter ensures the IC misses, forcing refill.
+                         * Set by js_jit_ic_fill_get/put; checked in JIT_IC_CHECK. */
+    void     *rt;       /* JSRuntime* — cross-runtime ABA guard: static IC entries
+                         * in disk-cached .so files persist across runtimes; checking
+                         * that ic->rt matches the current runtime prevents false hits
+                         * when a new runtime reuses the same shape pointer address. */
 } JSJITICEntry;
 
 /*
@@ -511,6 +521,7 @@ typedef struct {
  * both sets together.
  *   JSObject.shape        = byte 32
  *   JSObject.prop         = byte 40  (pointer to JSProperty array)
+ *   JSShape.shape_gen     = byte 26  (uint16_t generation counter — shape ABA guard)
  *   JSShape.prop_count    = byte 40
  *   JSShape.prop[]        = byte 64  (flexible array of JSShapeProperty)
  *   JSShapeProperty.atom  = byte  4  (after 4-byte bitfield word)
@@ -520,6 +531,7 @@ typedef struct {
 #define JIT_OBJIC_SHAPE_OFF       32
 #define JIT_OBJ_PROP_OFF          40  /* JSObject.prop pointer */
 #define JIT_PROP_SIZE             16  /* sizeof(JSProperty) == sizeof(JSValue) */
+#define JIT_SHAPEIC_SHAPEGEN_OFF  26  /* JSShape.shape_gen (uint16_t) — within-runtime ABA guard */
 #define JIT_SHAPEIC_PROPCOUNT_OFF 40
 #define JIT_SHAPEIC_PROP_OFF      64
 #define JIT_SHAPEIC_PROPSIZE       8
@@ -554,26 +566,39 @@ typedef struct {
 #define JIT_BC_BCHASH_OFF         128  /* JSFunctionBytecode.jit_bc_hash (uint64_t) */
 
 /*
+ * JS_GetRuntimeICGen: return the generation counter of a JSRuntime.
+ * Used by JIT_IC_CHECK to defeat the ABA problem: if a new runtime is
+ * allocated at the same address as a previously freed one, the generation
+ * counter (monotonically increasing across all JS_NewRuntime() calls in the
+ * process) will differ, forcing an IC miss and safe refill.
+ */
+uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
+
+/*
  * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard + runtime-guard.
  * Equivalent to js_jit_ic_check() but expands inline in JIT-generated code
  * so the compiler can see the body and optimize across the IC boundary.
  *
  * Safety: obj and ic must be simple lvalues (evaluated at most twice).
  *
- * Runtime guard (ic->rt == JS_GetRuntime(ctx)): static JSJITICEntry variables in
- * disk-cached .so files persist their shape/slot/atom across dlopen
- * invocations.  When a new JSRuntime is created (next test in run-test262),
- * freed shape memory may be reused at the same address by the new runtime
- * (ABA problem).  Checking that the cached runtime matches the current one
- * guarantees a miss on the first call in a new runtime, forcing a refill.
+ * Runtime guard: static JSJITICEntry variables in disk-cached .so files persist
+ * their shape/slot/atom across dlopen invocations.  Two guards work together:
+ *   1. ic->rt == JS_GetRuntime(ctx): ensures same runtime pointer (basic guard).
+ *   2. ic->rt_gen == JS_GetRuntimeICGen(rt): defeats ABA — if a new runtime is
+ *      allocated at the same address as a freed one, the generation counter
+ *      won't match, forcing a miss and refill.
+ * After guard (1) passes, (ic)->rt IS the live current runtime, so calling
+ * JS_GetRuntimeICGen on it is safe.
  * Relies on 'ctx' being in scope (always true in JIT-generated functions).
  */
 #define JIT_IC_CHECK(obj, ic) \
     ((ic)->rt != NULL && \
      (ic)->rt == JS_GetRuntime(ctx) && \
+     (ic)->rt_gen == JS_GetRuntimeICGen((JSRuntime*)(ic)->rt) && \
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
+     *(const uint16_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
      (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
      *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
                         (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)

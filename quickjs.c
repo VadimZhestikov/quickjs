@@ -311,6 +311,13 @@ struct JSRuntime {
     int shape_hash_count; /* number of hashed shapes */
     JSShape **shape_hash;
     void *user_opaque;
+#ifdef CONFIG_JIT
+    /* Monotonically-increasing generation counter, set once in JS_NewRuntime2.
+     * Used by JIT inline caches (JSJITICEntry.rt_gen) to defeat the ABA
+     * problem: if a new runtime is allocated at the same address as a freed
+     * one, the generation counter will differ, forcing an IC miss. */
+    uint32_t jit_ic_gen;
+#endif
 };
 
 struct JSClass {
@@ -949,6 +956,14 @@ struct JSShape {
     /* true if the shape is inserted in the shape hash table. If not,
        JSShape.hash is not valid */
     uint8_t is_hashed;
+    uint8_t _shape_pad0; /* explicit padding (was implicit before shape_gen) */
+    /* Monotonically-increasing generation counter assigned at shape
+     * allocation.  Used by JIT_IC_CHECK to defeat the within-runtime
+     * shape ABA problem: if a JSShape is freed and a new one is
+     * allocated at the same address, the generation will differ,
+     * forcing an IC miss and safe refill.  uint16_t gives 65536
+     * distinct values — wrap-around is astronomically unlikely. */
+    uint16_t shape_gen;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -1672,6 +1687,19 @@ static inline BOOL js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
 }
 #endif
 
+#ifdef CONFIG_JIT
+/* Process-global counter incremented by each JS_NewRuntime2 call.
+ * Stored in JSRuntime.jit_ic_gen to defeat the IC ABA problem:
+ * if a new runtime is allocated at the same address as a freed one,
+ * the generation counter will differ, causing JIT_IC_CHECK to miss. */
+static uint32_t js_jit_rt_gen_counter;
+
+uint32_t JS_GetRuntimeICGen(JSRuntime *rt)
+{
+    return rt->jit_ic_gen;
+}
+#endif /* CONFIG_JIT */
+
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
@@ -1692,6 +1720,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     }
     rt->malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
+#ifdef CONFIG_JIT
+    /* Assign a unique generation to this runtime so JIT ICs can detect ABA
+     * (a new runtime allocated at the same address as a freed one). */
+    rt->jit_ic_gen = ++js_jit_rt_gen_counter;
+#endif
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -4834,6 +4867,12 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     rt->shape_hash_count--;
 }
 
+/* Process-wide shape generation counter.  Each new JSShape gets a unique
+ * (mod 2^16) generation so that JIT_IC_CHECK can distinguish a freshly
+ * allocated shape at the same address from the one that was previously cached.
+ * Shared across all runtimes; only ever incremented, never reset. */
+static uint32_t js_shape_gen_counter;
+
 /* create a new empty shape with prototype 'proto'. It is not hashed */
 static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
                                            int hash_size, int prop_size)
@@ -4848,6 +4887,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     sh->header.ref_count = 1;
     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+    sh->shape_gen = (uint16_t)(++js_shape_gen_counter);
     if (proto)
         JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, proto));
     sh->proto = proto;
@@ -4910,6 +4950,7 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     sh->header.ref_count = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+    sh->shape_gen = (uint16_t)(++js_shape_gen_counter); /* new generation — distinct from source */
     sh->is_hashed = FALSE;
     if (sh->proto) {
         JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
@@ -17000,6 +17041,8 @@ _Static_assert(offsetof(JSObject,  prop)        == JIT_OBJ_PROP_OFF,
                "JIT_OBJ_PROP_OFF mismatch");
 _Static_assert(sizeof(JSProperty)               == JIT_PROP_SIZE,
                "JIT_PROP_SIZE mismatch — JSProperty stride != sizeof(JSValue)");
+_Static_assert(offsetof(JSShape,   shape_gen)   == JIT_SHAPEIC_SHAPEGEN_OFF,
+               "JIT_SHAPEIC_SHAPEGEN_OFF mismatch");
 _Static_assert(offsetof(JSShape,   prop_count)  == JIT_SHAPEIC_PROPCOUNT_OFF,
                "JIT_SHAPEIC_PROPCOUNT_OFF mismatch");
 _Static_assert(offsetof(JSShape,   prop)        == JIT_SHAPEIC_PROP_OFF,
@@ -17086,11 +17129,13 @@ int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
     prs = find_own_property(&pr, p, atom);
     if (!prs || (prs->flags & JS_PROP_TMASK))
         return 0;
-    ic->shape = p->shape;
-    ic->slot  = (uint32_t)(pr - p->prop);
-    ic->atom  = prs->atom;
-    ic->kind  = (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_FLOAT64) ? 1 : 0;
-    ic->rt    = ctx->rt;
+    ic->shape     = p->shape;
+    ic->slot      = (uint32_t)(pr - p->prop);
+    ic->atom      = prs->atom;
+    ic->kind      = (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_FLOAT64) ? 1 : 0;
+    ic->shape_gen = p->shape->shape_gen;
+    ic->rt_gen    = ctx->rt->jit_ic_gen;
+    ic->rt        = ctx->rt;
     return 1;
 }
 
@@ -17117,10 +17162,12 @@ int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
         return 0;
     if ((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) != JS_PROP_WRITABLE)
         return 0;
-    ic->shape = p->shape;
-    ic->slot  = (uint32_t)(pr - p->prop);
-    ic->atom  = prs->atom;
-    ic->rt    = ctx->rt;
+    ic->shape     = p->shape;
+    ic->slot      = (uint32_t)(pr - p->prop);
+    ic->atom      = prs->atom;
+    ic->shape_gen = p->shape->shape_gen;
+    ic->rt_gen    = ctx->rt->jit_ic_gen;
+    ic->rt        = ctx->rt;
     return 1;
 }
 
