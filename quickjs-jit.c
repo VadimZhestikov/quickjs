@@ -635,6 +635,12 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
             break;
         }
 
+        /* P20: OP_close_loc / OP_make_loc_ref / OP_make_arg_ref also need _sf_vrefs.
+         * Set has_fclosure so the preamble declares _sf_vrefs even if no OP_fclosure
+         * is present in this function (e.g. destructuring ref-pairs without closures). */
+        if (op == OP_close_loc || op == OP_make_loc_ref || op == OP_make_arg_ref)
+            sr->has_fclosure = 1;
+
         /* P13: detect OP_fclosure / OP_fclosure8 and compute captured-var masks. */
         if (op == OP_fclosure || op == OP_fclosure8) {
             /* Read cpool index (inline bc_u32 since bc_u32 is defined later in this file) */
