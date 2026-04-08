@@ -2196,6 +2196,8 @@ int main(int argc, char **argv)
         } else if (str_equal(arg, "--jit-link")) {
             jit_link = 1;
             js_jit_set_link_mode(1); /* record hashes during test run for linking */
+        } else if (str_equal(arg, "--jit-dump-c")) {
+            js_jit_set_dump_c_mode(1);
 #endif
         } else {
             fatal(1, "unknown option: %s", arg);

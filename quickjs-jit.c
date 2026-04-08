@@ -1281,6 +1281,54 @@ static uint64_t jit_hash_bytecode(const uint8_t *bc, int bc_len)
     return h;
 }
 
+/* Hash a function's bytecode AND the closure-variable metadata of every inner
+ * function referenced by OP_fclosure / OP_fclosure8.  Two functions can share
+ * the same raw bytecode hash if their inner functions have different
+ * closure_var_count or closure_var[].closure_type / var_idx values; including
+ * this metadata ensures distinct hashes → distinct cache files.
+ *
+ * This replaces jit_hash_bytecode() at all callsites that have a live
+ * JSFunctionBytecode* (i.e. everywhere except the P10.3 callee-hash path). */
+static uint64_t jit_hash_function(JSFunctionBytecode *b)
+{
+    int bc_len;
+    const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
+    uint64_t h = jit_hash_bytecode(bc, bc_len);
+
+    /* Walk bytecode looking for OP_fclosure / OP_fclosure8 to hash inner
+     * function closure-variable metadata. */
+    int op_sz_count;
+    const uint8_t *op_sz = js_jit_get_opcode_size_table(&op_sz_count);
+    int pc = 0;
+    while (pc < bc_len) {
+        int op = bc[pc];
+        if (op >= op_sz_count || op_sz[op] == 0) break;
+        if (op == OP_fclosure || op == OP_fclosure8) {
+            int cpool_idx = (op == OP_fclosure8) ? (int)bc[pc+1]
+                                                 : (int)((uint32_t)bc[pc+1]
+                                                        | ((uint32_t)bc[pc+2] << 8)
+                                                        | ((uint32_t)bc[pc+3] << 16)
+                                                        | ((uint32_t)bc[pc+4] << 24));
+            JSFunctionBytecode *bi = js_jit_cpool_get_fb(b, cpool_idx);
+            if (bi) {
+                int n_cv = js_jit_fb_get_closure_var_count(bi);
+                /* Hash: (pc, cpool_idx, n_cv) as 3 x int32 */
+                uint32_t meta[3] = { (uint32_t)pc, (uint32_t)cpool_idx, (uint32_t)n_cv };
+                h = jit_fnv1a_64(meta, sizeof(meta), h);
+                for (int ci = 0; ci < n_cv; ci++) {
+                    uint32_t cv[2] = {
+                        (uint32_t)js_jit_fb_get_inner_cv_type(bi, ci),
+                        (uint32_t)js_jit_fb_get_inner_cv_var_idx(bi, ci)
+                    };
+                    h = jit_fnv1a_64(cv, sizeof(cv), h);
+                }
+            }
+        }
+        pc += op_sz[op];
+    }
+    return h;
+}
+
 static char jit_cache_dir[512];
 static int  jit_cache_enabled;
 static int  jit_aot_mode_active;
@@ -1786,9 +1834,7 @@ void js_jit_drain(void)
 /* Public API: returns 1 if a .c source file is cached for b's bytecode. */
 int js_jit_cache_has_c_src(JSFunctionBytecode *b)
 {
-    int bc_len;
-    const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
-    return jit_cache_has_c_src(jit_hash_bytecode(bc, bc_len));
+    return jit_cache_has_c_src(jit_hash_function(b));
 }
 
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs)
@@ -1799,10 +1845,11 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     js_jit_fb_set_no_compile(b);
     if (!jit_worker.started) return;
 
-    /* Compute stable bytecode hash for cache lookup and symbol naming */
-    int bc_len;
-    const uint8_t *bc = js_jit_fb_get_bytecode(b, &bc_len);
-    uint64_t bc_hash = jit_hash_bytecode(bc, bc_len);
+    /* Compute stable bytecode hash for cache lookup and symbol naming.
+     * jit_hash_function() includes inner-function closure-var metadata so that
+     * two functions sharing identical raw opcodes but different closure_var_count
+     * or cv types get distinct hashes (avoiding stale-cache collisions). */
+    uint64_t bc_hash = jit_hash_function(b);
 
     /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install.
      * Skip in AOT mode (combined.so already loaded): bytecodes are per-test and
@@ -2696,10 +2743,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d+2);
             break;
 
-        /* OP_for_of_next: iter next catch_ph → iter next catch_ph value done (+2).
-         * iter at d-3, next at d-2, catch_ph at d-1; value→d, done→d+1.
-         * The wrapper may set *piter=JS_UNDEFINED when iteration is done. */
-        case OP_for_of_next:
+        /* OP_for_of_next: iter next catch_ph [extra] → ... value done (+2).
+         * The u8 operand (bc[pc+1]) gives the number of extra items pushed above
+         * the catch_ph since for_of_start (e.g. a destructuring target object).
+         * iter at d-3-extra, next at d-2-extra; value→d, done→d+1. */
+        case OP_for_of_next: {
+            int _extra = (int)bc[pc+1];
             _P94_ENSURE(d+1);
             jit_buf_printf(cb,
                 "    _tsv%d=JS_UNDEFINED; _tsv%d=JS_UNDEFINED;\n"
@@ -2707,9 +2756,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 " goto _ex;\n"
                 "    _sp=%d;\n",
                 d, d+1,
-                d-3, d-2, d, d+1,
+                d-3-_extra, d-2-_extra, d, d+1,
                 d+2);
             break;
+        }
 
         /* P30: OP_for_await_of_start: obj → iter next catch_ph (+2 net, async=TRUE).
          * Same interface as OP_for_of_start but uses Symbol.asyncIterator. */
@@ -4979,6 +5029,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
                     tslot);
             }
+            /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
+            if (sr->has_fclosure) {
+                if (var_ref_count > 0)
+                    jit_buf_printf(cb, "      js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+                for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
+                    if ((sr->captured_local_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
+                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                    if ((sr->captured_arg_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
+            }
             /* Free remaining stack slots and locals, then return */
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
@@ -5033,6 +5094,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "      _sp=%d; _FREE(_f);\n"
                     "      if(JS_VALUE_GET_TAG(_r)==JS_TAG_EXCEPTION) goto _ex;\n",
                     fslot);
+            }
+            /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
+            if (sr->has_fclosure) {
+                if (var_ref_count > 0)
+                    jit_buf_printf(cb, "      js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+                for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
+                    if ((sr->captured_local_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
+                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                    if ((sr->captured_arg_mask >> _cf) & 1)
+                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
             }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
