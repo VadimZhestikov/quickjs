@@ -1719,13 +1719,26 @@ static void jit_compile_gcc_job(JITGCCJob *job)
     /* Cache the compiled .so before unlinking (Phase 7.3) */
     jit_cache_put(so_path, job->bc_hash);
 
-    /* Load the compiled .so; unlink immediately (kernel keeps it mapped) */
-    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    /* Load the compiled .so; unlink immediately (kernel keeps it mapped).
+     * RTLD_GLOBAL: exports this function's symbol (__jit_f_HASH) into the
+     * process-wide namespace so that future caller .so files compiled with
+     * P10.3 direct-call extern references can resolve this symbol at their
+     * own dlopen(RTLD_NOW) time.  Without RTLD_GLOBAL the extern symbol is
+     * invisible to other dlopen calls and they fail with RTLD_NOW. */
+    void *handle = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
     unlink(so_path);
-    if (!handle) goto fail;
+    if (!handle) {
+        /* dlopen failure is transient (missing callee symbol not yet loaded,
+         * or OS error) — do NOT write .skip; we want to retry on future runs.
+         * .skip is reserved for permanent codegen failures (GCC errors). */
+        return;
+    }
 
     JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, job->fname);
-    if (!f) { dlclose(handle); goto fail; }
+    if (!f) {
+        dlclose(handle);
+        return;  /* transient — symbol mismatch; do not write .skip */
+    }
 
     /* Record the result for the main thread to install safely.
      * The worker must NOT write to job->b: the bytecode may be freed by the
@@ -1902,7 +1915,9 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         char fname[64];
         snprintf(fname, sizeof(fname), "__jit_f_%016llx",
                  (unsigned long long)bc_hash);
-        void *handle = dlopen(cache_path, RTLD_NOW | RTLD_LOCAL);
+        /* RTLD_GLOBAL: make this symbol visible so callers with P10.3 direct
+         * extern references can resolve it when they are dlopen'd later. */
+        void *handle = dlopen(cache_path, RTLD_NOW | RTLD_GLOBAL);
         free(cache_path);
         if (handle) {
             JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, fname);
