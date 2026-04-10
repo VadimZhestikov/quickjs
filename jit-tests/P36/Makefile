@@ -30,6 +30,8 @@ run: all
 	@/tmp/test_p36_2
 	@echo "=== P36.3: extended profile writer ==="
 	@/tmp/test_p36_3
+	@echo "=== P36.4: --jit-profile-time CLI flag ==="
+	@QJS=$(QJS_DIR)/qjs sh $(QJS_DIR)/jit-tests/P36/test_p36_4.sh
 	@echo "=== ALL P36 TESTS COMPLETE ==="
 
 clean:

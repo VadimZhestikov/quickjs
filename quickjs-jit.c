@@ -1234,6 +1234,7 @@ typedef struct JITGCCJob {
     JSFunctionBytecode *b;
     char               *c_src;     /* malloc'd C source; freed after gcc    */
     char                fname[64]; /* symbol name to look up via dlsym      */
+    char                js_name[80]; /* JS function name for registry/profile */
     uint64_t            bc_hash;   /* FNV-1a hash of bytecode + build stamp */
     struct JITGCCJob   *next;
 } JITGCCJob;
@@ -1377,6 +1378,9 @@ static int jit_cache_is_skip(uint64_t hash)
              jit_cache_dir, (unsigned long long)hash);
     return access(path, F_OK) == 0;
 }
+
+/* Forward declaration — defined later in P36.1 section. */
+void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash, const char *name);
 
 /* Write a .skip marker so future runs bypass code generation for this hash. */
 static void jit_cache_put_skip(uint64_t hash)
@@ -1576,6 +1580,7 @@ static void jit_session_clear(void)
 typedef struct {
     uint64_t    bc_hash;
     char        fname[64];
+    char        js_name[80]; /* JS function name for registry/profile */
     void       *handle;
     JSJITFunc   func;
 } JITGCCResult;
@@ -1587,6 +1592,7 @@ static struct {
 } jit_pending_results = { PTHREAD_MUTEX_INITIALIZER };
 
 static void jit_result_add(uint64_t bc_hash, const char *fname,
+                            const char *js_name,
                             void *handle, JSJITFunc func)
 {
     pthread_mutex_lock(&jit_pending_results.lock);
@@ -1601,6 +1607,8 @@ static void jit_result_add(uint64_t bc_hash, const char *fname,
     JITGCCResult *r = &jit_pending_results.items[jit_pending_results.count++];
     r->bc_hash = bc_hash;
     memcpy(r->fname, fname, sizeof(r->fname));
+    strncpy(r->js_name, js_name ? js_name : "", sizeof(r->js_name) - 1);
+    r->js_name[sizeof(r->js_name) - 1] = '\0';
     r->handle  = handle;
     r->func    = func;
     pthread_mutex_unlock(&jit_pending_results.lock);
@@ -1629,7 +1637,7 @@ void js_jit_install_results(void)
             js_jit_fb_set_bc_hash(b, r->bc_hash);
             js_jit_fb_set_func(b, r->func, r->handle, 2);
             /* P36.1: register address for sampling profiler */
-            jit_registry_add((uintptr_t)r->func, r->bc_hash);
+            jit_registry_add((uintptr_t)r->func, r->bc_hash, r->js_name);
         } else {
             /* Bytecode was freed during execution — discard the .so. */
             if (r->handle)
@@ -1750,7 +1758,7 @@ static void jit_compile_gcc_job(JITGCCJob *job)
      * The worker must NOT write to job->b: the bytecode may be freed by the
      * main thread (local closure goes out of scope) before the job completes.
      * js_jit_install_results() looks up the live bytecode by hash after drain. */
-    jit_result_add(job->bc_hash, job->fname, handle, f);
+    jit_result_add(job->bc_hash, job->fname, job->js_name, handle, f);
     return;
 fail:
     jit_cache_put_skip(job->bc_hash);
@@ -2004,6 +2012,9 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
      * or cv types get distinct hashes (avoiding stale-cache collisions). */
     uint64_t bc_hash = jit_hash_function(b);
 
+    /* P36.4: get JS function name early — needed for registry entries on all paths. */
+    const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
+
     /* P10.2/P10.4: record hash+bytecode for link combiner and manifest install.
      * Skip in AOT mode (combined.so already loaded): bytecodes are per-test and
      * become stale after JS_FreeRuntime(); recording them would leave dangling
@@ -2029,7 +2040,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
                 js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, jit_combined_manifest[_mi].func_ptr, NULL, 2);
                 /* P36.1: register address for sampling profiler (combined.so path) */
-                jit_registry_add((uintptr_t)jit_combined_manifest[_mi].func_ptr, bc_hash);
+                jit_registry_add((uintptr_t)jit_combined_manifest[_mi].func_ptr,
+                                 bc_hash, js_name);
                 return;
             }
         }
@@ -2067,7 +2079,7 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
                 js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, f, handle, 2);
                 /* P36.1: register address for sampling profiler (cache-hit path) */
-                jit_registry_add((uintptr_t)f, bc_hash);
+                jit_registry_add((uintptr_t)f, bc_hash, js_name);
                 return;
             }
             dlclose(handle);
@@ -2107,7 +2119,6 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     JSJITCodeBuf cb;
     char fname[64];
     int unsupported = 0;
-    const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
     if (js_jit_gen_c(b, &cb, fname, sizeof(fname), &unsupported,
                      js_name, bc_hash, JS_GetRuntime(ctx), p103_hash) < 0) {
         /* Persist the failure so future runs skip code generation silently. */
@@ -2142,6 +2153,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */
     job->bc_hash = bc_hash;
     memcpy(job->fname, fname, sizeof(job->fname));
+    strncpy(job->js_name, js_name ? js_name : "", sizeof(job->js_name) - 1);
+    job->js_name[sizeof(job->js_name) - 1] = '\0';
     job->next    = NULL;
 
     pthread_mutex_lock(&jit_worker.lock);
@@ -7268,7 +7281,7 @@ static int jit_install_combined_pass(void)
         js_jit_fb_set_func(b, jit_combined_manifest[i].func_ptr, NULL, 2);
         /* P36.1: register address for sampling profiler (combined-pass path) */
         jit_registry_add((uintptr_t)jit_combined_manifest[i].func_ptr,
-                         jit_combined_manifest[i].bc_hash);
+                         jit_combined_manifest[i].bc_hash, "");
         if (old_tier == 2 && old_handle)
             dlclose(old_handle);
         installed++;
@@ -7334,6 +7347,7 @@ typedef struct {
     uintptr_t  func_ptr;   /* start address of compiled JIT function      */
     uint64_t   bc_hash;    /* FNV-1a hash — key for profile output         */
     uint32_t   samples;    /* atomic sample counter; SIGPROF increments it */
+    char       name[80];   /* JS function name for profile output          */
 } JITAddrEntry;
 
 static JITAddrEntry      jit_addr_registry[JIT_ADDR_REGISTRY_MAX];
@@ -7366,7 +7380,7 @@ static inline int jit_seqlock_retry(uint32_t s)
 /* Add a newly installed JIT function to the registry.
  * Keeps the array sorted by func_ptr for binary search in the signal handler.
  * Called from js_jit_install_results() (main thread only). */
-void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash)
+void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash, const char *name)
 {
     int cnt = jit_addr_count;
     if (cnt >= JIT_ADDR_REGISTRY_MAX) {
@@ -7385,6 +7399,9 @@ void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash)
     jit_addr_registry[i].func_ptr = func_ptr;
     jit_addr_registry[i].bc_hash  = bc_hash;
     jit_addr_registry[i].samples  = 0;
+    strncpy(jit_addr_registry[i].name, name ? name : "",
+            sizeof(jit_addr_registry[i].name) - 1);
+    jit_addr_registry[i].name[sizeof(jit_addr_registry[i].name) - 1] = '\0';
     jit_addr_count = cnt + 1;
 
     jit_seqlock_write_end();
@@ -7541,7 +7558,11 @@ typedef struct {
     FILE       *f;
     int         first;
     JSRuntime  *rt;
-    int         hz;    /* P36.3: sampler hz; 0 = no timing data */
+    int         hz;        /* P36.3: sampler hz; 0 = no timing data */
+    /* P36.4: track hashes output by module walk for registry dedup pass */
+    uint64_t   *seen;
+    int         seen_count;
+    int         seen_cap;
 } ProfileWalkState;
 
 static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
@@ -7560,6 +7581,17 @@ static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
 
     if (calls <= 0 && samples == 0)
         return; /* nothing recorded */
+
+    /* P36.4: track hashes output by module walk so registry pass can skip them */
+    if (st->seen) {
+        if (st->seen_count == st->seen_cap) {
+            int nc = st->seen_cap ? st->seen_cap * 2 : 16;
+            uint64_t *na = realloc(st->seen, (size_t)nc * sizeof(*na));
+            if (na) { st->seen = na; st->seen_cap = nc; }
+        }
+        if (st->seen_count < st->seen_cap)
+            st->seen[st->seen_count++] = hash;
+    }
 
     const char *name = js_jit_fb_get_func_name(st->rt, b);
 
@@ -7598,7 +7630,7 @@ int js_jit_write_profile(JSContext *ctx, const char *path)
     if (!f)
         return -1;
     fprintf(f, "{\"functions\":[\n");
-    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), 0 };
+    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), 0, NULL, 0, 0 };
     js_jit_walk_all_modules(ctx, profile_walk_cb, &st);
     fprintf(f, "\n]}\n");
     fclose(f);
@@ -7611,8 +7643,43 @@ int js_jit_write_profile_timed(JSContext *ctx, const char *path, int hz)
     if (!f)
         return -1;
     fprintf(f, "{\"functions\":[\n");
-    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), hz };
+
+    /* Allocate initial seen-hash tracking buffer (grows on demand in walk_cb) */
+    uint64_t *seen_buf = malloc(16 * sizeof(uint64_t));
+    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), hz,
+                            seen_buf, 0, seen_buf ? 16 : 0 };
     js_jit_walk_all_modules(ctx, profile_walk_cb, &st);
+
+    /* P36.4: second pass — emit global-script functions found in the registry
+     * but NOT in any loaded module (they have samples > 0 but no module entry). */
+    int cnt = jit_addr_count;
+    for (int i = 0; i < cnt; i++) {
+        uint32_t s = __atomic_load_n(&jit_addr_registry[i].samples, __ATOMIC_RELAXED);
+        if (s == 0) continue;
+        uint64_t h = jit_addr_registry[i].bc_hash;
+        /* Skip hashes already output by the module walk */
+        int already = 0;
+        for (int j = 0; j < st.seen_count; j++) {
+            if (st.seen[j] == h) { already = 1; break; }
+        }
+        if (already) continue;
+        uint32_t tm = hz > 0 ? (s * 1000u) / (uint32_t)hz : 0;
+        if (!st.first) fprintf(f, ",\n");
+        const char *n = jit_addr_registry[i].name;
+        char safe_name[sizeof(jit_addr_registry[i].name)];
+        int ni = 0;
+        while (n[ni] && ni < (int)(sizeof(safe_name) - 1)) {
+            safe_name[ni] = (n[ni] == '"' || n[ni] == '\\') ? '_' : n[ni];
+            ni++;
+        }
+        safe_name[ni] = '\0';
+        fprintf(f, "  {\"hash\":\"%016llx\",\"calls\":0,\"time_ms\":%u,\"name\":\"%s\"}",
+                (unsigned long long)h, tm,
+                safe_name[0] ? safe_name : "<anon>");
+        st.first = 0;
+    }
+    free(st.seen);
+
     fprintf(f, "\n]}\n");
     fclose(f);
     return 0;

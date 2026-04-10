@@ -55,7 +55,10 @@ static int jit_link_mode        = 0; /* set by --jit-link    */
 static int jit_threshold_mode   = 0; /* set by --jit-threshold-gcc=N (N=0: AOT pre-pass) */
 static int jit_compile_all_mode = 0; /* set by --jit-compile-all (P35.3) */
 static int jit_exit_mode        = 0; /* set by --jit-exit (P35.3-D): skip execution */
-static const char *jit_profile_path = NULL; /* set by --jit-profile=<file> (P35.5-B) */
+static const char *jit_profile_path      = NULL; /* set by --jit-profile=<file> (P35.5-B) */
+static const char *jit_profile_time_path = NULL; /* set by --jit-profile-time=<file>[,Hz] (P36.4) */
+static int         jit_profile_time_hz   = 1000; /* sampler Hz for --jit-profile-time */
+static char        jit_profile_time_path_buf[512]; /* backing store for path copy */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -396,6 +399,8 @@ void help(void)
            "    --jit-compile-all  (P35.3) statically compile all functions to cache before running\n"
            "    --jit-exit         (P35.3) skip execution after --jit-compile-all (pure build step)\n"
            "    --jit-profile=<file>  (P35.5) write call-count JSON profile to <file> after execution\n"
+           "    --jit-profile-time=<file>[,Hz]  (P36.4) run SIGPROF sampler at Hz (default 1000) and\n"
+           "                                    write timed profile with time_ms fields to <file>\n"
 #endif
            );
     exit(1);
@@ -581,6 +586,24 @@ int main(int argc, char **argv)
                 jit_profile_path = longopt + 12;
                 continue;
             }
+            if (!strncmp(longopt, "jit-profile-time=", 17)) {
+                const char *arg = longopt + 17;
+                const char *comma = strrchr(arg, ',');
+                if (comma && comma[1] >= '0' && comma[1] <= '9') {
+                    jit_profile_time_hz = atoi(comma + 1);
+                    if (jit_profile_time_hz <= 0) jit_profile_time_hz = 1000;
+                    int plen = (int)(comma - arg);
+                    if (plen >= (int)sizeof(jit_profile_time_path_buf))
+                        plen = (int)sizeof(jit_profile_time_path_buf) - 1;
+                    memcpy(jit_profile_time_path_buf, arg, plen);
+                    jit_profile_time_path_buf[plen] = '\0';
+                    jit_profile_time_path = jit_profile_time_path_buf;
+                } else {
+                    jit_profile_time_path = arg;
+                    jit_profile_time_hz   = 1000;
+                }
+                continue;
+            }
 #endif
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
@@ -639,6 +662,11 @@ int main(int argc, char **argv)
                 goto fail;
         }
 
+#ifdef CONFIG_JIT
+        /* P36.4: start sampler before eval so JIT execution time is captured. */
+        if (jit_profile_time_path)
+            js_jit_sampler_start(jit_profile_time_hz);
+#endif
         if (expr) {
             int eval_flags;
             if (module > 0) {
@@ -667,6 +695,9 @@ int main(int argc, char **argv)
         js_std_loop(ctx);
 
 #ifdef CONFIG_JIT
+        /* P36.4: stop sampler after event loop completes. */
+        if (jit_profile_time_path)
+            js_jit_sampler_stop();
         /* P10.2: --jit-link — after execution collect all seen .c cache files
          * and combine them into a single GCC LTO shared library. */
         if (jit_link_mode)
@@ -676,6 +707,13 @@ int main(int argc, char **argv)
             if (js_jit_write_profile(ctx, jit_profile_path) != 0)
                 fprintf(stderr, "qjs: --jit-profile: failed to write '%s'\n",
                         jit_profile_path);
+        }
+        /* P36.4: --jit-profile-time=<file>[,Hz] — write timed profile. */
+        if (jit_profile_time_path) {
+            if (js_jit_write_profile_timed(ctx, jit_profile_time_path,
+                                           jit_profile_time_hz) != 0)
+                fprintf(stderr, "qjs: --jit-profile-time: failed to write '%s'\n",
+                        jit_profile_time_path);
         }
 #endif
     }
@@ -715,6 +753,11 @@ int main(int argc, char **argv)
     }
     return 0;
  fail:
+#ifdef CONFIG_JIT
+    /* P36.4: ensure sampler is stopped even on error exit. */
+    if (jit_profile_time_path)
+        js_jit_sampler_stop();
+#endif
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
