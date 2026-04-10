@@ -921,6 +921,38 @@ void js_jit_walk_bytecodes(JSFunctionBytecode *b,
                            void *opaque);
 
 /*
+ * js_jit_walk_module_graph() — P35.2
+ * Walks the module import graph starting from entry_module_val, visiting each
+ * module's bytecode tree (module body + inner functions) exactly once.
+ * Follows JSModuleDef.req_module_entries[] recursively.
+ * entry_module_val must be a JS_TAG_MODULE value (from JS_EVAL_FLAG_COMPILE_ONLY
+ * or from an evaluated module).  Does nothing if entry is not a module.
+ *
+ * Useful at build time (qjsc --jit-hybrid-app) when you have the module JSValue,
+ * and at runtime when you want to install into a known subtree.
+ * For whole-runtime installation after module evaluation, prefer
+ * js_jit_walk_all_modules().
+ */
+void js_jit_walk_module_graph(JSContext *ctx, JSValue entry_module_val,
+                               void (*cb)(JSFunctionBytecode *, void *),
+                               void *opaque);
+
+/*
+ * js_jit_walk_all_modules() — P35.2
+ * Calls cb(bytecode, opaque) for every bytecode reachable from every module
+ * currently loaded in ctx.  Iterates ctx->loaded_modules and calls
+ * js_jit_walk_bytecodes() on each module body.
+ *
+ * Used by the generated js_init_app(ctx) to install pre-compiled JIT functions
+ * into all loaded modules without needing the entry module JSValue.
+ * Suitable to call after all modules are loaded but before application
+ * functions are first invoked.
+ */
+void js_jit_walk_all_modules(JSContext *ctx,
+                              void (*cb)(JSFunctionBytecode *, void *),
+                              void *opaque);
+
+/*
  * js_jit_gen_c_str() — P34.3
  * Generate C source for a single JSFunctionBytecode and return it as a
  * malloc'd NUL-terminated string (caller must free()).

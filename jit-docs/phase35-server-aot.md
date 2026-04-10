@@ -80,7 +80,7 @@ re-queued.  Cap of 0 disables the limit entirely.
 
 ---
 
-## P35.2 — Whole-Application AOT Compilation (`qjsc --jit-hybrid-app`)
+## P35.2 — Whole-Application AOT Compilation (`qjsc --jit-hybrid-app`) ✓ DONE
 
 **Goal:** Extend the P34 per-module hybrid format to the entire application module
 graph.  All reachable functions are compiled to native code at build time; no GCC
@@ -104,37 +104,56 @@ app.so  ← loaded at startup; all functions at tier 2 immediately
 
 No representative traffic needed — all statically reachable functions are compiled.
 
-### Steps
+### Implementation
 
-- **P35.2-A** Implement `js_jit_walk_module_graph(ctx, entry_module_val, cb, opaque)`:
-  recursively walks imported modules via `JSModuleDef.req_module_entries[]`, visiting
-  each module's bytecode tree once (deduplication by module pointer).
-  Declared in `quickjs-jit.h`.
+**New public APIs** (declared in `quickjs-jit.h`, implemented in `quickjs.c`):
 
-- **P35.2-B** In `qjsc.c`, add `--jit-hybrid-app` flag.  When set, after loading the
-  entry module (without evaluating it), call `js_jit_walk_module_graph` to enumerate
-  all function bytecodes across all modules.
+- **`js_jit_walk_module_graph(ctx, entry_module_val, cb, opaque)`** — walks the import
+  graph from `entry_module_val` (a `JS_TAG_MODULE` value). Follows
+  `JSModuleDef.req_module_entries[]` recursively; deduplicates by module pointer.
+  Works with both COMPILE_ONLY modules (imports unresolved → only entry walked) and
+  fully evaluated modules (full graph walked).  Handles both pre-evaluation
+  (`JS_TAG_FUNCTION_BYTECODE`) and post-evaluation (`JS_CLASS_BYTECODE_FUNCTION` object)
+  states of `JSModuleDef.func_obj`.
 
-- **P35.2-C** For each eligible bytecode, emit a JIT C body using the existing
-  `js_jit_gen_c_str()` (P34.3 API) into a growing buffer.
+- **`js_jit_walk_all_modules(ctx, cb, opaque)`** — iterates `ctx->loaded_modules` and
+  calls `js_jit_walk_bytecodes` on each module body.  Used by the generated
+  `js_init_app(ctx)`.  Works after module evaluation because it extracts bytecodes
+  from `JS_CLASS_BYTECODE_FUNCTION` objects as well as raw `JS_TAG_FUNCTION_BYTECODE`.
 
-- **P35.2-D** Emit per-module dispatch tables and `_install_cb` callbacks, one set per
-  module, indexed by module pointer hash.  A single `js_init_app(ctx)` entry point
-  walks all modules and installs JIT functions.
+**`qjsc --jit-hybrid-app`** (`OUTPUT_C_HYBRID_APP` mode in `qjsc.c`):
+- Accepts one or more `.js` input files, each compiled with `COMPILE_ONLY`
+- Walks bytecodes of each module; applies P35.1 size cap; deduplicates by bc_hash
+- Emits: JIT function bodies + flat dispatch table + `js_init_app(ctx)`:
+  ```c
+  void js_init_app(JSContext *ctx) {
+  #ifdef CONFIG_JIT
+      js_jit_walk_all_modules(ctx, _install_app_cb, NULL);
+  #endif
+  }
+  ```
 
-- **P35.2-E** Apply P35.1 size cap during step C: functions with `bc_len > JIT_MAX_BC_LEN`
-  are silently omitted from the dispatch tables (interpreter fallback).
+**Build chain:**
+```sh
+# Build step (CI/CD):
+./qjsc --jit-hybrid-app -o app.c server.js module_a.js module_b.js
+gcc -O3 -flto -shared -fPIC -DCONFIG_JIT -I. -o app.so app.c
 
-- **P35.2-F** Makefile / shell snippet in docs showing the full build chain:
-  `qjsc --jit-hybrid-app → gcc -O3 -flto → app.so → qjs --jit-aot`.
+# Runtime:
+void *h = dlopen("./app.so", RTLD_NOW);
+void (*init_app)(JSContext *) = dlsym(h, "js_init_app");
+// After modules are loaded:
+init_app(ctx);  /* all eligible functions now at tier 2 */
+```
 
-- **P35.2-G** Tests in `jit-tests/P35/`: multi-module app, verify all inner functions
-  at tier 2 after `js_init_app`, data-init modules at tier 0.
+**Tests:** `jit-tests/P35/test_p35_2.c` — 4 subtests:
+- A: `js_jit_walk_all_modules` finds all bytecodes (module body + inner functions) after evaluation
+- B: After two-module load (entry imports lib), finds bytecodes from both modules
+- C: `js_jit_walk_module_graph` on a COMPILE_ONLY module visits its inner functions
+- D: `js_jit_walk_module_graph` is a no-op for non-module JSValues
 
-**Estimated effort:** ~5 days  
-**Risk:** medium — module graph walker touches internal module structures  
-**Dependencies:** P34 (hybrid format), P35.1 (size cap)  
-**Files:** `quickjs-jit.h`, `quickjs-jit.c`, `quickjs.c`, `qjsc.c`
+**Files changed:** `quickjs.c`, `quickjs-jit.h`, `qjsc.c`,
+`jit-tests/P35/test_p35_2.c`, `jit-tests/P35/Makefile`
 
 ---
 

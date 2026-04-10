@@ -15879,6 +15879,87 @@ JSFunctionBytecode *js_jit_module_get_bc(JSValue module_val) {
     if (JS_VALUE_GET_TAG(m->func_obj) != JS_TAG_FUNCTION_BYTECODE) return NULL;
     return (JSFunctionBytecode *)JS_VALUE_GET_PTR(m->func_obj);
 }
+/* P35.2: get the root JSFunctionBytecode for a module, handling both the
+ * pre-evaluation case (func_obj = JS_TAG_FUNCTION_BYTECODE, set by parser)
+ * and the post-evaluation case (func_obj = JS_CLASS_BYTECODE_FUNCTION object,
+ * set by js_create_module_function). */
+static JSFunctionBytecode *module_get_root_bc(JSModuleDef *m)
+{
+    JSValue fv = m->func_obj;
+    if (JS_VALUE_GET_TAG(fv) == JS_TAG_FUNCTION_BYTECODE)
+        return (JSFunctionBytecode *)JS_VALUE_GET_PTR(fv);
+    if (JS_VALUE_GET_TAG(fv) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(fv);
+        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+            return p->u.func.function_bytecode;
+    }
+    return NULL;
+}
+/* P35.2: module graph walk — deduplication state (module-level) */
+typedef struct {
+    JSModuleDef **ptr;
+    int           count;
+    int           cap;
+} MGWalkVisited;
+static int mgwalk_visited_has(MGWalkVisited *v, JSModuleDef *m) {
+    for (int i = 0; i < v->count; i++) if (v->ptr[i] == m) return 1;
+    return 0;
+}
+static int mgwalk_visited_add(JSRuntime *rt, MGWalkVisited *v, JSModuleDef *m) {
+    if (v->count == v->cap) {
+        int nc = v->cap ? v->cap * 2 : 8;
+        JSModuleDef **p = js_realloc_rt(rt, v->ptr, (size_t)nc * sizeof(*p));
+        if (!p) return -1;
+        v->ptr = p; v->cap = nc;
+    }
+    v->ptr[v->count++] = m; return 0;
+}
+static void mgwalk_rec(JSRuntime *rt, JSModuleDef *m,
+                        void (*cb)(JSFunctionBytecode *, void *),
+                        void *opaque, MGWalkVisited *visited)
+{
+    if (!m || mgwalk_visited_has(visited, m)) return;
+    if (mgwalk_visited_add(rt, visited, m) < 0) return;
+    JSFunctionBytecode *root_bc = module_get_root_bc(m);
+    if (root_bc)
+        js_jit_walk_bytecodes(root_bc, cb, opaque);
+    for (int i = 0; i < m->req_module_entries_count; i++) {
+        JSModuleDef *sub = m->req_module_entries[i].module;
+        if (sub) mgwalk_rec(rt, sub, cb, opaque, visited);
+    }
+}
+/* P35.2 — walk the module import graph from entry_module_val.
+ * Follows req_module_entries recursively; each module visited once.
+ * Works with both COMPILE_ONLY modules (imports unresolved, only entry module
+ * walked) and fully evaluated modules (full graph walked). */
+void js_jit_walk_module_graph(JSContext *ctx, JSValue entry_module_val,
+                               void (*cb)(JSFunctionBytecode *, void *),
+                               void *opaque)
+{
+    if (JS_VALUE_GET_TAG(entry_module_val) != JS_TAG_MODULE || !cb) return;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(entry_module_val);
+    MGWalkVisited visited = {NULL, 0, 0};
+    mgwalk_rec(rt, m, cb, opaque, &visited);
+    js_free_rt(rt, visited.ptr);
+}
+/* P35.2 — walk all modules currently loaded in ctx.
+ * Iterates ctx->loaded_modules and calls js_jit_walk_bytecodes on each
+ * module body.  Used by generated js_init_app(ctx) to install JIT functions
+ * without needing the entry module JSValue. */
+void js_jit_walk_all_modules(JSContext *ctx,
+                              void (*cb)(JSFunctionBytecode *, void *),
+                              void *opaque)
+{
+    if (!cb) return;
+    struct list_head *el;
+    list_for_each(el, &ctx->loaded_modules) {
+        JSModuleDef *m = list_entry(el, JSModuleDef, link);
+        JSFunctionBytecode *root_bc = module_get_root_bc(m);
+        if (root_bc)
+            js_jit_walk_bytecodes(root_bc, cb, opaque);
+    }
+}
 /* P13: inner function's closure_var[] accessors. */
 int js_jit_fb_get_inner_cv_type(JSFunctionBytecode *b_inner, int cv_idx) {
     return (int)b_inner->closure_var[cv_idx].closure_type;
