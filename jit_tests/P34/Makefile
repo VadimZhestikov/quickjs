@@ -17,7 +17,7 @@ OBJS   := $(QJS_DIR)/.obj/quickjs.o \
            $(QJS_DIR)/.obj/cutils.o
 LIBS   := -lm -lpthread -ldl
 
-BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5
+BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5 /tmp/test_p34_6
 
 .PHONY: all run clean
 
@@ -32,9 +32,13 @@ all: $(BINS)
 /tmp/test_p34_3: test_p34_3.c
 	gcc $(CFLAGS) -o $@ $< $(OBJS) $(LIBS)
 
-# P34.5 needs -rdynamic so the hybrid .so can resolve quickjs symbols
+# P34.5 and P34.6 need -rdynamic so the hybrid .so can resolve quickjs symbols
 # from the test binary at dlopen time, and -DQJS_DIR to find qjsc.
 /tmp/test_p34_5: test_p34_5.c
+	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' -rdynamic \
+	    -o $@ $< $(OBJS) $(LIBS)
+
+/tmp/test_p34_6: test_p34_6.c
 	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' -rdynamic \
 	    -o $@ $< $(OBJS) $(LIBS)
 
@@ -58,7 +62,10 @@ run: all
 	@echo "=== P34.5: tier==2 after hybrid .so load ==="
 	@/tmp/test_p34_5
 	@echo ""
+	@echo "=== P34.6: js_jit_call_fb executes JIT native code ==="
+	@/tmp/test_p34_6
+	@echo ""
 	@echo "=== ALL P34 TESTS COMPLETE ==="
 
 clean:
-	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_*
+	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_* /tmp/p34_6_*

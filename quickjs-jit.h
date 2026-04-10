@@ -386,6 +386,9 @@ int            js_jit_poll_interrupts(JSContext *ctx);
 /* P8.3: JIT-to-JIT fast call — checks jit_func, calls directly if compiled */
 JSValue        js_jit_call(JSContext *, JSValue func, JSValue this_val,
                             int argc, JSValue *argv);
+/* P34.6: call a JIT-compiled function by bytecode pointer (var_refs=NULL) */
+JSValue        js_jit_call_fb(JSContext *ctx, JSFunctionBytecode *b,
+                               JSValue this_val, int argc, JSValue *argv);
 /* P15: iterator helpers */
 JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv);
 int js_jit_for_in_start(JSContext *ctx, JSValue *pobj);

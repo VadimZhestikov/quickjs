@@ -16150,6 +16150,21 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
     return JS_Call(ctx, func, this_val, argc, argv);
 }
 
+/* P34.6: Call a JIT-compiled function directly by its JSFunctionBytecode.
+ * Intended for testing and tooling that has a bytecode pointer but no
+ * JSFunction object.  var_refs is passed as NULL — suitable for
+ * non-closure functions.  Returns JS_EXCEPTION if not JIT-compiled. */
+JSValue js_jit_call_fb(JSContext *ctx, JSFunctionBytecode *b,
+                       JSValue this_val, int argc, JSValue *argv)
+{
+    JSJITFunc fn = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+    if (!fn)
+        return JS_ThrowTypeError(ctx, "js_jit_call_fb: function not JIT-compiled");
+    if (js_jit_poll_interrupts(ctx))
+        return JS_EXCEPTION;
+    return fn(ctx, this_val, argc, argv, b->cpool, NULL);
+}
+
 /* P11.3: Direct JIT call with argument padding.
  *
  * The callee's JIT code assumes argc == callee_arg_count: it may write back
