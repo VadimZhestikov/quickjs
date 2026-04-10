@@ -48,6 +48,7 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 32: is_derived_ctor — derived class constructors; fixed jit_rt_call_constructor to forward new_target via JS_CallConstructor2; +19% v8bench score |
 | [phase18-todo.md](phase18-todo.md) | Phase 33: has_simple_parameter_list=false — rest params, default params, destructuring params; GEN_GET/PUT/SET_ARG made unconditional for complex params; jit_argc passes original argc for OP_rest; COPY_ARGV buffer overread fixed for spread/apply calls |
 | [phase34-hybrid.md](phase34-hybrid.md) | Phase 34: `qjsc --jit-hybrid` — bytecode + JIT C in one `.so`; `import './mod.so'` with no source `.js`; P34.1–P34.8 API and test suite |
+| [phase35-server-aot.md](phase35-server-aot.md) | Phase 35: server-side AOT pre-compilation — P35.1 bytecode size cap, P35.2 whole-app AOT, P35.3 compile-all, P35.4 standalone binary, P35.5 PGO |
 | [MANUAL.md](MANUAL.md) | Fix: close_var_refs missing from JIT exit path — js_closure2 (called from define_class inside JIT) creates JSVarRefs attached to sf; without close_var_refs on JIT return, closures held dangling pvalue pointers; crashes on 2nd cached run |
 | [MANUAL.md](MANUAL.md) | Feature: --jit-threshold-gcc=N — runtime override for JIT_THRESHOLD_GCC; N=0 triggers AOT pre-pass (compile_all+drain) before execution; N>=1 sets call-count threshold |
 | [MANUAL.md](MANUAL.md) | Feature: --jit-save-sources — writes original JS source of each JIT-compiled function to <hash>.js in cache; self-documenting cache, useful for debugging and tooling |
