@@ -30,16 +30,21 @@ SIGPROF handler (async, signal context)
 
 Main thread
   │
-  ├─► js_jit_install_results()
-  │     └─► jit_registry_add(func_ptr, bc_hash)   ← seqlock write
+  ├─► js_jit_install_results()  (also cache-hit paths in js_jit_queue_gcc)
+  │     └─► jit_registry_add(func_ptr, bc_hash, name)   ← seqlock write
   │
   ├─► js_jit_free_bytecode()
-  │     └─► jit_registry_remove(func_ptr)          ← seqlock write
+  │     └─► jit_registry_remove(func_ptr)                ← seqlock write
   │
-  └─► js_jit_write_profile(ctx, path)
-        └─► js_jit_walk_all_modules → per-bytecode:
-              hash → jit_registry_lookup_samples(hash) → time_ms
-              emit JSON with both "calls" and "time_ms" fields
+  └─► js_jit_write_profile_timed(ctx, path, hz)
+        ├─► Pass 1: js_jit_walk_all_modules → per-module-bytecode:
+        │     hash → jit_registry_lookup_samples(hash) → time_ms
+        │     emit JSON with "calls" + "time_ms" fields
+        │     record hash in seen[] for dedup
+        └─► Pass 2: iterate jit_addr_registry[] directly
+              for entries with samples > 0 not in seen[]
+              (global-script functions not in any loaded module)
+              emit JSON with "calls":0 + "time_ms" + "name" from registry
 ```
 
 **Signal safety**: the registry uses a **seqlock** (write increments an odd
@@ -64,6 +69,7 @@ typedef struct {
     uintptr_t  func_ptr;   /* start address of JIT function              */
     uint64_t   bc_hash;    /* FNV-1a hash — key for profile output        */
     uint32_t   samples;    /* atomic sample counter (SIGPROF increments)  */
+    char       name[80];   /* JS function name for profile output         */
 } JITAddrEntry;
 
 #define JIT_ADDR_REGISTRY_MAX 4096
@@ -110,29 +116,25 @@ static struct itimerval     jit_old_itimer;            /* saved timer     */
 
 ## Step-by-Step Plan
 
-### P36.1 — JIT address range registry
+### P36.1 — JIT address range registry ✓ DONE
 **Files:** `quickjs-jit.c`, `quickjs-jit.h`  
 **Effort:** ~0.5 day  
 **Risk:** low
 
 Add the `JITAddrEntry` array and seqlock to `quickjs-jit.c`.
 
-#### `jit_registry_add(func_ptr, bc_hash)` — called from `js_jit_install_results()`
+#### `jit_registry_add(func_ptr, bc_hash, name)` — called from install paths
 
 ```c
-static void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash)
+void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash, const char *name)
 {
-    if (jit_addr_count >= JIT_ADDR_REGISTRY_MAX) {
-        fprintf(stderr, "quickjs-jit: address registry full; "
-                        "function 0x%016llx will not be sampled\n",
-                (unsigned long long)bc_hash);
-        return;
-    }
+    int cnt = jit_addr_count;
+    if (cnt >= JIT_ADDR_REGISTRY_MAX) return; /* full — not sampled */
 
-    seqlock_write_begin();
+    jit_seqlock_write_begin();
 
     /* Insertion sort to keep array sorted by func_ptr */
-    int i = jit_addr_count;
+    int i = cnt;
     while (i > 0 && jit_addr_registry[i-1].func_ptr > func_ptr) {
         jit_addr_registry[i] = jit_addr_registry[i-1];
         i--;
@@ -140,18 +142,23 @@ static void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash)
     jit_addr_registry[i].func_ptr = func_ptr;
     jit_addr_registry[i].bc_hash  = bc_hash;
     jit_addr_registry[i].samples  = 0;
-    jit_addr_count++;
+    strncpy(jit_addr_registry[i].name, name ? name : "",
+            sizeof(jit_addr_registry[i].name) - 1);
+    jit_addr_count = cnt + 1;
 
-    seqlock_write_end();
+    jit_seqlock_write_end();
 }
 ```
 
-Hook site in `js_jit_install_results()` — after `js_jit_fb_set_func(b, ...)`:
-```c
-    /* P36.1: register address for sampling profiler */
-    if (jit_sampler_hz > 0)
-        jit_registry_add((uintptr_t)r->func, r->bc_hash);
-```
+Called unconditionally (not gated on sampler active) from four install paths:
+- `js_jit_install_results()` — GCC worker result → main thread install
+- `js_jit_queue_gcc()` combined.so path — function already in manifest
+- `js_jit_queue_gcc()` individual cache-hit path — function loaded from `.so`
+- `jit_install_combined_pass()` — post-load manifest scan
+
+JS function name is computed early in `js_jit_queue_gcc` (before any early-return
+paths) via `js_jit_fb_get_func_name(JS_GetRuntime(ctx), b)`, then propagated
+through `JITGCCJob.js_name` → `JITGCCResult.js_name` → registry entry.
 
 #### `jit_registry_remove(func_ptr)` — called from `js_jit_free_bytecode()`
 
@@ -203,7 +210,7 @@ static uint32_t jit_registry_lookup_samples(uint64_t bc_hash)
 
 ---
 
-### P36.2 — SIGPROF sampler (signal handler + timer)
+### P36.2 — SIGPROF sampler (signal handler + timer) ✓ DONE
 **Files:** `quickjs-jit.c`, `quickjs-jit.h`  
 **Effort:** ~1 day  
 **Risk:** medium (platform-specific ucontext, async-signal-safety)
@@ -320,7 +327,7 @@ void js_jit_sampler_stop(void);
 
 ---
 
-### P36.3 — Extended profile writer (`js_jit_write_profile` + `time_ms`)
+### P36.3 — Extended profile writer (`js_jit_write_profile` + `time_ms`) ✓ DONE
 **Files:** `quickjs-jit.c`, `quickjs-jit.h`  
 **Effort:** ~0.5 day  
 **Risk:** low
@@ -337,7 +344,11 @@ typedef struct {
     FILE       *f;
     int         first;
     JSRuntime  *rt;
-    int         hz;       /* P36.3: sampler hz; 0 = no timing data */
+    int         hz;        /* P36.3: sampler hz; 0 = no timing data */
+    /* P36.4: track hashes output by module walk for registry dedup pass */
+    uint64_t   *seen;
+    int         seen_count;
+    int         seen_cap;
 } ProfileWalkState;
 
 static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
@@ -411,8 +422,8 @@ follows the same pattern as `js_jit_write_profile`.
 
 ---
 
-### P36.4 — `qjs --jit-profile-time[=Hz]` flag
-**Files:** `qjs.c`  
+### P36.4 — `qjs --jit-profile-time=<file>[,Hz]` flag ✓ DONE
+**Files:** `qjs.c`, `quickjs-jit.c`  
 **Effort:** ~0.5 day  
 **Risk:** low
 
@@ -420,78 +431,76 @@ follows the same pattern as `js_jit_write_profile`.
 
 ```c
 static const char *jit_profile_time_path = NULL; /* --jit-profile-time=<file> */
-static int         jit_profile_time_hz   = 100;  /* default 100 Hz            */
+static int         jit_profile_time_hz   = 1000; /* default 1000 Hz           */
+static char        jit_profile_time_path_buf[512];
 ```
 
-#### Argument parsing (inside `#ifdef CONFIG_JIT`)
+#### Argument parsing
+
+`--jit-profile-time=<file>[,Hz]` — splits on the *last* comma followed by digits.
+Default Hz is 1000 (higher than P36.2's internal default because WSL2 profiling
+benefits from more samples on short runs).
+
+#### Sampler lifecycle in `eval_buf()` / `main()`
+
+Sampler is started just before `eval_file()` is called (after all context init
+and `--jit-aot` / `--jit-compile-all` option setup, but before JS execution).
+Stopped after `js_std_loop()`.  Profile written after stop.
 
 ```c
-if (!strncmp(longopt, "jit-profile-time=", 17)) {
-    jit_profile_time_path = longopt + 17;
-    /* optional ",Hz" suffix: --jit-profile-time=prof.json,200 */
-    const char *comma = strchr(jit_profile_time_path, ',');
-    if (comma) {
-        /* split: path is before comma */
-        static char path_buf[4096];
-        int n = (int)(comma - jit_profile_time_path);
-        if (n < (int)sizeof(path_buf)) {
-            memcpy(path_buf, jit_profile_time_path, n);
-            path_buf[n] = '\0';
-            jit_profile_time_path = path_buf;
-        }
-        jit_profile_time_hz = atoi(comma + 1);
-        if (jit_profile_time_hz <= 0) jit_profile_time_hz = 100;
-    }
-    continue;
+/* just before eval_file() */
+if (jit_profile_time_path)
+    js_jit_sampler_start(jit_profile_time_hz);
+
+/* ... eval, js_std_loop ... */
+
+if (jit_profile_time_path)
+    js_jit_sampler_stop();
+
+if (jit_profile_time_path) {
+    if (js_jit_write_profile_timed(ctx, jit_profile_time_path,
+                                   jit_profile_time_hz) != 0)
+        fprintf(stderr, "qjs: --jit-profile-time: failed to write '%s'\n",
+                jit_profile_time_path);
 }
 ```
 
-#### Sampler lifecycle in `main()`
+#### Global-script support (registry second pass)
 
-```c
-/* Start sampler immediately after context init */
-#ifdef CONFIG_JIT
-    if (jit_profile_time_path)
-        js_jit_sampler_start(jit_profile_time_hz);
-#endif
+`js_jit_write_profile_timed` now performs two passes:
 
-    /* ... eval files, js_std_loop ... */
+1. **Module walk** (`js_jit_walk_all_modules`): finds all module-scope bytecodes,
+   outputs functions with `calls > 0` or `samples > 0`, records their hashes in
+   `ProfileWalkState.seen[]`.
 
-#ifdef CONFIG_JIT
-    if (jit_profile_time_path) {
-        js_jit_sampler_stop();
-        if (js_jit_write_profile_timed(ctx, jit_profile_time_path,
-                                       jit_profile_time_hz) != 0)
-            fprintf(stderr, "qjs: --jit-profile-time: failed to write '%s'\n",
-                    jit_profile_time_path);
-    }
-    if (jit_profile_path) {  /* existing P35.5-B */
-        if (js_jit_write_profile(ctx, jit_profile_path) != 0)
-            fprintf(stderr, "qjs: --jit-profile: failed to write '%s'\n",
-                    jit_profile_path);
-    }
-#endif
+2. **Registry scan**: iterates `jit_addr_registry[]` directly for any entry with
+   `samples > 0` whose hash is **not** in `seen[]`.  These are global-script
+   functions (not in `ctx->loaded_modules`).  They carry the JS name stored in
+   `JITAddrEntry.name` (populated at `jit_registry_add` time).
+
+This means `--jit-profile-time` works correctly for both module scripts (`.mjs`)
+and traditional global scripts (`.js`).
+
+**Recommended workflow for global scripts:**
+```sh
+# First run: compile and cache all functions
+./qjs --jit-compile-all script.js
+# (or --jit-warmup for AOT combined.so)
+
+# Second run: profile with warm cache
+./qjs --jit-compile-all --jit-profile-time=prof.json,1000 script.js
 ```
 
-**Combining both flags**: `--jit-profile-time` and `--jit-profile` can be given
-together; they write to different files.  The timed profile includes `time_ms`;
-the call-count profile does not.
-
-#### Help text addition
-
-```
-    --jit-profile-time=<file>[,Hz]  (P36) write sampling-based time profile
-                 after execution; Hz = sample rate (default 100); requires
-                 JS modules (global-script bytecodes are freed too early)
-```
+For module files, `--jit-compile-all` or `--jit-aot` work equally well.
 
 #### Tests (P36.4)
 
-`jit-tests/P36/test_p36_4.sh` — shell:
-- A: `qjs --jit-profile-time=/tmp/p36.json module.mjs` creates profile file.
-- B: Profile contains `"time_ms"` field for at least one function.
-- C: `qjs --jit-profile-time=/tmp/p36.json,1000 module.mjs` runs at 1000 Hz without crash.
-- D: Both `--jit-profile` and `--jit-profile-time` can be given simultaneously; both files written.
+`jit-tests/P36/test_p36_4.sh` — shell (5 subtests):
+- A: `--jit-profile-time` creates a JSON file with `"time_ms"` field.
+- B: At least one `time_ms > 0` for a hot function.
+- C: `--jit-profile-time=<file>,500` (Hz=500) parses correctly, profile written.
+- D: **Global-script** function appears in profile via registry second pass.
+- E: **Module** function appears in profile via module walk path.
 
 ---
 
@@ -679,14 +688,14 @@ all supported compilers (GCC ≥ 4.7, Clang ≥ 3.1).
 
 ## Summary
 
-| Sub-phase | What | Effort | Risk |
-|---|---|---|---|
-| P36.1 | Address range registry (seqlock, add/remove/lookup) | 0.5 day | low |
-| P36.2 | SIGPROF sampler (handler + timer + platform ucontext) | 1 day | medium |
-| P36.3 | Extended profile writer (`time_ms` field) | 0.5 day | low |
-| P36.4 | `qjs --jit-profile-time=<file>[,Hz]` flag | 0.5 day | low |
-| P36.5 | `qjsc --jit-pgo` time-aware hotness metric | 0.5 day | low |
-| P36.6 | Makefile + test harness (5 test files) | 0.5 day | low |
+| Sub-phase | What | Effort | Risk | Status |
+|---|---|---|---|---|
+| P36.1 | Address range registry (seqlock, add/remove/lookup) | 0.5 day | low | ✓ DONE |
+| P36.2 | SIGPROF sampler (handler + timer + platform ucontext) | 1 day | medium | ✓ DONE |
+| P36.3 | Extended profile writer (`time_ms` field) | 0.5 day | low | ✓ DONE |
+| P36.4 | `qjs --jit-profile-time=<file>[,Hz]` flag | 0.5 day | low | ✓ DONE |
+| P36.5 | `qjsc --jit-pgo` time-aware hotness metric | 0.5 day | low | pending |
+| P36.6 | Makefile + test harness (5 test files) | 0.5 day | low | partial |
 
 **Total: ~3.5 days**
 
