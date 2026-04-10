@@ -430,7 +430,7 @@ order would free the value before copying it into `var_ref->value`.
 
 **File:** `quickjs-jit.c` — confirmed already done by P13.0.
 
-**Tests** (`tests/test_jit_p13_closures.js`):
+**Tests** (`jit-tests/js/test_jit_p13_closures.js`):
 - Basic counter closure: `function makeCounter() { let n=0; return ()=>n++; }`
 - Multiple closures sharing a var: `function shared() { let x=0; return [()=>x++, ()=>x]; }`
 - Arg capture: `function makeAdder(x) { return y => x+y; }`

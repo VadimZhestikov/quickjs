@@ -238,7 +238,7 @@ JSValue js_jit_call_fb(JSContext *ctx, JSFunctionBytecode *b,
 
 ---
 
-## Test suite (`jit_tests/P34/`)
+## Test suite (`jit-tests/P34/`)
 
 | Test | What it verifies |
 |---|---|
@@ -254,7 +254,7 @@ JSValue js_jit_call_fb(JSContext *ctx, JSFunctionBytecode *b,
 Run all tests from `quickjs/`:
 
 ```sh
-make CONFIG_JIT=y -C jit_tests/P34 run
+make CONFIG_JIT=y -C jit-tests/P34 run
 ```
 
 Build requirements: `CONFIG_JIT=y` build already done (`make CONFIG_JIT=y`).

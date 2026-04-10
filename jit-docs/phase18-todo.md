@@ -34,7 +34,7 @@
     (`gen_st[gen_sp-3]` and `gen_st[gen_sp-2]` → `JIT_T_JSVAL`) after the call, since the
     helper writes new JSValues into those slots. Without this, `_P94_ENSURE` re-boxes stale
     `_ti` values (e.g., old pos=0 instead of updated pos=3), corrupting subsequent opcodes.
-  - Test: `tests/test_jit_p21p22p23.js`.
+  - Test: `jit-tests/js/test_jit_p21p22p23.js`.
 
 **P22 — DONE** (implemented in `quickjs-jit.c`, tested, no regressions).
   - Helpers added in `quickjs.c`: `js_jit_op_private_symbol`, `js_jit_op_get_private_field`,
@@ -59,11 +59,11 @@
     `js_jit_op_define_method_computed`.
   - Function pointers: `check_brand`, `add_brand`, `get_super_value`, `put_super_value`,
     `define_method`, `define_method_computed`.
-  - Tests: `tests/test_jit_p21p22p23.js` covers all implemented opcodes.
+  - Tests: `jit-tests/js/test_jit_p21p22p23.js` covers all implemented opcodes.
 
 **P25 — DONE** (for-in and generic iterators — verified regression test, already implemented).
   - `OP_for_in_start`, `OP_for_in_next`, `OP_iterator_next`, `OP_iterator_call` were
-    all implemented in the P15 phase. Regression tests added in `tests/test_jit_p25p26p27p28.js`.
+    all implemented in the P15 phase. Regression tests added in `jit-tests/js/test_jit_p25p26p27p28.js`.
 
 **P26 — DONE** (constructor / class-definition — implemented without signature change).
   - Key insight: `new_target` and `func_obj` are accessible via
@@ -80,7 +80,7 @@
   - `define_class_computed`: key slot (`sp[-3]`) is read-only; parent and bfunc are consumed.
     On failure only parent/bfunc are freed by `js_op_define_class`; key stays valid.
   - Function pointers: `check_ctor`, `init_ctor`, `define_class`, `define_class_computed`.
-  - Tests: `tests/test_jit_p25p26p27p28.js`.
+  - Tests: `jit-tests/js/test_jit_p25p26p27p28.js`.
 
 **P27 — DONE** (dynamic import).
   - `OP_import`: stack effect 2-in 1-out (specifier, options → promise).
@@ -88,14 +88,14 @@
     does NOT consume its inputs; wrapper frees both after the call.
   - Forward declaration added for static `js_dynamic_import`.
   - Function pointer: `import_op`.
-  - Tests: `tests/test_jit_p25p26p27p28.js`.
+  - Tests: `jit-tests/js/test_jit_p25p26p27p28.js`.
 
 **P28 — DONE** (OP_eval excluded from JIT).
   - `OP_eval` added to `scan_is_unsupported`. Functions containing direct `eval()` are
     excluded from JIT compilation and run interpreted.
   - Rationale: `OP_eval` needs the full scope chain (`scope_idx + ARG_SCOPE_END`) which
     is not available in the JIT function signature without major refactoring.
-  - Tests: `tests/test_jit_p25p26p27p28.js` verifies that eval-using functions still
+  - Tests: `jit-tests/js/test_jit_p25p26p27p28.js` verifies that eval-using functions still
     run correctly (in interpreter mode).
 
 **P29 — DONE** (yield_star, async_yield_star).
@@ -106,7 +106,7 @@
   - Scan pass: `OP_yield_star` and `OP_async_yield_star` now increment `yield_site_counter`
     and are included in the `yield_below[]` computation (same as `OP_yield`/`OP_await`).
   - No new vtable entries or helpers needed — pure inline codegen copied from `OP_yield`.
-  - Tests: `tests/test_jit_p29p30.js` covers sync generator delegation (array, nested
+  - Tests: `jit-tests/js/test_jit_p29p30.js` covers sync generator delegation (array, nested
     generator, return value, string), async generator delegation.
 
 **P31 — DONE** (need_home_object: class methods using super.prop/super.method()).
@@ -122,7 +122,7 @@
     stack frame (the obvious alternative) would break `js_closure2 / get_var_ref` which relies
     on `sf->var_refs` and `sf->arg_buf` being valid for the outer scope.
   - No new helpers, vtable entries, or codegen changes needed.
-  - Tests: `tests/test_jit_p31p32.js` covers `super.method()`, `super.prop` getters,
+  - Tests: `jit-tests/js/test_jit_p31p32.js` covers `super.method()`, `super.prop` getters,
     `super.method(args)`, 3-level super chain, static super, subclass methods.
 
 **P32 — DONE** (is_derived_ctor: derived class constructors).
@@ -135,7 +135,7 @@
     `OP_set_loc_uninitialized` were all already handled correctly.
   - Removed the `is_derived_ctor` eligibility check from `js_jit_is_eligible()`.
   - No new helpers or vtable entries needed.
-  - Tests: `tests/test_jit_p31p32.js` covers basic derived ctor, instanceof chain, 3-level
+  - Tests: `jit-tests/js/test_jit_p31p32.js` covers basic derived ctor, instanceof chain, 3-level
     hierarchy, default args (interpreted), return semantics, new.target.name, combined P31+P32.
   - v8bench score (interp/JIT): Richards 797/1139 (+43%), DeltaBlue 683/837 (+22%),
     total score 894/1060 (+19%).
@@ -162,7 +162,7 @@
     original argv slots are copied.
   - Removed `has_simple_parameter_list` eligibility check from `js_jit_is_eligible()`.
   - No new helpers or vtable entries needed — `OP_rest` was already implemented in P21.
-  - Tests: `tests/test_jit_p33.js` covers rest (zero, exact, only, sum, spread, apply, identity),
+  - Tests: `jit-tests/js/test_jit_p33.js` covers rest (zero, exact, only, sum, spread, apply, identity),
     default (single, first, multiple, expression, combined with rest), destructuring (object,
     array, with defaults, mixed), and combined scenarios (class rest method, recursive rest,
     closure capturing rest, nested rest).
@@ -193,7 +193,7 @@
   - Vtable entries: `with_has`, `with_get_var`, `with_put_var`, `with_delete_var`,
     `with_make_ref`, `with_get_ref`.
   - Note: `with` is only valid in non-strict mode; the test file omits `"use strict"`.
-  - Tests: `tests/test_jit_p29p30.js` covers with_get_var, with_put_var, with_delete_var,
+  - Tests: `jit-tests/js/test_jit_p29p30.js` covers with_get_var, with_put_var, with_delete_var,
     nested with, shadow, and fallthrough.
 
 ## Overview

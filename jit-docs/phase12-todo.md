@@ -211,9 +211,9 @@ is working. Follow the same approach as P15's sync `for_of` handling.
 
 ## Test coverage
 
-- `tests/test_jit_p121_generators.js` — P12.1: generators with try/catch
-- `tests/test_jit_p123_async.js` — P12.3: async function JIT (6 tests, 200 iters each)
-- `tests/test_jit_p124_closures_async_gen.js` — P12.2+P12.4: generator+closure and async generator (7 tests)
+- `jit-tests/js/test_jit_p121_generators.js` — P12.1: generators with try/catch
+- `jit-tests/js/test_jit_p123_async.js` — P12.3: async function JIT (6 tests, 200 iters each)
+- `jit-tests/js/test_jit_p124_closures_async_gen.js` — P12.2+P12.4: generator+closure and async generator (7 tests)
 
 ---
 

@@ -631,4 +631,7 @@ Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
 | `jit_perf_tests/bench_aot.js` | Micro-benchmark suite for `--jit-aot` mode (no warm-up needed) |
 | `jit_perf_tests/v8bench/` | V8 benchmark suite port |
 | `jit_perf_tests/RESULTS.md` | Raw measurements for all phases |
-| `jit_tests/P34/` | Phase 34 C + shell test suite (`make -C jit_tests/P34 run`) |
+| `jit-tests/` | Full JIT test suite — C harness (P1,P2,P5,P8,P9,P10,P34) + JS level (js/) |
+| `jit-tests/js/` | JS-level behavioural tests P12–P33 (`make -C jit-tests/js run`) |
+| `jit-tests/P34/` | Phase 34 C + shell test suite (`make -C jit-tests/P34 run`) |
+| `jit-tests-historical-artifacts/` | Early-phase smoke tests (P1–P3/TCC); superseded by jit-tests/ |
