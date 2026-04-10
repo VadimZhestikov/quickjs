@@ -900,6 +900,32 @@ void js_jit_walk_bytecodes(JSFunctionBytecode *b,
                            void *opaque);
 
 /*
+ * js_jit_gen_c_str() — P34.3
+ * Generate C source for a single JSFunctionBytecode and return it as a
+ * malloc'd NUL-terminated string (caller must free()).
+ *
+ * Parameters:
+ *   ctx        — live JSContext (used to retrieve runtime and function name)
+ *   b          — bytecode to compile
+ *   bc_hash    — js_jit_hash_bytecode_pub(b); passed explicitly so callers
+ *                can compute it once and reuse for the dispatch table
+ *   fname_out  — buffer filled with the generated C symbol name
+ *                (e.g. "__jit_f_aabbccdd11223344")
+ *   fname_sz   — size of fname_out buffer (64 bytes is sufficient)
+ *   unsupported — set to 1 if the function contains unsupported opcodes or
+ *                features (generators, eval, complex params, …); the
+ *                function must then be left to the interpreter
+ *
+ * Returns the C source on success, NULL on unsupported function or OOM.
+ * When NULL is returned due to an unsupported feature *unsupported == 1;
+ * on OOM *unsupported == 0.
+ */
+char *js_jit_gen_c_str(JSContext *ctx, JSFunctionBytecode *b,
+                       uint64_t bc_hash,
+                       char *fname_out, size_t fname_sz,
+                       int *unsupported);
+
+/*
  * js_jit_set_link_mode() — enable hash recording for --jit-link.
  * When active, every bc_hash seen in js_jit_queue_gcc() is appended to an
  * internal list so js_jit_link() can collect the corresponding .c files.

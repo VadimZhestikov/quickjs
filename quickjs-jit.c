@@ -1930,6 +1930,43 @@ void js_jit_walk_bytecodes(JSFunctionBytecode *b,
     free(visited.ptr);
 }
 
+/* P34.3 — public convenience wrapper around js_jit_gen_c().
+ *
+ * Allocates a JSJITCodeBuf internally, runs code generation for b, and
+ * returns the resulting C source as a malloc'd NUL-terminated string.
+ * The caller must free() the returned pointer.
+ *
+ * On success  : returns the C source string; *fname_out filled with the
+ *               C symbol name (e.g. "__jit_f_aabbccdd11223344").
+ * On failure  : returns NULL.  Two distinct failure modes:
+ *   unsupported opcode/feature — *unsupported set to 1, returns NULL.
+ *   OOM                        — *unsupported left 0,  returns NULL.
+ *
+ * bc_hash must be js_jit_hash_bytecode_pub(b); it is passed explicitly so
+ * the caller can compute it once and reuse it for the dispatch table. */
+char *js_jit_gen_c_str(JSContext *ctx, JSFunctionBytecode *b,
+                       uint64_t bc_hash,
+                       char *fname_out, size_t fname_sz,
+                       int *unsupported)
+{
+    JSJITCodeBuf cb;
+    if (jit_buf_init(&cb) < 0) return NULL;
+
+    const char *js_name = js_jit_fb_get_func_name(JS_GetRuntime(ctx), b);
+    int ret = js_jit_gen_c(b, &cb, fname_out, fname_sz, unsupported,
+                            js_name, bc_hash, JS_GetRuntime(ctx), NULL);
+    if (ret < 0 || cb.error) {
+        jit_buf_free(&cb);
+        return NULL;
+    }
+
+    /* Transfer ownership of the buffer to the caller */
+    char *src = cb.buf;
+    cb.buf = NULL; /* prevent jit_buf_free from freeing it */
+    jit_buf_free(&cb);
+    return src;
+}
+
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs)
 {
     if (js_jit_fb_jit_no_compile(b)) return;
