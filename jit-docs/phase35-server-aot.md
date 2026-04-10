@@ -36,7 +36,7 @@ server.js                                                     ./server   (P35.4)
 
 ---
 
-## P35.1 — Bytecode Size Cap (prerequisite for all sub-phases)
+## P35.1 — Bytecode Size Cap (prerequisite for all sub-phases) ✓ DONE
 
 **Goal:** Prevent runaway GCC compilation of data-initialization functions during both
 warmup and runtime.  A prerequisite that unblocks the rest of P35.
@@ -47,32 +47,36 @@ The function runs once, has 2 branches, and the JIT provides zero benefit.
 
 **Solution:** Skip JIT for any function whose bytecode exceeds a configurable limit.
 `jit_no_compile` is already set before the check fires, so the function is never
-re-queued.
+re-queued.  Cap of 0 disables the limit entirely.
 
-### Steps
+### Implementation
 
-- **P35.1-A** Add `JIT_MAX_BC_LEN` constant (default `32768`) to `quickjs-jit.h`.
+- **P35.1-A** `JIT_MAX_BC_LEN = 32768` added to `quickjs-jit.h` as a `#ifndef`-guarded
+  macro (default 32768; override at compile time with `-DJIT_MAX_BC_LEN=N`).
 
-- **P35.1-B** In `js_jit_queue_gcc` (after `js_jit_fb_set_no_compile(b)` and the worker
-  check), add:
+- **P35.1-B** Size check in `js_jit_queue_gcc` (after `js_jit_fb_set_no_compile` and
+  worker check):
   ```c
-  int _bc_len;
-  js_jit_fb_get_bytecode(b, &_bc_len);
-  if (_bc_len > jit_max_bc_len) return;   /* jit_no_compile already set */
+  if (jit_max_bc_len > 0) {
+      int _bc_len;
+      js_jit_fb_get_bytecode(b, &_bc_len);
+      if (_bc_len > jit_max_bc_len) return;
+  }
   ```
 
-- **P35.1-C** Add runtime override: `void js_jit_set_max_bc_len(int n)` declared in
-  `quickjs-jit.h`, with a file-static `int jit_max_bc_len = JIT_MAX_BC_LEN`.
+- **P35.1-C** Runtime override: `js_jit_set_max_bc_len(n)` / `js_jit_get_max_bc_len()`
+  in `quickjs-jit.c`; declared in `quickjs-jit.h`.
 
-- **P35.1-D** Add `--jit-max-bc=N` CLI flag in `qjs.c` and `qjsc.c` that calls
-  `js_jit_set_max_bc_len(N)`.
+- **P35.1-D** `--jit-max-bc=N` CLI flag in `qjs.c` and `qjsc.c`.
 
-- **P35.1-E** Test: run `./qjs --jit-threshold-gcc=1 string-upper-lower-mapping.js`
-  and verify the function is skipped in < 1 ms; interpreter result is correct.
+- **P35.1-E** C harness: `jit-tests/P35/test_p35_1.c` — 4 subtests:
+  - A: cap set just below actual bc_len → function stays tier 0, `jit_no_compile=1`
+  - B: large cap → function reaches tier 2 normally
+  - C: cap=0 disables limit → function reaches tier 2 regardless of size
+  - D: `js_jit_get_max_bc_len()` returns `JIT_MAX_BC_LEN` (32768)
 
-**Estimated effort:** ~0.5 day  
-**Risk:** trivial — one integer comparison in `js_jit_queue_gcc`  
-**Files:** `quickjs-jit.h`, `quickjs-jit.c`, `qjs.c`, `qjsc.c`
+**Files changed:** `quickjs-jit.h`, `quickjs-jit.c`, `qjs.c`, `qjsc.c`,
+`jit-tests/P35/test_p35_1.c`, `jit-tests/P35/Makefile`, `jit-tests/Makefile`
 
 ---
 

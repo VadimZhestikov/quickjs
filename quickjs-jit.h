@@ -859,6 +859,21 @@ void js_jit_set_threshold(int n);
 int  js_jit_get_threshold(void);
 
 /*
+ * js_jit_set_max_bc_len() / js_jit_get_max_bc_len() — P35.1 bytecode size cap.
+ * Functions whose bytecode exceeds this many bytes are silently skipped by
+ * js_jit_queue_gcc (jit_no_compile is already set, so they are never retried).
+ * Prevents runaway GCC compilation of large data-initialisation functions
+ * (e.g. Unicode mapping tables) that generate tens of MB of C with no JIT benefit.
+ * Default: JIT_MAX_BC_LEN (32768).  Set to 0 to disable the cap entirely.
+ * Set by --jit-max-bc=N.
+ */
+#ifndef JIT_MAX_BC_LEN
+#define JIT_MAX_BC_LEN 32768
+#endif
+void js_jit_set_max_bc_len(int n);
+int  js_jit_get_max_bc_len(void);
+
+/*
  * js_jit_set_dump_c_mode() — when active, print generated C to stdout
  * for each JIT-compiled function.  Set by --jit-dump-c.
  */

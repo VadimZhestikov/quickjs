@@ -401,7 +401,8 @@ void help(void)
            "options are:\n"
            "-c          only output bytecode to a C file\n"
            "-e          output main() and bytecode to a C file (default = executable output)\n"
-           "--jit-hybrid  output bytecode + JIT function bodies + js_init_module to a C file\n"
+           "--jit-hybrid   output bytecode + JIT function bodies + js_init_module to a C file\n"
+           "--jit-max-bc=N skip JIT for functions with bytecode > N bytes (default=32768, 0=no cap)\n"
            "-o output   set the output filename\n"
            "-N cname    set the C name of the generated data\n"
            "-m          compile as Javascript module (default=autodetect)\n"
@@ -841,6 +842,12 @@ int main(int argc, char **argv)
 #else
                 fprintf(stderr, "qjsc: --jit-hybrid requires CONFIG_JIT build\n");
                 exit(1);
+#endif
+                continue;
+            }
+            if (!strncmp(longopt, "jit-max-bc=", 11)) {
+#ifdef CONFIG_JIT
+                js_jit_set_max_bc_len(atoi(longopt + 11));
 #endif
                 continue;
             }

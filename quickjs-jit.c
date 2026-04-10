@@ -1784,6 +1784,13 @@ static int jit_threshold_gcc = JIT_THRESHOLD_GCC;
 void js_jit_set_threshold(int n) { jit_threshold_gcc = n; }
 int  js_jit_get_threshold(void)  { return jit_threshold_gcc; }
 
+/* P35.1: bytecode size cap (set via --jit-max-bc=N).
+ * 0 = no cap; >0 = skip functions whose bytecode exceeds N bytes. */
+static int jit_max_bc_len = JIT_MAX_BC_LEN;
+
+void js_jit_set_max_bc_len(int n) { jit_max_bc_len = n; }
+int  js_jit_get_max_bc_len(void)  { return jit_max_bc_len; }
+
 void js_jit_init(void)
 {
     if (jit_worker.started) {
@@ -1974,6 +1981,16 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
     /* Claim the slot: no other thread or call will enqueue this function */
     js_jit_fb_set_no_compile(b);
     if (!jit_worker.started) return;
+
+    /* P35.1: skip functions whose bytecode exceeds the size cap.
+     * jit_no_compile is already set above, so this function is never retried.
+     * Prevents runaway GCC compilation of large data-initialisation functions
+     * (e.g. a 34 MB C file from a Unicode mapping table that takes 340 min). */
+    if (jit_max_bc_len > 0) {
+        int _bc_len;
+        js_jit_fb_get_bytecode(b, &_bc_len);
+        if (_bc_len > jit_max_bc_len) return;
+    }
 
     /* Compute stable bytecode hash for cache lookup and symbol naming.
      * jit_hash_function() includes inner-function closure-var metadata so that

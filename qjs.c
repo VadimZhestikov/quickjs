@@ -358,6 +358,7 @@ void help(void)
            "    --jit-link     combine cached .c files into one LTO .so after running\n"
            "    --jit-dump-c   print generated C source for each compiled function\n"
            "    --jit-threshold-gcc=N  compile after N calls (0=AOT pre-pass, default=100)\n"
+           "    --jit-max-bc=N         skip JIT for functions with bytecode > N bytes (default=32768, 0=no cap)\n"
            "    --jit-save-sources     save original JS source of each compiled function to cache as <hash>.js\n"
 #endif
            );
@@ -525,6 +526,10 @@ int main(int argc, char **argv)
                 js_jit_set_threshold(n);
                 if (n == 0)
                     jit_threshold_mode = 1; /* trigger AOT pre-pass */
+                continue;
+            }
+            if (!strncmp(longopt, "jit-max-bc=", 11)) {
+                js_jit_set_max_bc_len(atoi(longopt + 11));
                 continue;
             }
 #endif
