@@ -12,12 +12,15 @@ LIBS   := -lm -lpthread -ldl
 
 .PHONY: all run clean
 
-all: /tmp/test_p36_1 /tmp/test_p36_2
+all: /tmp/test_p36_1 /tmp/test_p36_2 /tmp/test_p36_3
 
-/tmp/test_p36_1: test_p36_1.c
+/tmp/test_p36_1: test_p36_1.c $(OBJS)
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
-/tmp/test_p36_2: test_p36_2.c
+/tmp/test_p36_2: test_p36_2.c $(OBJS)
+	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
+
+/tmp/test_p36_3: test_p36_3.c $(OBJS)
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
 run: all
@@ -25,7 +28,9 @@ run: all
 	@/tmp/test_p36_1
 	@echo "=== P36.2: SIGPROF sampler ==="
 	@/tmp/test_p36_2
+	@echo "=== P36.3: extended profile writer ==="
+	@/tmp/test_p36_3
 	@echo "=== ALL P36 TESTS COMPLETE ==="
 
 clean:
-	rm -f /tmp/test_p36_1 /tmp/test_p36_2
+	rm -f /tmp/test_p36_1 /tmp/test_p36_2 /tmp/test_p36_3

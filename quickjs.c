@@ -32551,8 +32551,9 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
 
         /* initialize the global variables */
         ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
-        if (JS_IsException(ret_val))
+        if (JS_IsException(ret_val)) {
             goto fail;
+        }
         JS_FreeValue(ctx, ret_val);
     }
 

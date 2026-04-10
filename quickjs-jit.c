@@ -2028,6 +2028,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
             if (jit_combined_manifest[_mi].bc_hash == bc_hash) {
                 js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, jit_combined_manifest[_mi].func_ptr, NULL, 2);
+                /* P36.1: register address for sampling profiler (combined.so path) */
+                jit_registry_add((uintptr_t)jit_combined_manifest[_mi].func_ptr, bc_hash);
                 return;
             }
         }
@@ -2064,6 +2066,8 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
             if (f) {
                 js_jit_fb_set_bc_hash(b, bc_hash);
                 js_jit_fb_set_func(b, f, handle, 2);
+                /* P36.1: register address for sampling profiler (cache-hit path) */
+                jit_registry_add((uintptr_t)f, bc_hash);
                 return;
             }
             dlclose(handle);
@@ -7262,6 +7266,9 @@ static int jit_install_combined_pass(void)
         /* Install with handle=NULL so js_jit_free_bytecode skips it */
         js_jit_fb_set_bc_hash(b, jit_combined_manifest[i].bc_hash);
         js_jit_fb_set_func(b, jit_combined_manifest[i].func_ptr, NULL, 2);
+        /* P36.1: register address for sampling profiler (combined-pass path) */
+        jit_registry_add((uintptr_t)jit_combined_manifest[i].func_ptr,
+                         jit_combined_manifest[i].bc_hash);
         if (old_tier == 2 && old_handle)
             dlclose(old_handle);
         installed++;
