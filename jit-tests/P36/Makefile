@@ -32,7 +32,11 @@ run: all
 	@/tmp/test_p36_3
 	@echo "=== P36.4: --jit-profile-time CLI flag ==="
 	@QJS=$(QJS_DIR)/qjs sh $(QJS_DIR)/jit-tests/P36/test_p36_4.sh
+	@echo "=== P36.5: qjsc --jit-pgo time-aware hotness ==="
+	@QJS=$(QJS_DIR)/qjs QJSC=$(QJS_DIR)/qjsc sh $(QJS_DIR)/jit-tests/P36/test_p36_5.sh
 	@echo "=== ALL P36 TESTS COMPLETE ==="
 
 clean:
 	rm -f /tmp/test_p36_1 /tmp/test_p36_2 /tmp/test_p36_3
+	rm -f /tmp/p36_4_*.js /tmp/p36_4_*.json /tmp/p36_4_*.mjs
+	rm -f /tmp/p36_5_*.mjs /tmp/p36_5_*.json /tmp/p36_5_*.c

@@ -578,14 +578,15 @@ static int output_executable(const char *out_filename, const char *cfilename,
 typedef struct {
     uint64_t hash;
     int      calls;
+    int      time_ms;  /* P36.5: 0 if not present in profile */
 } PGOEntry;
 
 static PGOEntry *g_pgo_entries = NULL;
 static int       g_pgo_count   = 0;
 static int       g_pgo_active  = 0; /* 1 when --jit-pgo was given */
 
-/* Minimal JSON parser: scan for {"hash":"<16hex>","calls":<N>} objects.
- * We rely on the fixed format written by js_jit_write_profile(). */
+/* Minimal JSON parser: scan for {"hash":"<16hex>","calls":<N>[,"time_ms":<M>]}
+ * objects.  "time_ms" is optional (P36.5 timed profiles only). */
 static void pgo_load(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -623,11 +624,23 @@ static void pgo_load(const char *path)
             hash = (hash << 4) | nibble;
         }
         p += 16;
+
+        /* Find the next "hash": to bound searches within this JSON object. */
+        const char *next_hash = strstr(p, "\"hash\":\"");
+        if (!next_hash) next_hash = buf + sz; /* end of file */
+
         /* find "calls": */
         const char *cp = strstr(p, "\"calls\":");
-        if (!cp) break;
+        if (!cp || cp >= next_hash) { p = next_hash; continue; }
         cp += 8;
         int calls = atoi(cp);
+
+        /* P36.5: find optional "time_ms": within same object */
+        int time_ms = 0;
+        const char *tp = strstr(p, "\"time_ms\":");
+        if (tp && tp < next_hash)
+            time_ms = atoi(tp + 10);
+
         p = cp;
 
         if (g_pgo_count >= cap) {
@@ -636,29 +649,44 @@ static void pgo_load(const char *path)
                                     cap * sizeof(*g_pgo_entries));
             if (!g_pgo_entries) { perror("realloc"); exit(1); }
         }
-        g_pgo_entries[g_pgo_count].hash  = hash;
-        g_pgo_entries[g_pgo_count].calls = calls;
+        g_pgo_entries[g_pgo_count].hash    = hash;
+        g_pgo_entries[g_pgo_count].calls   = calls;
+        g_pgo_entries[g_pgo_count].time_ms = time_ms;
         g_pgo_count++;
     }
     free(buf);
     g_pgo_active = 1;
 }
 
-/* Returns call count for hash, or -1 if not in profile. */
-static int pgo_lookup(uint64_t hash)
+/* Returns the PGOEntry for hash, or NULL if not in profile. */
+static const PGOEntry *pgo_lookup(uint64_t hash)
 {
     for (int i = 0; i < g_pgo_count; i++)
         if (g_pgo_entries[i].hash == hash)
-            return g_pgo_entries[i].calls;
-    return -1;
+            return &g_pgo_entries[i];
+    return NULL;
 }
 
-/* Returns "O3" / "O2" / "O1" / "O0" based on call count. */
-static const char *pgo_opt_level(int calls)
+/* P36.5: unified hotness metric.
+ * Prefers time_ms (true CPU time) when available; falls back to calls.
+ * Returns a synthetic "calls" value compatible with pgo_opt_level(). */
+static int pgo_hotness(const PGOEntry *e)
 {
-    if (calls >= 10000) return "O3";
-    if (calls >=  1000) return "O2";
-    if (calls >=   100) return "O1";
+    if (e->time_ms > 0) {
+        if (e->time_ms >= 500) return 10000; /* → O3 */
+        if (e->time_ms >=  50) return  1000; /* → O2 */
+        if (e->time_ms >=   5) return   100; /* → O1 */
+        return 1;                             /* → O0 */
+    }
+    return e->calls;
+}
+
+/* Returns "O3" / "O2" / "O1" / "O0" based on hotness value. */
+static const char *pgo_opt_level(int hotness)
+{
+    if (hotness >= 10000) return "O3";
+    if (hotness >=  1000) return "O2";
+    if (hotness >=   100) return "O1";
     return "O0";
 }
 
@@ -687,10 +715,10 @@ static void hybrid_walk_cb(JSFunctionBytecode *b, void *opaque)
 
     uint64_t hash = js_jit_hash_bytecode_pub(b);
 
-    /* P35.5-C: PGO filter */
+    /* P35.5-C: PGO filter — P36.5: use pgo_hotness() for time_ms support */
     if (g_pgo_active) {
-        int calls = pgo_lookup(hash);
-        if (calls <= 0) return; /* absent or never called — skip */
+        const PGOEntry *pe = pgo_lookup(hash);
+        if (!pe || pgo_hotness(pe) <= 0) return; /* absent or cold — skip */
     }
 
     char fname[64];
@@ -703,11 +731,11 @@ static void hybrid_walk_cb(JSFunctionBytecode *b, void *opaque)
         return;
     }
 
-    /* P35.5-D: per-function optimization pragma */
+    /* P35.5-D: per-function optimization pragma — P36.5: driven by hotness */
     if (g_pgo_active) {
-        int calls = pgo_lookup(hash);
+        const PGOEntry *pe = pgo_lookup(hash);
         fprintf(st->fo, "#pragma GCC optimize(\"%s\")\n",
-                pgo_opt_level(calls));
+                pgo_opt_level(pgo_hotness(pe)));
     }
 
     /* emit the JIT function body */
@@ -943,10 +971,10 @@ static void app_walk_bodies_cb(JSFunctionBytecode *b, void *opaque)
     uint64_t hash = js_jit_hash_bytecode_pub(b);
     if (app_walk_hash_seen(st, hash)) return; /* dedup across modules */
 
-    /* P35.5-C: PGO filter */
+    /* P35.5-C: PGO filter — P36.5: use pgo_hotness() for time_ms support */
     if (g_pgo_active) {
-        int calls = pgo_lookup(hash);
-        if (calls <= 0) return; /* absent or never called — skip */
+        const PGOEntry *pe = pgo_lookup(hash);
+        if (!pe || pgo_hotness(pe) <= 0) return; /* absent or cold — skip */
     }
 
     char fname[64];
@@ -955,11 +983,11 @@ static void app_walk_bodies_cb(JSFunctionBytecode *b, void *opaque)
                                    &unsupported);
     if (!csrc) return; /* unsupported or OOM */
 
-    /* P35.5-D: per-function optimization pragma */
+    /* P35.5-D: per-function optimization pragma — P36.5: driven by hotness */
     if (g_pgo_active) {
-        int calls = pgo_lookup(hash);
+        const PGOEntry *pe = pgo_lookup(hash);
         fprintf(st->fo, "#pragma GCC optimize(\"%s\")\n",
-                pgo_opt_level(calls));
+                pgo_opt_level(pgo_hotness(pe)));
     }
 
     fprintf(st->fo, "%s\n", csrc);

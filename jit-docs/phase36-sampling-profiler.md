@@ -504,12 +504,10 @@ For module files, `--jit-compile-all` or `--jit-aot` work equally well.
 
 ---
 
-### P36.5 — `qjsc --jit-pgo` time-aware extension
+### P36.5 — `qjsc --jit-pgo` time-aware extension ✓ DONE
 **Files:** `qjsc.c`  
 **Effort:** ~0.5 day  
 **Risk:** low
-
-Extend `pgo_load()` and `pgo_opt_level` to consume `time_ms` from the profile.
 
 #### Extended `PGOEntry`
 
@@ -523,95 +521,85 @@ typedef struct {
 
 #### `pgo_load()` extended parser
 
-Scan for both `"calls":` and `"time_ms":` in each JSON object.  `"time_ms"` is
-optional; if absent, `time_ms=0`.
+Within each JSON object, `next_hash` (position of the next `"hash":` token)
+bounds the search so `"time_ms":` from a later entry is not picked up:
 
 ```c
-/* Inside the parse loop: */
-const char *tp = strstr(p, "\"time_ms\":");
-if (tp && tp < next_hash) { /* only if within this JSON object */
-    g_pgo_entries[g_pgo_count].time_ms = atoi(tp + 10);
-}
-```
+const char *next_hash = strstr(p, "\"hash\":\"");
+if (!next_hash) next_hash = buf + sz;
 
-`next_hash` is the position of the next `"hash":` token (used to bound the
-search within one JSON object).
+const char *tp = strstr(p, "\"time_ms\":");
+if (tp && tp < next_hash)
+    g_pgo_entries[g_pgo_count].time_ms = atoi(tp + 10);
+```
 
 #### `pgo_hotness(entry)` — unified hotness metric
 
 ```c
-/* Returns effective hotness for optimization level selection.
- * Prefer time_ms if available (more accurate); fall back to calls. */
 static int pgo_hotness(const PGOEntry *e)
 {
     if (e->time_ms > 0) {
-        /* Map time_ms → synthetic "calls" equivalent for opt_level() reuse */
         if (e->time_ms >= 500) return 10000; /* → O3 */
         if (e->time_ms >=  50) return  1000; /* → O2 */
         if (e->time_ms >=   5) return   100; /* → O1 */
         return 1;                             /* → O0 */
     }
-    return e->calls; /* fall back to call count */
+    return e->calls;
 }
 ```
 
-Then in `pgo_lookup()` + walker callbacks, use `pgo_hotness(&g_pgo_entries[i])`
-instead of `g_pgo_entries[i].calls` directly.
+`pgo_lookup()` now returns `const PGOEntry *` (NULL if absent).  Both walker
+callbacks use `pgo_hotness(pe)` in place of the former `calls` integer for both
+the PGO filter and the `#pragma GCC optimize(...)` selection.
 
 #### Tests (P36.5)
 
-`jit-tests/P36/test_p36_5.sh` — shell, end-to-end PGO round-trip:
-- A: Collect time profile with `--jit-profile-time`.
-- B: `qjsc --jit-hybrid-app --jit-pgo=<time-profile>` generates C with `"O3"` pragma for hot function (time_ms ≥ 500).
-- C: Profile with only `"calls"` (no `"time_ms"`) still works (backwards-compat).
-- D: Profile with both fields uses `time_ms` as the primary metric.
+`jit-tests/P36/test_p36_5.sh` — shell, end-to-end PGO round-trip (6 subtests):
+- A: Timed profile accepted by `qjsc --jit-pgo` without error.
+- B: `time_ms=600` → `#pragma GCC optimize("O3")`.
+- C: `time_ms=60` → `#pragma GCC optimize("O2")`.
+- D: `time_ms=6` → `#pragma GCC optimize("O1")`.
+- E: Calls-only profile (no `time_ms`) still works — backwards compatible.
+- F: Both fields present: `time_ms` wins (`calls=1, time_ms=600` → O3, not O0).
 
 ---
 
-### P36.6 — Makefile and test harness
+### P36.6 — Makefile and test harness ✓ DONE
 **Files:** `jit-tests/P36/Makefile`, `jit-tests/P36/test_p36_*.{c,sh}`
 
+The Makefile tracks `.obj` file dependencies so binaries are relinked whenever
+`quickjs.o` / `quickjs-jit.o` change.  Shell tests receive `QJS` and `QJSC`
+via the environment so they work regardless of working directory.
+
 ```makefile
-QJS_DIR := $(realpath ../..)
-CFLAGS  := -g -O0 -DCONFIG_JIT -I$(QJS_DIR)
-OBJS    := $(QJS_DIR)/.obj/quickjs.o \
-            $(QJS_DIR)/.obj/quickjs-jit.o \
-            $(QJS_DIR)/.obj/quickjs-libc.o \
-            $(QJS_DIR)/.obj/dtoa.o \
-            $(QJS_DIR)/.obj/libregexp.o \
-            $(QJS_DIR)/.obj/libunicode.o \
-            $(QJS_DIR)/.obj/cutils.o
-LIBS    := -lm -lpthread -ldl
-
-.PHONY: all run clean
-
-all: /tmp/test_p36_1 /tmp/test_p36_2 /tmp/test_p36_3
-
-/tmp/test_p36_1: test_p36_1.c
-	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
-
-/tmp/test_p36_2: test_p36_2.c
-	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
-
-/tmp/test_p36_3: test_p36_3.c
-	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
-
 run: all
-	@echo "=== P36.1: address range registry ==="
+	@echo "=== P36.1: JIT address range registry ==="
 	@/tmp/test_p36_1
 	@echo "=== P36.2: SIGPROF sampler ==="
 	@/tmp/test_p36_2
 	@echo "=== P36.3: extended profile writer ==="
 	@/tmp/test_p36_3
-	@echo "=== P36.4: qjs --jit-profile-time flag ==="
-	@sh test_p36_4.sh $(QJS_DIR)/qjs
-	@echo "=== P36.5: qjsc --jit-pgo time-aware ==="
-	@sh test_p36_5.sh $(QJS_DIR)/qjs $(QJS_DIR)/qjsc
+	@echo "=== P36.4: --jit-profile-time CLI flag ==="
+	@QJS=$(QJS_DIR)/qjs sh $(QJS_DIR)/jit-tests/P36/test_p36_4.sh
+	@echo "=== P36.5: qjsc --jit-pgo time-aware hotness ==="
+	@QJS=$(QJS_DIR)/qjs QJSC=$(QJS_DIR)/qjsc sh $(QJS_DIR)/jit-tests/P36/test_p36_5.sh
 	@echo "=== ALL P36 TESTS COMPLETE ==="
 
 clean:
 	rm -f /tmp/test_p36_1 /tmp/test_p36_2 /tmp/test_p36_3
+	rm -f /tmp/p36_4_*.js /tmp/p36_4_*.json /tmp/p36_4_*.mjs
+	rm -f /tmp/p36_5_*.mjs /tmp/p36_5_*.json /tmp/p36_5_*.c
 ```
+
+**Test file inventory:**
+
+| File | Phase | Type | Subtests |
+|---|---|---|---|
+| `test_p36_1.c` | P36.1 | C harness | A–D (registry add/remove/lookup/capacity) |
+| `test_p36_2.c` | P36.2 | C harness | A–D (sampler start/stop/samples/double-start) |
+| `test_p36_3.c` | P36.3 | C harness | A–D (profile writer hz=0, timed, uncalled, compat) |
+| `test_p36_4.sh` | P36.4 | shell | A–E (CLI flag, global scripts, modules) |
+| `test_p36_5.sh` | P36.5 | shell | A–F (PGO round-trip, hotness thresholds, compat) |
 
 ---
 
@@ -694,14 +682,14 @@ all supported compilers (GCC ≥ 4.7, Clang ≥ 3.1).
 | P36.2 | SIGPROF sampler (handler + timer + platform ucontext) | 1 day | medium | ✓ DONE |
 | P36.3 | Extended profile writer (`time_ms` field) | 0.5 day | low | ✓ DONE |
 | P36.4 | `qjs --jit-profile-time=<file>[,Hz]` flag | 0.5 day | low | ✓ DONE |
-| P36.5 | `qjsc --jit-pgo` time-aware hotness metric | 0.5 day | low | pending |
-| P36.6 | Makefile + test harness (5 test files) | 0.5 day | low | partial |
+| P36.5 | `qjsc --jit-pgo` time-aware hotness metric | 0.5 day | low | ✓ DONE |
+| P36.6 | Makefile + test harness (5 test files) | 0.5 day | low | ✓ DONE |
 
-**Total: ~3.5 days**
+**Total: ~3.5 days — ✓ ALL DONE**
 
 **Files changed:**
-- `quickjs-jit.c` — registry, seqlock, sampler, `js_jit_write_profile_timed`
+- `quickjs-jit.c` — registry + seqlock + name propagation, sampler, `js_jit_write_profile_timed` (module walk + registry second pass)
 - `quickjs-jit.h` — `js_jit_sampler_start`, `js_jit_sampler_stop`, `js_jit_write_profile_timed`
-- `qjs.c` — `--jit-profile-time` flag, sampler lifecycle
-- `qjsc.c` — `pgo_load` extension, `PGOEntry.time_ms`, `pgo_hotness()`
-- `jit-tests/P36/` — new test directory (Makefile + 5 test files)
+- `qjs.c` — `--jit-profile-time=<file>[,Hz]` flag, sampler lifecycle
+- `qjsc.c` — `PGOEntry.time_ms`, `pgo_hotness()`, `pgo_load()` extended parser, `pgo_lookup()` returns `const PGOEntry *`
+- `jit-tests/P36/` — Makefile + 5 test files (3 C harnesses + 2 shell scripts)
