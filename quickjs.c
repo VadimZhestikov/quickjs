@@ -15870,6 +15870,15 @@ JSFunctionBytecode *js_jit_cpool_get_fb(JSFunctionBytecode *b, int idx) {
     if (JS_VALUE_GET_TAG(v) != JS_TAG_FUNCTION_BYTECODE) return NULL;
     return (JSFunctionBytecode *)JS_VALUE_GET_PTR(v);
 }
+/* P34.4: extract the body JSFunctionBytecode from a JS_TAG_MODULE value.
+ * Used by js_init_module in --jit-hybrid generated code to walk bytecodes
+ * for JIT function pointer installation after JS_ReadObject. */
+JSFunctionBytecode *js_jit_module_get_bc(JSValue module_val) {
+    if (JS_VALUE_GET_TAG(module_val) != JS_TAG_MODULE) return NULL;
+    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(module_val);
+    if (JS_VALUE_GET_TAG(m->func_obj) != JS_TAG_FUNCTION_BYTECODE) return NULL;
+    return (JSFunctionBytecode *)JS_VALUE_GET_PTR(m->func_obj);
+}
 /* P13: inner function's closure_var[] accessors. */
 int js_jit_fb_get_inner_cv_type(JSFunctionBytecode *b_inner, int cv_idx) {
     return (int)b_inner->closure_var[cv_idx].closure_type;

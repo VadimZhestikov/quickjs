@@ -354,6 +354,9 @@ const char    *js_jit_fb_get_source(JSFunctionBytecode *b, int *len_out);
 JSAtom         js_jit_fb_get_func_atom(JSFunctionBytecode *b);
 /* P13: inner function's cpool entry as JSFunctionBytecode* (NULL if not function) */
 JSFunctionBytecode *js_jit_cpool_get_fb(JSFunctionBytecode *b, int cpool_idx);
+/* P34.4: extract the body JSFunctionBytecode* from a JS_TAG_MODULE value.
+ * Returns NULL if module_val is not a module or has no JS body (C module). */
+JSFunctionBytecode *js_jit_module_get_bc(JSValue module_val);
 /* P13: JSClosureTypeEnum values — must match quickjs.c (verified by _Static_assert). */
 #define JIT_CLOSURE_LOCAL         0  /* var_idx = local index in outer function */
 #define JIT_CLOSURE_ARG           1  /* var_idx = arg index in outer function */
