@@ -873,6 +873,19 @@ void js_jit_set_save_sources(int active);
 int js_jit_cache_has_c_src(JSFunctionBytecode *b);
 
 /*
+ * js_jit_hash_bytecode_pub() — P34.1
+ * Returns the stable 64-bit FNV-1a hash that identifies this function's
+ * bytecode.  The hash covers raw bytecode bytes plus inner-function
+ * closure-var metadata (count, types, var indices) so two functions with
+ * identical opcodes but different closure layouts get distinct hashes.
+ *
+ * This is the same hash used to name cache files
+ * (~/.cache/qjs-jit/<hex16>.so) and to key the JIT dispatch table in
+ * hybrid .so modules (P34.4).
+ */
+uint64_t js_jit_hash_bytecode_pub(JSFunctionBytecode *b);
+
+/*
  * js_jit_set_link_mode() — enable hash recording for --jit-link.
  * When active, every bc_hash seen in js_jit_queue_gcc() is appended to an
  * internal list so js_jit_link() can collect the corresponding .c files.

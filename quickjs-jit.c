@@ -1850,6 +1850,16 @@ int js_jit_cache_has_c_src(JSFunctionBytecode *b)
     return jit_cache_has_c_src(jit_hash_function(b));
 }
 
+/* P34.1 — public wrapper around jit_hash_function().
+ * Returns the stable bytecode hash used for cache filenames and JIT dispatch
+ * tables.  The hash covers raw bytecode bytes plus inner-function closure-var
+ * metadata so that two functions with identical opcodes but different closure
+ * layouts get distinct hashes. */
+uint64_t js_jit_hash_bytecode_pub(JSFunctionBytecode *b)
+{
+    return jit_hash_function(b);
+}
+
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs)
 {
     if (js_jit_fb_jit_no_compile(b)) return;
@@ -1927,7 +1937,15 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
                 return;
             }
             dlclose(handle);
-            /* Corrupted cache entry — fall through to recompile */
+            /* Corrupted cache entry (symbol missing) — fall through to recompile */
+        } else {
+            /* dlopen failed — typically a P10.3 callee symbol not yet loaded via
+             * RTLD_GLOBAL.  The .so itself is valid; do NOT recompile (that would
+             * overwrite cache files and waste GCC cycles on every run).  Return and
+             * let the interpreter handle this call; the function will be retried
+             * from cache on the next js_jit_queue_gcc call for the same bytecode
+             * (next runtime / next test). */
+            return;
         }
     }
 
