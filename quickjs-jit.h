@@ -498,10 +498,10 @@ typedef struct {
                          * reallocated for a different layout, the atom at this
                          * slot will differ, preventing false IC hits. */
     uint8_t   kind;     /* 0=general, 1=float64 typed slot (P8.6) */
-    uint8_t   _pad0;    /* explicit padding (was _pad[0]) */
-    uint16_t  shape_gen;/* JSShape generation counter — within-runtime shape ABA guard:
+    uint8_t   _pad[3];  /* explicit padding to align shape_gen at natural boundary */
+    uint32_t  shape_gen;/* JSShape generation counter — within-runtime shape ABA guard:
                          * if a JSShape is freed and a new one is allocated at the same
-                         * address, the new shape gets a higher shape_gen (mod 2^16),
+                         * address, the new shape gets a higher shape_gen (mod 2^32),
                          * so the IC check fails and the entry is safely refilled.
                          * Set by js_jit_ic_fill_get/put; checked in JIT_IC_CHECK. */
     uint32_t  rt_gen;   /* JSRuntime generation counter — ABA guard: even if a new
@@ -528,9 +528,9 @@ typedef struct {
  * both sets together.
  *   JSObject.shape        = byte 32
  *   JSObject.prop         = byte 40  (pointer to JSProperty array)
- *   JSShape.shape_gen     = byte 26  (uint16_t generation counter — shape ABA guard)
- *   JSShape.prop_count    = byte 40
- *   JSShape.prop[]        = byte 64  (flexible array of JSShapeProperty)
+ *   JSShape.shape_gen     = byte 28  (uint32_t generation counter — shape ABA guard)
+ *   JSShape.prop_count    = byte 44
+ *   JSShape.prop[]        = byte 72  (flexible array of JSShapeProperty)
  *   JSShapeProperty.atom  = byte  4  (after 4-byte bitfield word)
  *   sizeof(JSShapeProperty) = 8
  *   sizeof(JSProperty)    = 16       (= sizeof(JSValue); u.value is at offset 0)
@@ -538,9 +538,9 @@ typedef struct {
 #define JIT_OBJIC_SHAPE_OFF       32
 #define JIT_OBJ_PROP_OFF          40  /* JSObject.prop pointer */
 #define JIT_PROP_SIZE             16  /* sizeof(JSProperty) == sizeof(JSValue) */
-#define JIT_SHAPEIC_SHAPEGEN_OFF  26  /* JSShape.shape_gen (uint16_t) — within-runtime ABA guard */
-#define JIT_SHAPEIC_PROPCOUNT_OFF 40
-#define JIT_SHAPEIC_PROP_OFF      64
+#define JIT_SHAPEIC_SHAPEGEN_OFF  28  /* JSShape.shape_gen (uint32_t) — within-runtime ABA guard */
+#define JIT_SHAPEIC_PROPCOUNT_OFF 44
+#define JIT_SHAPEIC_PROP_OFF      72
 #define JIT_SHAPEIC_PROPSIZE       8
 #define JIT_SHAPEIC_ATOM_OFF       4
 
@@ -605,7 +605,7 @@ uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
-     *(const uint16_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
+     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
      (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
      *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
                         (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)

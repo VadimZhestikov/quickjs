@@ -956,14 +956,14 @@ struct JSShape {
     /* true if the shape is inserted in the shape hash table. If not,
        JSShape.hash is not valid */
     uint8_t is_hashed;
-    uint8_t _shape_pad0; /* explicit padding (was implicit before shape_gen) */
+    uint8_t _shape_pad[3]; /* explicit padding to align shape_gen at offset 28 */
     /* Monotonically-increasing generation counter assigned at shape
      * allocation.  Used by JIT_IC_CHECK to defeat the within-runtime
      * shape ABA problem: if a JSShape is freed and a new one is
      * allocated at the same address, the generation will differ,
-     * forcing an IC miss and safe refill.  uint16_t gives 65536
-     * distinct values — wrap-around is astronomically unlikely. */
-    uint16_t shape_gen;
+     * forcing an IC miss and safe refill.  uint32_t gives 4 billion
+     * distinct values — wrap-around is not a practical concern. */
+    uint32_t shape_gen;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -4887,7 +4887,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     sh->header.ref_count = 1;
     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
-    sh->shape_gen = (uint16_t)(++js_shape_gen_counter);
+    sh->shape_gen = ++js_shape_gen_counter;
     if (proto)
         JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, proto));
     sh->proto = proto;
@@ -4950,7 +4950,7 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     sh->header.ref_count = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
-    sh->shape_gen = (uint16_t)(++js_shape_gen_counter); /* new generation — distinct from source */
+    sh->shape_gen = ++js_shape_gen_counter; /* new generation — distinct from source */
     sh->is_hashed = FALSE;
     if (sh->proto) {
         JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
