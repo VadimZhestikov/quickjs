@@ -17,7 +17,7 @@ OBJS   := $(QJS_DIR)/.obj/quickjs.o \
            $(QJS_DIR)/.obj/cutils.o
 LIBS   := -lm -lpthread -ldl
 
-BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5 /tmp/test_p34_6 /tmp/test_p34_7
+BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5 /tmp/test_p34_6 /tmp/test_p34_7 /tmp/test_p34_8
 
 .PHONY: all run clean
 
@@ -46,6 +46,11 @@ all: $(BINS)
 	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' -rdynamic \
 	    -o $@ $< $(OBJS) $(LIBS)
 
+# P34.8 does not need -rdynamic (no dlopen); just needs QJS_DIR for qjsc/qjs paths.
+/tmp/test_p34_8: test_p34_8.c
+	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' \
+	    -o $@ $< $(OBJS) $(LIBS)
+
 run: all
 	@echo "=== P34.1: js_jit_hash_bytecode_pub ==="
 	@rm -f ~/.cache/qjs-jit/*.so ~/.cache/qjs-jit/*.c ~/.cache/qjs-jit/*.skip
@@ -72,7 +77,10 @@ run: all
 	@echo "=== P34.7: unsupported (eval) functions fall back to interpreter ==="
 	@/tmp/test_p34_7
 	@echo ""
+	@echo "=== P34.8: source stripping / Function.prototype.toString ==="
+	@/tmp/test_p34_8
+	@echo ""
 	@echo "=== ALL P34 TESTS COMPLETE ==="
 
 clean:
-	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_* /tmp/p34_6_* /tmp/p34_7_*
+	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_* /tmp/p34_6_* /tmp/p34_7_* /tmp/p34_8*
