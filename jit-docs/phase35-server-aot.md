@@ -208,7 +208,7 @@ cap applies automatically inside `js_jit_compile_all` → `js_jit_queue_gcc`.
 
 ---
 
-## P35.4 — Standalone Binary (`qjsc --standalone`)
+## P35.4 — Standalone Binary (`qjsc --standalone`) ✓ DONE
 
 **Goal:** Produce a self-contained executable that embeds the QuickJS runtime,
 bytecode, and JIT-compiled native code.  No `.js` files, no `.so` files, no `qjs`
@@ -220,41 +220,77 @@ binary required at deployment.  Single-binary distribution.
 server.js
     │
     ▼  qjsc --standalone -o server server.js
+    │  (generates /tmp/outNNN.c, then compiles it)
     │
-server.c   (bytecodes + JIT bodies + main() wrapper + embedded std library)
+server.c   (bytecodes + JIT bodies + _eval_blob helper + main())
     │
-    ▼  gcc -O3 -static-libgcc -o server server.c -L. -lquickjs -lm -lpthread -ldl
+    ▼  gcc -O2 -DCONFIG_JIT -I<quickjs_dir> -o server server.c libquickjs.a -lm -ldl -lpthread
     │
-./server   ← self-contained; no external dependencies
+./server   ← self-contained; runs without any .js files
 ```
 
-### Steps
+### Implementation
 
-- **P35.4-A** Add `--standalone -o <binary>` flag to `qjsc.c`.
+**`qjsc.c`** — new `OUTPUT_STANDALONE` mode:
 
-- **P35.4-B** Generate a `.c` file that includes:
-  1. The bytecode blob for all modules (P34 section 1 format).
-  2. JIT function bodies for all eligible functions (P35.2 C generation).
-  3. Embedded `repl.c`-style standard library (or a stripped-down version).
-  4. A `main(int argc, char **argv)` that creates runtime + context, loads the
-     bytecode, runs `js_init_app()`, evaluates the module, and calls `js_std_loop()`.
+- **`g_jit_module_hook`** / **`g_jit_module_hook_opaque`** (globals, CONFIG_JIT-guarded):
+  Set during standalone compilation so `jsc_module_loader` notifies the JIT walker
+  whenever a dependency module is recursively compiled.  This gives JIT coverage
+  for the full import graph, not just explicitly listed files.
 
-- **P35.4-C** Produce `libquickjs.a` as a build artifact (it already exists via
-  `make CONFIG_JIT=y`).  Document the link command.
+- **`standalone_module_walk(root_bc, opaque)`** (static, after `output_hybrid_app`):
+  Walker hooked into `jsc_module_loader`; adds `root_bc` to the AppWalkState roots
+  list (to exclude module body from JIT) and walks inner functions.
 
-- **P35.4-D** Handle dynamic features: `import()`, `require()`, worker threads.  These
-  require the module loader to be embedded; for server-side code where all modules are
-  known at build time, they can be statically embedded.  Dynamic `import()` of
-  unknown modules falls back to a runtime error with a clear message.
+- **`jsc_module_loader` hook** (inside `#ifdef CONFIG_JIT`): after
+  `output_object_code` for each JS dependency module, calls `g_jit_module_hook`
+  if set.
 
-- **P35.4-E** Tests: compile a `hello.js` to `./hello`; run without any other files;
-  verify output and exit code.  Compile a multi-module server stub; verify all imports
-  resolve.
+- **`OUTPUT_STANDALONE` block in `main()`**:
+  1. Opens a temp file (`jit_tmp`) for JIT function bodies.
+  2. Compiles each listed input file:  
+     bytecode blob → `fo` (main output) via `output_object_code`;  
+     JIT function bodies → `jit_tmp` via `AppWalkState`.  
+     Dependency modules are handled by the `jsc_module_loader` hook.
+  3. After compilation: copies `jit_tmp` into `fo`, emits dispatch table +
+     `_install_cb` (inside `#ifdef CONFIG_JIT`).
+  4. Emits `_eval_blob(ctx, buf, len, load_only)` static helper — mirrors
+     `js_std_eval_binary` but injects `js_jit_walk_bytecodes(b, _install_cb, NULL)`
+     before evaluation.
+  5. Emits `JS_NewCustomContext` (loads dependency modules with `_eval_blob(..., 1)`)
+     and `main()` (executes entry scripts with `_eval_blob(..., 0)` + `js_std_loop`).
+  6. Compiles the C file to a binary via `output_executable` with `-DCONFIG_JIT`
+     passed as an extra compiler flag.
 
-**Estimated effort:** ~6 days  
-**Risk:** medium-high — embedded std library, module loader, argv handling  
-**Dependencies:** P35.2 (whole-app AOT)  
-**Files:** `qjsc.c`, `quickjs-libc.c`, `Makefile`
+- **`output_executable` signature extended**: added `const char **extra_cflags`
+  parameter (NULL for all existing callers); for `--standalone`, passes
+  `{"-DCONFIG_JIT", NULL}` so the `#ifdef CONFIG_JIT` blocks in `_eval_blob` and
+  the dispatch table are active.
+
+**Module loader**: the standalone binary installs `js_module_loader` from
+`quickjs-libc` so dynamic `import()` still works at runtime for modules not
+embedded at build time.  All statically-imported modules are pre-loaded in
+`JS_NewCustomContext` and resolve without filesystem access.
+
+**Usage:**
+```sh
+# Build (libquickjs.a must be built with CONFIG_JIT=y):
+./qjsc --standalone -o server server.js
+
+# Multi-file (entry imports lib; lib is auto-embedded via jsc_module_loader):
+./qjsc --standalone -o server server.mjs
+
+# Deploy:
+./server   # runs with no .js files, all bytecodes embedded
+```
+
+**Tests:** `jit-tests/P35/test_p35_4.sh` — 4 subtests:
+- A: simple global script; binary runs without source file present
+- B: functions produce correct results (fib, add)
+- C: ES module with `import`; binary runs after source files are removed
+- D: std library (print, scriptArgs) available in standalone binary
+
+**Files changed:** `qjsc.c`, `jit-tests/P35/test_p35_4.sh`, `jit-tests/P35/Makefile`
 
 ---
 
@@ -345,7 +381,7 @@ P35.1 (size cap)              ← prerequisite for all; implement first
 | P35.1 size cap | Pathological data files; unblocks all others | 0.5 day | trivial |
 | P35.2 hybrid-app | Whole-app AOT; no traffic needed | 5 days | medium |
 | P35.3 compile-all | Single-file static compilation | 2 days ✓ | low |
-| P35.4 standalone | Single-binary deployment | 6 days | medium-high |
+| P35.4 standalone | Single-binary deployment | 6 days ✓ | medium-high |
 | P35.5 PGO | Per-function optimization levels | 7 days | medium |
 
 **Minimum viable**: P35.1 + P35.3 (~2.5 days total) gives a usable server-side

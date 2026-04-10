@@ -65,6 +65,14 @@ static BOOL byte_swap;
 static BOOL dynamic_export;
 static const char *c_ident_prefix = "qjsc_";
 
+#ifdef CONFIG_JIT
+/* P35.4 — --standalone: hook called by jsc_module_loader for each recursively
+ * loaded JS module, so JIT bodies are collected for the full import graph.
+ * Set before compilation, cleared afterwards. */
+static void (*g_jit_module_hook)(JSFunctionBytecode *root_bc, void *opaque) = NULL;
+static void *g_jit_module_hook_opaque = NULL;
+#endif
+
 #define FE_ALL (-1)
 
 static const FeatureEntry feature_list[] = {
@@ -321,7 +329,15 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
                 find_unique_cname(cname, sizeof(cname));
             }
             output_object_code(ctx, outfile, func_val, cname, CNAME_TYPE_MODULE);
-            
+
+#ifdef CONFIG_JIT
+            /* P35.4: collect JIT bodies from this dependency module */
+            if (g_jit_module_hook) {
+                JSFunctionBytecode *root_bc = js_jit_module_get_bc(func_val);
+                if (root_bc)
+                    g_jit_module_hook(root_bc, g_jit_module_hook_opaque);
+            }
+#endif
             /* the module is already referenced, so we must free it */
             m = JS_VALUE_GET_PTR(func_val);
             JS_FreeValue(ctx, func_val);
@@ -403,6 +419,8 @@ void help(void)
            "-e          output main() and bytecode to a C file (default = executable output)\n"
            "--jit-hybrid     output bytecode + JIT function bodies + js_init_module to a C file\n"
            "--jit-hybrid-app output JIT bodies for all input modules + js_init_app to a C file\n"
+           "--standalone     (P35.4) produce a self-contained binary with embedded bytecodes\n"
+           "                 and AOT-compiled JIT functions; no .js files needed at runtime\n"
            "--jit-max-bc=N   skip JIT for functions with bytecode > N bytes (default=32768, 0=no cap)\n"
            "-o output   set the output filename\n"
            "-N cname    set the C name of the generated data\n"
@@ -453,7 +471,8 @@ int exec_cmd(char **argv)
 }
 
 static int output_executable(const char *out_filename, const char *cfilename,
-                             BOOL use_lto, BOOL verbose, const char *exename)
+                             BOOL use_lto, BOOL verbose, const char *exename,
+                             const char **extra_cflags)
 {
     const char *argv[64];
     const char **arg, *bn_suffix, *lto_suffix;
@@ -497,6 +516,11 @@ static int output_executable(const char *out_filename, const char *cfilename,
        libraries */
     *arg++ = "-D";
     *arg++ = "_GNU_SOURCE";
+    if (extra_cflags) {
+        const char **ep;
+        for (ep = extra_cflags; *ep; ep++)
+            *arg++ = *ep;
+    }
     *arg++ = "-I";
     *arg++ = inc_dir;
     *arg++ = "-o";
@@ -524,8 +548,10 @@ static int output_executable(const char *out_filename, const char *cfilename,
 }
 #else
 static int output_executable(const char *out_filename, const char *cfilename,
-                             BOOL use_lto, BOOL verbose, const char *exename)
+                             BOOL use_lto, BOOL verbose, const char *exename,
+                             const char **extra_cflags)
 {
+    (void)extra_cflags;
     fprintf(stderr, "Executable output is not supported for this target\n");
     exit(1);
     return 0;
@@ -901,6 +927,16 @@ static void output_hybrid_app(JSContext *ctx, FILE *fo,
     free(st.entries);
     free(st.roots);
 }
+
+/* P35.4 — standalone: walker callback installed as g_jit_module_hook so that
+ * dependency modules recursively loaded by jsc_module_loader also contribute
+ * JIT function bodies to the AppWalkState. */
+static void standalone_module_walk(JSFunctionBytecode *root_bc, void *opaque)
+{
+    AppWalkState *st = (AppWalkState *)opaque;
+    app_walk_add_root(st, root_bc);
+    js_jit_walk_bytecodes(root_bc, app_walk_bodies_cb, st);
+}
 #endif /* CONFIG_JIT */
 
 static size_t get_suffixed_size(const char *str)
@@ -935,6 +971,7 @@ typedef enum {
     OUTPUT_EXECUTABLE,
     OUTPUT_C_HYBRID,      /* P34.4: bytecode + JIT bodies + js_init_module */
     OUTPUT_C_HYBRID_APP,  /* P35.2: all-modules JIT AOT; js_init_app entry point */
+    OUTPUT_STANDALONE,    /* P35.4: self-contained binary (bytecodes + JIT + main) */
 } OutputTypeEnum;
 
 static const char *get_short_optarg(int *poptind, int opt,
@@ -1036,6 +1073,10 @@ int main(int argc, char **argv)
 #endif
                 continue;
             }
+            if (!strcmp(longopt, "standalone")) {
+                output_type = OUTPUT_STANDALONE;
+                continue;
+            }
             if (!strncmp(longopt, "jit-max-bc=", 11)) {
 #ifdef CONFIG_JIT
                 js_jit_set_max_bc_len(atoi(longopt + 11));
@@ -1133,16 +1174,15 @@ int main(int argc, char **argv)
         help();
 
     if (!out_filename) {
-        if (output_type == OUTPUT_EXECUTABLE) {
+        if (output_type == OUTPUT_EXECUTABLE || output_type == OUTPUT_STANDALONE) {
             out_filename = "a.out";
         } else {
             out_filename = "out.c";
         }
     }
 
-    if (output_type == OUTPUT_EXECUTABLE) {
+    if (output_type == OUTPUT_EXECUTABLE || output_type == OUTPUT_STANDALONE) {
 #if defined(_WIN32) || defined(__ANDROID__)
-        /* XXX: find a /tmp directory ? */
         snprintf(cfilename, sizeof(cfilename), "out%d.c", getpid());
 #else
         snprintf(cfilename, sizeof(cfilename), "/tmp/out%d.c", getpid());
@@ -1247,6 +1287,236 @@ int main(int argc, char **argv)
     }
 #endif /* CONFIG_JIT */
 
+    if (output_type == OUTPUT_STANDALONE) {
+        /* P35.4 — standalone binary:
+         *   - Compile all listed JS files; jsc_module_loader handles imports.
+         *   - Bytecode blobs → cfilename (fo).
+         *   - JIT function bodies → jit_tmp (via g_jit_module_hook + top-level walk).
+         *   - Emit JIT table, _install_cb, _eval_blob, JS_NewCustomContext, main().
+         *   - Compile cfilename → out_filename binary. */
+#ifdef CONFIG_JIT
+        FILE *jit_tmp = tmpfile();
+        if (!jit_tmp) { perror("tmpfile"); exit(1); }
+        AppWalkState jit_st = {ctx, jit_tmp, NULL, 0, 0, NULL, 0, 0};
+
+        /* Hook so jsc_module_loader also walks dependency modules for JIT */
+        g_jit_module_hook = standalone_module_walk;
+        g_jit_module_hook_opaque = &jit_st;
+#endif
+
+        /* File header */
+        fprintf(fo,
+            "/* Generated by qjsc --standalone. Do not edit. */\n"
+            "#include \"quickjs-libc.h\"\n"
+            "#ifdef CONFIG_JIT\n"
+            "#include \"quickjs-jit.h\"\n"
+            "#endif\n\n");
+
+        /* Compile each input file:
+         *   - bytecode blob written to fo via output_object_code
+         *   - JIT bodies written to jit_tmp via jit_st walker */
+        for (i = optind; i < argc; i++) {
+            const char *filename = argv[i];
+            uint8_t *buf;
+            size_t buf_len;
+            char c_name_buf[1024];
+            int is_mod, eval_fl;
+            JSValue obj;
+
+            buf = js_load_file(ctx, &buf_len, filename);
+            if (!buf) {
+                fprintf(stderr, "qjsc: cannot load '%s'\n", filename);
+                exit(1);
+            }
+            is_mod = (module < 0)
+                ? (has_suffix(filename, ".mjs") ||
+                   JS_DetectModule((const char *)buf, buf_len))
+                : module;
+            eval_fl = JS_EVAL_FLAG_COMPILE_ONLY
+                    | (is_mod ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL);
+            obj = JS_Eval(ctx, (const char *)buf, buf_len, filename, eval_fl);
+            js_free(ctx, buf);
+            if (JS_IsException(obj)) {
+                js_std_dump_error(ctx);
+                exit(1);
+            }
+
+#ifdef CONFIG_JIT
+            /* Walk JIT bytecodes for this top-level file */
+            {
+                JSFunctionBytecode *root_bc = is_mod
+                    ? js_jit_module_get_bc(obj)
+                    : ((JS_VALUE_GET_TAG(obj) == JS_TAG_FUNCTION_BYTECODE)
+                       ? (JSFunctionBytecode *)JS_VALUE_GET_PTR(obj) : NULL);
+                if (root_bc) {
+                    app_walk_add_root(&jit_st, root_bc);
+                    js_jit_walk_bytecodes(root_bc, app_walk_bodies_cb, &jit_st);
+                }
+            }
+#endif
+
+            /* Serialize bytecode blob to fo (as CNAME_TYPE_SCRIPT → executed in main) */
+            if (cname) {
+                pstrcpy(c_name_buf, sizeof(c_name_buf), cname);
+                cname = NULL;
+            } else {
+                get_c_name(c_name_buf, sizeof(c_name_buf), filename);
+                if (namelist_find(&cname_list, c_name_buf))
+                    find_unique_cname(c_name_buf, sizeof(c_name_buf));
+            }
+            output_object_code(ctx, fo, obj, c_name_buf, CNAME_TYPE_SCRIPT);
+            JS_FreeValue(ctx, obj);
+        }
+
+#ifdef CONFIG_JIT
+        g_jit_module_hook = NULL;
+        g_jit_module_hook_opaque = NULL;
+
+        /* Emit JIT section: function bodies from jit_tmp, then dispatch table */
+        fprintf(fo, "#ifdef CONFIG_JIT\n\n");
+        {
+            char cpbuf[4096];
+            size_t nn;
+            rewind(jit_tmp);
+            while ((nn = fread(cpbuf, 1, sizeof(cpbuf), jit_tmp)) > 0)
+                fwrite(cpbuf, 1, nn, fo);
+        }
+        fclose(jit_tmp);
+
+        /* Dispatch table (empty array is valid C99) */
+        fprintf(fo,
+            "static const struct {\n"
+            "    uint64_t   hash;\n"
+            "    JSJITFunc  func;\n"
+            "} _jit_table[] = {\n");
+        for (int j = 0; j < jit_st.count; j++)
+            fprintf(fo, "    { 0x%016llxULL, %s },\n",
+                    (unsigned long long)jit_st.entries[j].hash,
+                    jit_st.entries[j].fname);
+        fprintf(fo, "};\n");
+        fprintf(fo,
+            "#define _JIT_TABLE_COUNT "
+            "((int)(sizeof(_jit_table)/sizeof(_jit_table[0])))\n\n");
+
+        /* Install callback */
+        fprintf(fo,
+            "static void _install_cb(JSFunctionBytecode *b, void *opaque)\n"
+            "{\n"
+            "    uint64_t h = js_jit_hash_bytecode_pub(b);\n"
+            "    int i;\n"
+            "    for (i = 0; i < _JIT_TABLE_COUNT; i++) {\n"
+            "        if (_jit_table[i].hash == h) {\n"
+            "            js_jit_fb_set_func(b, _jit_table[i].func, NULL, 2);\n"
+            "            return;\n"
+            "        }\n"
+            "    }\n"
+            "}\n");
+        fprintf(fo, "#endif /* CONFIG_JIT */\n\n");
+
+        free(jit_st.entries);
+        free(jit_st.roots);
+#endif /* CONFIG_JIT */
+
+        /* _eval_blob: ReadObject + JIT install + EvalFunction.
+         * Mirrors js_std_eval_binary but injects the JIT install step.
+         * load_only=1: pre-load module dependency (sets import.meta, no exec).
+         * load_only=0: execute script or entry module. */
+        fprintf(fo,
+            "static void _eval_blob(JSContext *ctx, const uint8_t *buf,\n"
+            "                       uint32_t len, int load_only)\n"
+            "{\n"
+            "    JSValue obj = JS_ReadObject(ctx, buf, len, JS_READ_OBJ_BYTECODE);\n"
+            "    if (JS_IsException(obj)) { js_std_dump_error(ctx); exit(1); }\n"
+            "#ifdef CONFIG_JIT\n"
+            "    {\n"
+            "        JSFunctionBytecode *b =\n"
+            "            (JS_VALUE_GET_TAG(obj) == JS_TAG_FUNCTION_BYTECODE)\n"
+            "            ? (JSFunctionBytecode *)JS_VALUE_GET_PTR(obj)\n"
+            "            : js_jit_module_get_bc(obj);\n"
+            "        if (b) js_jit_walk_bytecodes(b, _install_cb, NULL);\n"
+            "    }\n"
+            "#endif\n"
+            "    if (load_only) {\n"
+            "        if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE)\n"
+            "            js_module_set_import_meta(ctx, obj, 0, 0);\n"
+            "        JS_FreeValue(ctx, obj);\n"
+            "    } else {\n"
+            "        if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {\n"
+            "            if (JS_ResolveModule(ctx, obj) < 0) {\n"
+            "                JS_FreeValue(ctx, obj);\n"
+            "                js_std_dump_error(ctx); exit(1);\n"
+            "            }\n"
+            "            js_module_set_import_meta(ctx, obj, 0, 1);\n"
+            "            obj = JS_EvalFunction(ctx, obj);\n"
+            "            if (!JS_IsException(obj)) obj = js_std_await(ctx, obj);\n"
+            "        } else {\n"
+            "            obj = JS_EvalFunction(ctx, obj);\n"
+            "        }\n"
+            "        if (JS_IsException(obj)) { js_std_dump_error(ctx); exit(1); }\n"
+            "        JS_FreeValue(ctx, obj);\n"
+            "    }\n"
+            "}\n\n");
+
+        /* JS_NewCustomContext: context + intrinsics + pre-load module deps */
+        fprintf(fo,
+            "static JSContext *JS_NewCustomContext(JSRuntime *rt)\n"
+            "{\n"
+            "  JSContext *ctx = JS_NewContextRaw(rt);\n"
+            "  if (!ctx)\n"
+            "    return NULL;\n");
+        fprintf(fo, "  JS_AddIntrinsicBaseObjects(ctx);\n");
+        for (i = 0; i < countof(feature_list); i++) {
+            if ((feature_bitmap & ((uint64_t)1 << i)) && feature_list[i].init_name)
+                fprintf(fo, "  JS_AddIntrinsic%s(ctx);\n", feature_list[i].init_name);
+        }
+        /* Pre-load module dependencies (CNAME_TYPE_MODULE = from jsc_module_loader) */
+        for (i = 0; i < cname_list.count; i++) {
+            namelist_entry_t *e = &cname_list.array[i];
+            if (e->flags == CNAME_TYPE_MODULE)
+                fprintf(fo, "  _eval_blob(ctx, %s, %s_size, 1);\n",
+                        e->name, e->name);
+        }
+        fprintf(fo, "  return ctx;\n}\n\n");
+
+        /* main() */
+        fputs(main_c_template1, fo);
+        if (stack_size != 0)
+            fprintf(fo, "  JS_SetMaxStackSize(rt, %u);\n", (unsigned int)stack_size);
+        /* Module loader for dynamic import() at runtime */
+        fprintf(fo,
+            "  JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader,\n"
+            "                         js_module_check_attributes, NULL);\n");
+        fprintf(fo,
+            "  ctx = JS_NewCustomContext(rt);\n"
+            "  js_std_add_helpers(ctx, argc, argv);\n");
+        /* Execute entry scripts/modules */
+        for (i = 0; i < cname_list.count; i++) {
+            namelist_entry_t *e = &cname_list.array[i];
+            if (e->flags == CNAME_TYPE_SCRIPT)
+                fprintf(fo, "  _eval_blob(ctx, %s, %s_size, 0);\n",
+                        e->name, e->name);
+        }
+        fputs(main_c_template2, fo);
+
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        namelist_free(&cname_list);
+        namelist_free(&cmodule_list);
+        namelist_free(&init_module_list);
+        fclose(fo);
+
+        /* Compile to binary with -DCONFIG_JIT so JIT blocks are active */
+        {
+#ifdef CONFIG_JIT
+            const char *sa_cflags[] = { "-DCONFIG_JIT", NULL };
+#else
+            const char *sa_cflags[] = { NULL };
+#endif
+            return output_executable(out_filename, cfilename, use_lto, verbose,
+                                     argv[0], sa_cflags);
+        }
+    }
+
     if (output_type != OUTPUT_C) {
         fprintf(fo, "#include \"quickjs-libc.h\"\n"
                 "\n"
@@ -1347,7 +1617,7 @@ int main(int argc, char **argv)
 
     if (output_type == OUTPUT_EXECUTABLE) {
         return output_executable(out_filename, cfilename, use_lto, verbose,
-                                 argv[0]);
+                                 argv[0], NULL);
     }
     namelist_free(&cname_list);
     namelist_free(&cmodule_list);

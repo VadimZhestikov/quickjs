@@ -30,6 +30,8 @@ run: all
 	@/tmp/test_p35_2
 	@echo "=== P35.3: --jit-compile-all static enumeration ==="
 	@/tmp/test_p35_3
+	@echo "=== P35.4: --standalone self-contained binary ==="
+	@sh test_p35_4.sh $(QJS_DIR)/qjsc
 	@echo "=== ALL P35 TESTS COMPLETE ==="
 
 clean:
