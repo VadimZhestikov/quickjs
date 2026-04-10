@@ -422,6 +422,8 @@ void help(void)
            "--standalone     (P35.4) produce a self-contained binary with embedded bytecodes\n"
            "                 and AOT-compiled JIT functions; no .js files needed at runtime\n"
            "--jit-max-bc=N   skip JIT for functions with bytecode > N bytes (default=32768, 0=no cap)\n"
+           "--jit-pgo=<file> (P35.5) load call-count profile; skip absent functions and emit\n"
+           "                 per-function #pragma GCC optimize levels (O0/O1/O2/O3)\n"
            "-o output   set the output filename\n"
            "-N cname    set the C name of the generated data\n"
            "-m          compile as Javascript module (default=autodetect)\n"
@@ -559,6 +561,107 @@ static int output_executable(const char *out_filename, const char *cfilename,
 #endif
 
 #ifdef CONFIG_JIT
+/* P35.5-C: PGO profile table -----------------------------------------------
+ *
+ * Loaded from --jit-pgo=<file> before code generation starts.
+ * Maps bc_hash → call_count so walker callbacks can:
+ *   - skip functions absent from the profile or with calls == 0
+ *   - emit #pragma GCC optimize at the appropriate level
+ *
+ * Threshold table:
+ *   calls >= 10000  → O3
+ *   calls >=  1000  → O2
+ *   calls >=   100  → O1
+ *   calls >=     1  → O0
+ *   absent / 0      → skip (no C emitted)
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    uint64_t hash;
+    int      calls;
+} PGOEntry;
+
+static PGOEntry *g_pgo_entries = NULL;
+static int       g_pgo_count   = 0;
+static int       g_pgo_active  = 0; /* 1 when --jit-pgo was given */
+
+/* Minimal JSON parser: scan for {"hash":"<16hex>","calls":<N>} objects.
+ * We rely on the fixed format written by js_jit_write_profile(). */
+static void pgo_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "qjsc: --jit-pgo: cannot open '%s'\n", path);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); perror("malloc"); exit(1); }
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+
+    int cap = 64;
+    g_pgo_entries = malloc(cap * sizeof(*g_pgo_entries));
+    if (!g_pgo_entries) { perror("malloc"); exit(1); }
+    g_pgo_count = 0;
+
+    const char *p = buf;
+    while ((p = strstr(p, "\"hash\":\""))) {
+        p += 8; /* skip "hash":" */
+        if (strlen(p) < 16) break;
+        /* parse 16-hex hash */
+        uint64_t hash = 0;
+        for (int i = 0; i < 16; i++) {
+            char c = p[i];
+            int nibble;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            else { nibble = 0; }
+            hash = (hash << 4) | nibble;
+        }
+        p += 16;
+        /* find "calls": */
+        const char *cp = strstr(p, "\"calls\":");
+        if (!cp) break;
+        cp += 8;
+        int calls = atoi(cp);
+        p = cp;
+
+        if (g_pgo_count >= cap) {
+            cap *= 2;
+            g_pgo_entries = realloc(g_pgo_entries,
+                                    cap * sizeof(*g_pgo_entries));
+            if (!g_pgo_entries) { perror("realloc"); exit(1); }
+        }
+        g_pgo_entries[g_pgo_count].hash  = hash;
+        g_pgo_entries[g_pgo_count].calls = calls;
+        g_pgo_count++;
+    }
+    free(buf);
+    g_pgo_active = 1;
+}
+
+/* Returns call count for hash, or -1 if not in profile. */
+static int pgo_lookup(uint64_t hash)
+{
+    for (int i = 0; i < g_pgo_count; i++)
+        if (g_pgo_entries[i].hash == hash)
+            return g_pgo_entries[i].calls;
+    return -1;
+}
+
+/* Returns "O3" / "O2" / "O1" / "O0" based on call count. */
+static const char *pgo_opt_level(int calls)
+{
+    if (calls >= 10000) return "O3";
+    if (calls >=  1000) return "O2";
+    if (calls >=   100) return "O1";
+    return "O0";
+}
+
 /* P34.4 — --jit-hybrid code generation
  *
  * Walker callback state: collects (hash, fname, c_src) for each JIT-eligible
@@ -583,6 +686,13 @@ static void hybrid_walk_cb(JSFunctionBytecode *b, void *opaque)
     if (b == st->root_bc) return; /* skip module body */
 
     uint64_t hash = js_jit_hash_bytecode_pub(b);
+
+    /* P35.5-C: PGO filter */
+    if (g_pgo_active) {
+        int calls = pgo_lookup(hash);
+        if (calls <= 0) return; /* absent or never called — skip */
+    }
+
     char fname[64];
     int unsupported = 0;
 
@@ -593,9 +703,21 @@ static void hybrid_walk_cb(JSFunctionBytecode *b, void *opaque)
         return;
     }
 
+    /* P35.5-D: per-function optimization pragma */
+    if (g_pgo_active) {
+        int calls = pgo_lookup(hash);
+        fprintf(st->fo, "#pragma GCC optimize(\"%s\")\n",
+                pgo_opt_level(calls));
+    }
+
     /* emit the JIT function body */
     fprintf(st->fo, "%s\n", csrc);
     free(csrc);
+
+    /* Reset to default after function */
+    if (g_pgo_active)
+        fprintf(st->fo, "#pragma GCC optimize(\"O2\")\n\n");
+
     st->count++;
 }
 
@@ -821,14 +943,31 @@ static void app_walk_bodies_cb(JSFunctionBytecode *b, void *opaque)
     uint64_t hash = js_jit_hash_bytecode_pub(b);
     if (app_walk_hash_seen(st, hash)) return; /* dedup across modules */
 
+    /* P35.5-C: PGO filter */
+    if (g_pgo_active) {
+        int calls = pgo_lookup(hash);
+        if (calls <= 0) return; /* absent or never called — skip */
+    }
+
     char fname[64];
     int unsupported = 0;
     char *csrc = js_jit_gen_c_str(st->ctx, b, hash, fname, sizeof(fname),
                                    &unsupported);
     if (!csrc) return; /* unsupported or OOM */
 
+    /* P35.5-D: per-function optimization pragma */
+    if (g_pgo_active) {
+        int calls = pgo_lookup(hash);
+        fprintf(st->fo, "#pragma GCC optimize(\"%s\")\n",
+                pgo_opt_level(calls));
+    }
+
     fprintf(st->fo, "%s\n", csrc);
     free(csrc);
+
+    /* Reset to default after function */
+    if (g_pgo_active)
+        fprintf(st->fo, "#pragma GCC optimize(\"O2\")\n\n");
 
     /* Record entry for dispatch table */
     if (st->count == st->cap) {
@@ -1080,6 +1219,15 @@ int main(int argc, char **argv)
             if (!strncmp(longopt, "jit-max-bc=", 11)) {
 #ifdef CONFIG_JIT
                 js_jit_set_max_bc_len(atoi(longopt + 11));
+#endif
+                continue;
+            }
+            if (!strncmp(longopt, "jit-pgo=", 8)) {
+#ifdef CONFIG_JIT
+                pgo_load(longopt + 8);
+#else
+                fprintf(stderr, "qjsc: --jit-pgo requires CONFIG_JIT build\n");
+                exit(1);
 #endif
                 continue;
             }

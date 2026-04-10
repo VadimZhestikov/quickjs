@@ -39,6 +39,8 @@ run: all
 	@/tmp/test_p35_5a
 	@echo "=== P35.5-B: qjs --jit-profile flag ==="
 	@sh test_p35_5b.sh $(QJS_DIR)/qjs
+	@echo "=== P35.5-C+D: qjsc --jit-pgo PGO filter and pragma emission ==="
+	@sh test_p35_5cd.sh $(QJS_DIR)/qjs $(QJS_DIR)/qjsc
 	@echo "=== ALL P35 TESTS COMPLETE ==="
 
 clean:

@@ -348,28 +348,43 @@ Phase 2 — optimized AOT build:
   written, hash/calls fields, called-function inclusion, uncalled-function
   exclusion, JSON structure).
 
-- **P35.5-C** Add `--jit-pgo=<file>` flag to `qjsc.c`.  During P35.2/P35.3 C
-  generation, look up each function's `bc_hash` in the profile.  Select optimization
-  level:
+- **P35.5-C+D** ✓ DONE — `--jit-pgo=<file>` flag in `qjsc.c` with per-function pragma.
 
-  | calls | GCC flag |
-  |---|---|
-  | ≥ 10 000 | `-O3 -march=native` |
-  | ≥ 1 000  | `-O2` |
-  | ≥ 100    | `-O1` |
-  | ≥ 1      | `-O0` |
-  | 0 / absent | skipped (no C emitted) |
+  Loads a profile written by `js_jit_write_profile` and applies it during
+  `--jit-hybrid-app` (and `--jit-hybrid`) C generation:
 
-- **P35.5-D** Per-function optimization levels: emit `#pragma GCC optimize("O3")`
-  before each JIT function body in the generated C and `#pragma GCC optimize("O2")`
-  after, so all functions can be compiled in a single GCC invocation without needing
-  separate per-function compilation units.
+  - **Filter (C)**: functions absent from the profile or with `calls ≤ 0` are
+    skipped — no C body emitted and no dispatch table entry.
+  - **Pragma (D)**: before each emitted function body, injects
+    `#pragma GCC optimize("<level>")` and resets to `"O2"` after:
+
+    | calls     | pragma level |
+    |-----------|-------------|
+    | ≥ 10 000  | `O3`        |
+    | ≥  1 000  | `O2`        |
+    | ≥    100  | `O1`        |
+    | ≥      1  | `O0`        |
+    | 0 / absent | skipped    |
+
+  Implementation: minimal JSON scanner in `pgo_load()` (no dependencies beyond
+  `libc`); `g_pgo_entries[]` global array; `pgo_lookup(hash)` linear scan;
+  `pgo_opt_level(calls)` threshold lookup.
+
+  **Profile collection note**: `jit_call_count` stops incrementing once the JIT
+  threshold is reached and GCC compilation is queued.  For true call-count
+  profiling (to distinguish O3/O2/O1/O0 tiers), use `--jit-threshold-gcc=<large>`
+  during the profiling run so counts accumulate past 10 000.
+
+  Tests: `jit-tests/P35/test_p35_5cd.sh` (8 subtests):
+  - profile collected with `--jit-threshold-gcc=1000000` (hot=20000, cold=1)
+  - `--jit-hybrid-app --jit-pgo`: O3 for hot, O0 for cold, C compiles cleanly
+  - un-profiled module produces no JIT bodies in PGO mode
 
 - **P35.5-E** Tests in `jit-tests/P35/`: collect profile from a benchmark; verify that
   hot function is at tier 2 with higher optimization; cold function is absent from the
-  dispatch table.
+  dispatch table.  *(remaining stretch goal — covered by P35.5-C+D tests above)*
 
-**Estimated effort:** ~7 days (P35.5-A + B done; ~5 days remaining)  
+**Estimated effort:** ~7 days (P35.5-A + B + C + D done; phase largely complete)  
 **Risk:** medium — per-function optimization selection, GCC pragma injection  
 **Dependencies:** P35.2 or P35.3 (AOT C generation), P35.1 (size cap)  
 **Files:** `qjs.c`, `qjsc.c`, `quickjs-jit.c`, `quickjs-jit.h`
@@ -400,7 +415,7 @@ P35.1 (size cap)              ← prerequisite for all; implement first
 | P35.2 hybrid-app | Whole-app AOT; no traffic needed | 5 days | medium |
 | P35.3 compile-all | Single-file static compilation | 2 days ✓ | low |
 | P35.4 standalone | Single-binary deployment | 6 days ✓ | medium-high |
-| P35.5 PGO | Per-function optimization levels | 7 days | medium |
+| P35.5 PGO | Per-function optimization levels | 7 days ✓ | medium |
 
 **Minimum viable**: P35.1 + P35.3 (~2.5 days total) gives a usable server-side
 pre-compilation workflow for single-file scripts with no traffic requirement.
