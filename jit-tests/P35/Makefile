@@ -12,7 +12,7 @@ LIBS   := -lm -lpthread -ldl
 
 .PHONY: all run clean
 
-all: /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3
+all: /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3 /tmp/test_p35_5a
 
 /tmp/test_p35_1: test_p35_1.c
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
@@ -21,6 +21,9 @@ all: /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
 /tmp/test_p35_3: test_p35_3.c
+	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
+
+/tmp/test_p35_5a: test_p35_5a.c
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
 run: all
@@ -32,7 +35,9 @@ run: all
 	@/tmp/test_p35_3
 	@echo "=== P35.4: --standalone self-contained binary ==="
 	@sh test_p35_4.sh $(QJS_DIR)/qjsc
+	@echo "=== P35.5-A: js_jit_write_profile call-count profile writer ==="
+	@/tmp/test_p35_5a
 	@echo "=== ALL P35 TESTS COMPLETE ==="
 
 clean:
-	rm -f /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3
+	rm -f /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3 /tmp/test_p35_5a

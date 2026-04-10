@@ -314,6 +314,7 @@ void      js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f,
                               void *handle, int tier);
 void      js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash);
 int       js_jit_fb_inc_count(JSFunctionBytecode *b);
+int       js_jit_fb_get_call_count(JSFunctionBytecode *b);
 /* Bytecode / metadata accessors for the code generator */
 const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len);
 int            js_jit_fb_get_arg_count(JSFunctionBytecode *b);
@@ -1055,6 +1056,24 @@ JSFunctionBytecode *js_jit_get_callee_fb(JSValue func);
  */
 int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
                               JSValue **cpool_out, JSVarRef ***var_refs_out);
+
+/*
+ * js_jit_write_profile() — P35.5
+ * Write a JSON call-count profile to <path>.
+ * Walks all live module bytecodes via js_jit_walk_all_modules() and records
+ * {hash, calls, name} for every function with jit_call_count > 0.
+ *
+ * Format:
+ *   {"functions":[
+ *     {"hash":"<16-hex>","calls":<N>,"name":"<func-name>"},
+ *     ...
+ *   ]}
+ *
+ * Returns 0 on success, -1 on error (fopen failed).
+ * Note: global-script bytecodes freed by JS_EvalFunction are not captured;
+ * this API is designed for module-based server workloads.
+ */
+int js_jit_write_profile(JSContext *ctx, const char *path);
 
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */

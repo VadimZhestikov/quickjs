@@ -15702,6 +15702,7 @@ void     js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash)
     b->jit_bc_hash = hash;
 }
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
+int      js_jit_fb_get_call_count(JSFunctionBytecode *b) { return b->jit_call_count; }
 
 /* Return pointer to the JSValue inside a JSVarRef.  Used by generated C code
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */

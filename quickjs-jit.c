@@ -7300,6 +7300,58 @@ int js_jit_install_combined_if_exists(void)
 }
 
 /* -----------------------------------------------------------------------
+ * P35.5: call-count profile writer
+ * ----------------------------------------------------------------------- */
+
+typedef struct {
+    FILE       *f;
+    int         first;
+    JSRuntime  *rt;
+} ProfileWalkState;
+
+static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
+{
+    ProfileWalkState *st = (ProfileWalkState *)opaque;
+    int calls = js_jit_fb_get_call_count(b);
+    if (calls <= 0)
+        return;
+    uint64_t hash = js_jit_hash_bytecode_pub(b);
+    const char *name = js_jit_fb_get_func_name(st->rt, b);
+
+    /* Escape the name: replace '"' with ' ' (names are identifiers, rare) */
+    char safe_name[256];
+    if (name) {
+        int i = 0;
+        while (name[i] && i < (int)(sizeof(safe_name) - 1)) {
+            safe_name[i] = (name[i] == '"' || name[i] == '\\') ? '_' : name[i];
+            i++;
+        }
+        safe_name[i] = '\0';
+    } else {
+        safe_name[0] = '\0';
+    }
+
+    if (!st->first)
+        fprintf(st->f, ",\n");
+    fprintf(st->f, "  {\"hash\":\"%016llx\",\"calls\":%d,\"name\":\"%s\"}",
+            (unsigned long long)hash, calls, safe_name);
+    st->first = 0;
+}
+
+int js_jit_write_profile(JSContext *ctx, const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "{\"functions\":[\n");
+    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx) };
+    js_jit_walk_all_modules(ctx, profile_walk_cb, &st);
+    fprintf(f, "\n]}\n");
+    fclose(f);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
  * Cleanup hook called from free_function_bytecode()
  * ----------------------------------------------------------------------- */
 

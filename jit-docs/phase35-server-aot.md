@@ -318,7 +318,9 @@ Phase 2 — optimized AOT build:
 
 ### Steps
 
-- **P35.5-A** Define profile format (`profile.json`):
+- **P35.5-A** ✓ DONE — Profile format + writer API.
+
+  Profile format (`profile.json`):
   ```json
   { "functions": [
       { "hash": "39aff7310a2a1d1e", "calls": 142857, "name": "fib" },
@@ -326,10 +328,22 @@ Phase 2 — optimized AOT build:
   ] }
   ```
 
+  Implementation:
+  - `js_jit_fb_get_call_count(b)` added to `quickjs.c` (symmetric accessor for
+    the existing `js_jit_fb_inc_count`); declared in `quickjs-jit.h`.
+  - `js_jit_write_profile(JSContext *ctx, const char *path)` added to
+    `quickjs-jit.c`; walks all live module bytecodes via
+    `js_jit_walk_all_modules()` and emits JSON for every function with
+    `jit_call_count > 0`.  Returns 0 on success, -1 if `fopen` fails.
+  - Only module-based bytecodes are captured; global-script bytecodes freed by
+    `JS_EvalFunction` are not (by design — P35 targets module-based server code).
+  - Tests: `jit-tests/P35/test_p35_5a.c` (4 subtests: JSON structure, call
+    count accuracy, zero-call filter, `get_call_count` unit test).
+
 - **P35.5-B** Add `--jit-profile=<file>` flag to `qjs.c`.  During execution, record
   `(bc_hash, call_count)` for every function that has `jit_call_count > 0`.  Write
-  `profile.json` on clean exit.  Uses `jit_session_map` (already populated by
-  `js_jit_queue_gcc`) as the source of (hash → bytecode) mappings.
+  `profile.json` on clean exit.  Calls `js_jit_write_profile(ctx, path)` after
+  `js_std_loop` returns.
 
 - **P35.5-C** Add `--jit-pgo=<file>` flag to `qjsc.c`.  During P35.2/P35.3 C
   generation, look up each function's `bc_hash` in the profile.  Select optimization
@@ -343,16 +357,17 @@ Phase 2 — optimized AOT build:
   | ≥ 1      | `-O0` |
   | 0 / absent | skipped (no C emitted) |
 
-- **P35.5-D** For `-O3` functions: optionally emit `__attribute__((optimize("O3")))`
-  inline in the generated C so they can be compiled together with other functions in
-  one GCC invocation without needing separate per-function compilation.
+- **P35.5-D** Per-function optimization levels: emit `#pragma GCC optimize("O3")`
+  before each JIT function body in the generated C and `#pragma GCC optimize("O2")`
+  after, so all functions can be compiled in a single GCC invocation without needing
+  separate per-function compilation units.
 
 - **P35.5-E** Tests in `jit-tests/P35/`: collect profile from a benchmark; verify that
   hot function is at tier 2 with higher optimization; cold function is absent from the
   dispatch table.
 
-**Estimated effort:** ~7 days  
-**Risk:** medium — profile format, per-function optimization selection, GCC attribute  
+**Estimated effort:** ~7 days (P35.5-A done; ~5.5 days remaining)  
+**Risk:** medium — per-function optimization selection, GCC pragma injection  
 **Dependencies:** P35.2 or P35.3 (AOT C generation), P35.1 (size cap)  
 **Files:** `qjs.c`, `qjsc.c`, `quickjs-jit.c`, `quickjs-jit.h`
 
