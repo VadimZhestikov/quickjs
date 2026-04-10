@@ -257,6 +257,13 @@ ifdef CONFIG_JIT
   CFLAGS  += -DJIT_INCLUDE_DIR='"$(JIT_INCLUDE_DIR)"'
   QJS_LIB_OBJS += $(OBJDIR)/quickjs-jit.o
   EXTRA_LIBS += -lpthread -ldl
+  # Explicit header/source dependencies — ensure correct rebuilds when
+  # quickjs-jit.h or quickjs-jit.c changes, even when .d files are stale
+  # (e.g. generated from a non-CONFIG_JIT build).  These lines add
+  # prerequisites only; the pattern rule $(OBJDIR)/%.o: %.c still provides
+  # the recipe, so there is no "multiple rules with recipes" conflict.
+  $(OBJDIR)/quickjs.o $(OBJDIR)/qjsc.o $(OBJDIR)/quickjs-jit.o: quickjs-jit.h
+  $(OBJDIR)/quickjs-jit.o: quickjs-jit.c
 endif
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
