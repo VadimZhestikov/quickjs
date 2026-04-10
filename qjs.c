@@ -55,6 +55,7 @@ static int jit_link_mode        = 0; /* set by --jit-link    */
 static int jit_threshold_mode   = 0; /* set by --jit-threshold-gcc=N (N=0: AOT pre-pass) */
 static int jit_compile_all_mode = 0; /* set by --jit-compile-all (P35.3) */
 static int jit_exit_mode        = 0; /* set by --jit-exit (P35.3-D): skip execution */
+static const char *jit_profile_path = NULL; /* set by --jit-profile=<file> (P35.5-B) */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -394,6 +395,7 @@ void help(void)
            "    --jit-save-sources     save original JS source of each compiled function to cache as <hash>.js\n"
            "    --jit-compile-all  (P35.3) statically compile all functions to cache before running\n"
            "    --jit-exit         (P35.3) skip execution after --jit-compile-all (pure build step)\n"
+           "    --jit-profile=<file>  (P35.5) write call-count JSON profile to <file> after execution\n"
 #endif
            );
     exit(1);
@@ -575,6 +577,10 @@ int main(int argc, char **argv)
                 jit_exit_mode = 1;
                 continue;
             }
+            if (!strncmp(longopt, "jit-profile=", 12)) {
+                jit_profile_path = longopt + 12;
+                continue;
+            }
 #endif
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
@@ -665,6 +671,12 @@ int main(int argc, char **argv)
          * and combine them into a single GCC LTO shared library. */
         if (jit_link_mode)
             js_jit_link();
+        /* P35.5-B: --jit-profile=<file> — write call-count profile. */
+        if (jit_profile_path) {
+            if (js_jit_write_profile(ctx, jit_profile_path) != 0)
+                fprintf(stderr, "qjs: --jit-profile: failed to write '%s'\n",
+                        jit_profile_path);
+        }
 #endif
     }
 

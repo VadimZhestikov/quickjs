@@ -37,6 +37,8 @@ run: all
 	@sh test_p35_4.sh $(QJS_DIR)/qjsc
 	@echo "=== P35.5-A: js_jit_write_profile call-count profile writer ==="
 	@/tmp/test_p35_5a
+	@echo "=== P35.5-B: qjs --jit-profile flag ==="
+	@sh test_p35_5b.sh $(QJS_DIR)/qjs
 	@echo "=== ALL P35 TESTS COMPLETE ==="
 
 clean:

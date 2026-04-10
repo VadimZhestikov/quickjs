@@ -340,10 +340,13 @@ Phase 2 — optimized AOT build:
   - Tests: `jit-tests/P35/test_p35_5a.c` (4 subtests: JSON structure, call
     count accuracy, zero-call filter, `get_call_count` unit test).
 
-- **P35.5-B** Add `--jit-profile=<file>` flag to `qjs.c`.  During execution, record
-  `(bc_hash, call_count)` for every function that has `jit_call_count > 0`.  Write
-  `profile.json` on clean exit.  Calls `js_jit_write_profile(ctx, path)` after
-  `js_std_loop` returns.
+- **P35.5-B** ✓ DONE — `--jit-profile=<file>` flag in `qjs.c`.
+
+  Calls `js_jit_write_profile(ctx, path)` after `js_std_loop` returns on clean
+  exit.  Writes live module function call counts; emits a warning to stderr on
+  `fopen` failure.  Tests: `jit-tests/P35/test_p35_5b.sh` (6 subtests: file
+  written, hash/calls fields, called-function inclusion, uncalled-function
+  exclusion, JSON structure).
 
 - **P35.5-C** Add `--jit-pgo=<file>` flag to `qjsc.c`.  During P35.2/P35.3 C
   generation, look up each function's `bc_hash` in the profile.  Select optimization
@@ -366,7 +369,7 @@ Phase 2 — optimized AOT build:
   hot function is at tier 2 with higher optimization; cold function is absent from the
   dispatch table.
 
-**Estimated effort:** ~7 days (P35.5-A done; ~5.5 days remaining)  
+**Estimated effort:** ~7 days (P35.5-A + B done; ~5 days remaining)  
 **Risk:** medium — per-function optimization selection, GCC pragma injection  
 **Dependencies:** P35.2 or P35.3 (AOT C generation), P35.1 (size cap)  
 **Files:** `qjs.c`, `qjsc.c`, `quickjs-jit.c`, `quickjs-jit.h`
