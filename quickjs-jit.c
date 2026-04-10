@@ -1860,6 +1860,76 @@ uint64_t js_jit_hash_bytecode_pub(JSFunctionBytecode *b)
     return jit_hash_function(b);
 }
 
+/* P34.2 — recursive bytecode walker internals.
+ *
+ * We need a visited set to handle shared inner functions: two sibling
+ * closures may reference the same JSFunctionBytecode via their cpool, so
+ * without deduplication the callback would fire multiple times for the same
+ * bytecode object.
+ *
+ * Implementation: a flat pointer array grown with realloc, O(n) lookup.
+ * Module functions typically have <200 inner functions so linear scan is fine.
+ */
+typedef struct {
+    JSFunctionBytecode **ptr;
+    int                  count;
+    int                  cap;
+} JITWalkVisited;
+
+static int jit_walk_visited_has(JITWalkVisited *v, JSFunctionBytecode *b)
+{
+    for (int i = 0; i < v->count; i++)
+        if (v->ptr[i] == b) return 1;
+    return 0;
+}
+
+static int jit_walk_visited_add(JITWalkVisited *v, JSFunctionBytecode *b)
+{
+    if (v->count == v->cap) {
+        int new_cap = v->cap ? v->cap * 2 : 16;
+        JSFunctionBytecode **p = realloc(v->ptr,
+                                         (size_t)new_cap * sizeof(*p));
+        if (!p) return -1;
+        v->ptr = p;
+        v->cap = new_cap;
+    }
+    v->ptr[v->count++] = b;
+    return 0;
+}
+
+static void jit_walk_rec(JSFunctionBytecode *b,
+                         void (*cb)(JSFunctionBytecode *, void *),
+                         void *opaque, JITWalkVisited *visited)
+{
+    if (!b) return;
+    if (jit_walk_visited_has(visited, b)) return;
+    if (jit_walk_visited_add(visited, b) < 0) return; /* OOM — skip subtree */
+
+    cb(b, opaque);
+
+    int n = js_jit_fb_get_cpool_count(b);
+    for (int i = 0; i < n; i++) {
+        JSFunctionBytecode *inner = js_jit_cpool_get_fb(b, i);
+        if (inner)
+            jit_walk_rec(inner, cb, opaque, visited);
+    }
+}
+
+/* P34.2 — public API.
+ * Calls cb(bytecode, opaque) once for b and each inner function reachable
+ * through its constant pool, recursively.  Each distinct JSFunctionBytecode*
+ * is visited exactly once even if shared by multiple closures.
+ * cb is called in depth-first pre-order (outer before inner). */
+void js_jit_walk_bytecodes(JSFunctionBytecode *b,
+                           void (*cb)(JSFunctionBytecode *, void *),
+                           void *opaque)
+{
+    if (!b || !cb) return;
+    JITWalkVisited visited = {NULL, 0, 0};
+    jit_walk_rec(b, cb, opaque, &visited);
+    free(visited.ptr);
+}
+
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs)
 {
     if (js_jit_fb_jit_no_compile(b)) return;

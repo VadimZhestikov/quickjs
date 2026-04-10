@@ -886,6 +886,20 @@ int js_jit_cache_has_c_src(JSFunctionBytecode *b);
 uint64_t js_jit_hash_bytecode_pub(JSFunctionBytecode *b);
 
 /*
+ * js_jit_walk_bytecodes() — P34.2
+ * Calls cb(bytecode, opaque) once for b and every inner function reachable
+ * through its constant pool, recursively.  Each distinct JSFunctionBytecode*
+ * is visited exactly once even if shared by multiple closures.  Visits in
+ * depth-first pre-order (outer function before its inner functions).
+ *
+ * Used by P34.4 --jit-hybrid to install JIT function pointers into all
+ * bytecodes deserialized from the embedded bytecode blob.
+ */
+void js_jit_walk_bytecodes(JSFunctionBytecode *b,
+                           void (*cb)(JSFunctionBytecode *, void *),
+                           void *opaque);
+
+/*
  * js_jit_set_link_mode() — enable hash recording for --jit-link.
  * When active, every bc_hash seen in js_jit_queue_gcc() is appended to an
  * internal list so js_jit_link() can collect the corresponding .c files.
