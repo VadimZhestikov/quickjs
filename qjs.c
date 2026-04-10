@@ -53,6 +53,8 @@ static int jit_aot_mode         = 0; /* set by --jit-aot     */
 static int jit_warmup_mode      = 0; /* set by --jit-warmup  */
 static int jit_link_mode        = 0; /* set by --jit-link    */
 static int jit_threshold_mode   = 0; /* set by --jit-threshold-gcc=N (N=0: AOT pre-pass) */
+static int jit_compile_all_mode = 0; /* set by --jit-compile-all (P35.3) */
+static int jit_exit_mode        = 0; /* set by --jit-exit (P35.3-D): skip execution */
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
@@ -68,12 +70,20 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
         if (!JS_IsException(val)) {
             js_module_set_import_meta(ctx, val, TRUE, TRUE);
 #ifdef CONFIG_JIT
-            if (jit_aot_mode) {
-                js_jit_preload_combined();  /* P10.4: open combined.so before compile_all */
+            if (jit_aot_mode || jit_compile_all_mode) {
+                if (jit_aot_mode)
+                    js_jit_preload_combined();  /* P10.4: open combined.so before compile_all */
                 if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
                     js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
                 js_jit_drain();
-                js_jit_install_combined_if_exists();  /* P10.4 */
+                if (jit_aot_mode)
+                    js_jit_install_combined_if_exists();  /* P10.4 */
+                else
+                    js_jit_install_results();
+                if (jit_exit_mode) {
+                    JS_FreeValue(ctx, val);
+                    return 0;
+                }
             }
 #endif
             val = JS_EvalFunction(ctx, val);
@@ -102,6 +112,28 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                 JS_FreeValue(ctx, val);
                 return 0;
             }
+        }
+#else
+        val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
+#endif
+    } else if (jit_compile_all_mode) {
+#ifdef CONFIG_JIT
+        /* P35.3: static enumeration — compile all functions before execution.
+         * Unlike --jit-aot, this does NOT use the combined LTO .so;
+         * each function is installed from its own cached .so file.
+         * --jit-exit (P35.3-D): skip execution after compilation. */
+        val = JS_Eval(ctx, buf, buf_len, filename,
+                      eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(val)) {
+            if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE)
+                js_jit_compile_all(ctx, JS_VALUE_GET_PTR(val));
+            js_jit_drain();
+            js_jit_install_results();
+            if (jit_exit_mode) {
+                JS_FreeValue(ctx, val);
+                return 0;
+            }
+            val = JS_EvalFunction(ctx, val);
         }
 #else
         val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
@@ -360,6 +392,8 @@ void help(void)
            "    --jit-threshold-gcc=N  compile after N calls (0=AOT pre-pass, default=100)\n"
            "    --jit-max-bc=N         skip JIT for functions with bytecode > N bytes (default=32768, 0=no cap)\n"
            "    --jit-save-sources     save original JS source of each compiled function to cache as <hash>.js\n"
+           "    --jit-compile-all  (P35.3) statically compile all functions to cache before running\n"
+           "    --jit-exit         (P35.3) skip execution after --jit-compile-all (pure build step)\n"
 #endif
            );
     exit(1);
@@ -530,6 +564,15 @@ int main(int argc, char **argv)
             }
             if (!strncmp(longopt, "jit-max-bc=", 11)) {
                 js_jit_set_max_bc_len(atoi(longopt + 11));
+                continue;
+            }
+            if (!strcmp(longopt, "jit-compile-all")) {
+                jit_compile_all_mode = 1;
+                js_jit_set_aot_mode(1);
+                continue;
+            }
+            if (!strcmp(longopt, "jit-exit")) {
+                jit_exit_mode = 1;
                 continue;
             }
 #endif

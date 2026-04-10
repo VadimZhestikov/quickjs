@@ -12,7 +12,7 @@ LIBS   := -lm -lpthread -ldl
 
 .PHONY: all run clean
 
-all: /tmp/test_p35_1 /tmp/test_p35_2
+all: /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3
 
 /tmp/test_p35_1: test_p35_1.c
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
@@ -20,12 +20,17 @@ all: /tmp/test_p35_1 /tmp/test_p35_2
 /tmp/test_p35_2: test_p35_2.c
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
+/tmp/test_p35_3: test_p35_3.c
+	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
+
 run: all
 	@echo "=== P35.1: bytecode size cap ==="
 	@/tmp/test_p35_1
 	@echo "=== P35.2: module graph walkers ==="
 	@/tmp/test_p35_2
+	@echo "=== P35.3: --jit-compile-all static enumeration ==="
+	@/tmp/test_p35_3
 	@echo "=== ALL P35 TESTS COMPLETE ==="
 
 clean:
-	rm -f /tmp/test_p35_1 /tmp/test_p35_2
+	rm -f /tmp/test_p35_1 /tmp/test_p35_2 /tmp/test_p35_3

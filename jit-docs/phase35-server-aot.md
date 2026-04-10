@@ -157,7 +157,7 @@ init_app(ctx);  /* all eligible functions now at tier 2 */
 
 ---
 
-## P35.3 — Static Function Enumeration (`--jit-compile-all`)
+## P35.3 — Static Function Enumeration (`--jit-compile-all`) ✓ DONE
 
 **Goal:** Compile every statically reachable function to native code without executing
 the script.  Eliminates the need for representative traffic during the build step.
@@ -167,29 +167,44 @@ Complements P35.2 for single-file scripts that do not use ES modules.
 scripts or CommonJS-style code where the module graph isn't available statically.
 P35.3 works by parsing and walking the bytecode tree without evaluating anything.
 
-### Steps
+### Implementation
 
-- **P35.3-A** Add `--jit-compile-all` flag to `qjs.c`.  After `JS_Eval()` compiles the
-  script (but before execution), use `js_jit_walk_bytecodes` (P34.2 API) to enumerate
-  every function bytecode in the top-level bytecode tree.
+**`qjs.c`** — two new flags + `eval_buf` branches:
 
-- **P35.3-B** For each bytecode, check eligibility (size cap, is_eligible) and call
-  `js_jit_queue_gcc` with `NULL` var_refs (non-closure, AOT context).
+- **`jit_compile_all_mode`** (set by `--jit-compile-all`):
+  - Module path: extends the existing `if (jit_aot_mode)` block to also trigger on
+    `jit_compile_all_mode`; calls `js_jit_compile_all` + `js_jit_drain()` +
+    `js_jit_install_results()` (no combined `.so`); respects `jit_exit_mode`.
+  - Global-script path: new `else if (jit_compile_all_mode)` branch — compile-only
+    eval → `js_jit_compile_all` → `js_jit_drain()` → `js_jit_install_results()` →
+    optional `jit_exit_mode` skip → `JS_EvalFunction`.
 
-- **P35.3-C** After queueing all functions, call `js_jit_drain()` +
-  `js_jit_install_results()`.  Then execute the script normally — all pre-compiled
-  functions hit tier 2 from the first call.
+- **`jit_exit_mode`** (set by `--jit-exit`): after compile+install, free the bytecode
+  value and return 0 without executing.  Useful as a pure CI build step that has no
+  side-effects from the script.
 
-- **P35.3-D** Add `--jit-compile-all --jit-exit` combination: compile everything, write
-  cache, do not execute.  Useful as a pure build step in CI.
+```sh
+# Compile all functions into cache, then run normally:
+./qjs --jit-compile-all server.js
 
-- **P35.3-E** Tests in `jit-tests/P35/`: single-file script with 10 functions; after
-  `--jit-compile-all`, verify all 10 at tier 2 before first call.
+# Pure build step — compile cache, skip execution:
+./qjs --jit-compile-all --jit-exit server.js
+```
 
-**Estimated effort:** ~2 days  
-**Risk:** low — uses existing `js_jit_walk_bytecodes` and `js_jit_queue_gcc`  
-**Dependencies:** P35.1 (size cap)  
-**Files:** `qjs.c`, `quickjs-jit.h`
+**No combined LTO `.so`**: unlike `--jit-aot`, `--jit-compile-all` installs each
+function from its own cached `.so` via `js_jit_install_results()`.  The P35.1 size
+cap applies automatically inside `js_jit_compile_all` → `js_jit_queue_gcc`.
+
+**Tests:** `jit-tests/P35/test_p35_3.c` — 4 subtests:
+- A: `js_jit_compile_all` + drain + install puts all 3 inner functions at tier 2
+  BEFORE `JS_EvalFunction` is called
+- B: After installation the functions execute correctly (add, fib)
+- C: `--jit-exit` equivalent — compile+install, skip `JS_EvalFunction`, side-effect
+  never runs, yet functions are at tier 2
+- D: P35.1 size cap integration — small function reaches tier 2, large function
+  stays at tier 0 due to cap
+
+**Files changed:** `qjs.c`, `jit-tests/P35/test_p35_3.c`, `jit-tests/P35/Makefile`
 
 ---
 
@@ -329,7 +344,7 @@ P35.1 (size cap)              ← prerequisite for all; implement first
 |---|---|---|---|
 | P35.1 size cap | Pathological data files; unblocks all others | 0.5 day | trivial |
 | P35.2 hybrid-app | Whole-app AOT; no traffic needed | 5 days | medium |
-| P35.3 compile-all | Single-file static compilation | 2 days | low |
+| P35.3 compile-all | Single-file static compilation | 2 days ✓ | low |
 | P35.4 standalone | Single-binary deployment | 6 days | medium-high |
 | P35.5 PGO | Per-function optimization levels | 7 days | medium |
 
