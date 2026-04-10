@@ -1624,6 +1624,8 @@ void js_jit_install_results(void)
             /* Bytecode is still alive — install the JIT function. */
             js_jit_fb_set_bc_hash(b, r->bc_hash);
             js_jit_fb_set_func(b, r->func, r->handle, 2);
+            /* P36.1: register address for sampling profiler */
+            jit_registry_add((uintptr_t)r->func, r->bc_hash);
         } else {
             /* Bytecode was freed during execution — discard the .so. */
             if (r->handle)
@@ -7300,6 +7302,117 @@ int js_jit_install_combined_if_exists(void)
 }
 
 /* -----------------------------------------------------------------------
+ * P36.1: JIT address range registry
+ *
+ * Maps installed JIT function addresses → bc_hash → sample_count.
+ * Used by the P36.2 SIGPROF sampler: the signal handler binary-searches
+ * this sorted array to identify which JIT function is executing.
+ *
+ * Synchronization: seqlock.
+ *   Writers (install/remove, main thread): increment seqlock to odd,
+ *   modify, increment to even.
+ *   Readers (signal handler): retry if seqlock is odd or changes.
+ *   Sample counters are incremented with __ATOMIC_RELAXED — no lock
+ *   needed since each slot is owned by one entry and entries are never
+ *   recycled while in the registry.
+ * ----------------------------------------------------------------------- */
+
+#define JIT_ADDR_REGISTRY_MAX 4096
+
+typedef struct {
+    uintptr_t  func_ptr;   /* start address of compiled JIT function      */
+    uint64_t   bc_hash;    /* FNV-1a hash — key for profile output         */
+    uint32_t   samples;    /* atomic sample counter; SIGPROF increments it */
+} JITAddrEntry;
+
+static JITAddrEntry      jit_addr_registry[JIT_ADDR_REGISTRY_MAX];
+static volatile int      jit_addr_count  = 0;
+static volatile uint32_t jit_addr_seqlock = 0; /* even = stable, odd = writing */
+
+static inline void jit_seqlock_write_begin(void)
+{
+    __atomic_add_fetch(&jit_addr_seqlock, 1, __ATOMIC_SEQ_CST);
+}
+static inline void jit_seqlock_write_end(void)
+{
+    __atomic_add_fetch(&jit_addr_seqlock, 1, __ATOMIC_SEQ_CST);
+}
+/* Returns the seq value at the start of a read window. */
+static inline uint32_t jit_seqlock_read_begin(void)
+{
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&jit_addr_seqlock, __ATOMIC_SEQ_CST);
+    } while (s & 1); /* spin while a write is in progress */
+    return s;
+}
+/* Returns 1 if the read window is stale and must be retried. */
+static inline int jit_seqlock_retry(uint32_t s)
+{
+    return s != __atomic_load_n(&jit_addr_seqlock, __ATOMIC_SEQ_CST);
+}
+
+/* Add a newly installed JIT function to the registry.
+ * Keeps the array sorted by func_ptr for binary search in the signal handler.
+ * Called from js_jit_install_results() (main thread only). */
+void jit_registry_add(uintptr_t func_ptr, uint64_t bc_hash)
+{
+    int cnt = jit_addr_count;
+    if (cnt >= JIT_ADDR_REGISTRY_MAX) {
+        /* Registry full — this function will not be sampled. */
+        return;
+    }
+
+    jit_seqlock_write_begin();
+
+    /* Insertion sort: find position to keep array sorted by func_ptr. */
+    int i = cnt;
+    while (i > 0 && jit_addr_registry[i - 1].func_ptr > func_ptr) {
+        jit_addr_registry[i] = jit_addr_registry[i - 1];
+        i--;
+    }
+    jit_addr_registry[i].func_ptr = func_ptr;
+    jit_addr_registry[i].bc_hash  = bc_hash;
+    jit_addr_registry[i].samples  = 0;
+    jit_addr_count = cnt + 1;
+
+    jit_seqlock_write_end();
+}
+
+/* Remove a JIT function from the registry (called before dlclose).
+ * Called from js_jit_free_bytecode() (main thread only). */
+void jit_registry_remove(uintptr_t func_ptr)
+{
+    jit_seqlock_write_begin();
+
+    int cnt = jit_addr_count;
+    for (int i = 0; i < cnt; i++) {
+        if (jit_addr_registry[i].func_ptr == func_ptr) {
+            for (int j = i; j < cnt - 1; j++)
+                jit_addr_registry[j] = jit_addr_registry[j + 1];
+            jit_addr_count = cnt - 1;
+            break;
+        }
+    }
+
+    jit_seqlock_write_end();
+}
+
+/* Look up sample count for a bc_hash.
+ * Called from profile writer (main thread, after sampler stopped). */
+uint32_t jit_registry_lookup_samples(uint64_t bc_hash)
+{
+    int cnt = jit_addr_count;
+    for (int i = 0; i < cnt; i++)
+        if (jit_addr_registry[i].bc_hash == bc_hash)
+            return jit_addr_registry[i].samples;
+    return 0;
+}
+
+/* Public accessor used by jit-tests. */
+int js_jit_registry_count(void) { return jit_addr_count; }
+
+/* -----------------------------------------------------------------------
  * P35.5: call-count profile writer
  * ----------------------------------------------------------------------- */
 
@@ -7307,18 +7420,29 @@ typedef struct {
     FILE       *f;
     int         first;
     JSRuntime  *rt;
+    int         hz;    /* P36.3: sampler hz; 0 = no timing data */
 } ProfileWalkState;
 
 static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
 {
     ProfileWalkState *st = (ProfileWalkState *)opaque;
-    int calls = js_jit_fb_get_call_count(b);
-    if (calls <= 0)
-        return;
-    uint64_t hash = js_jit_hash_bytecode_pub(b);
+    int      calls   = js_jit_fb_get_call_count(b);
+    uint64_t hash    = js_jit_hash_bytecode_pub(b);
+    uint32_t samples = 0;
+    uint32_t time_ms = 0;
+
+    if (st->hz > 0) {
+        /* P36.3: timed profile — look up sample count */
+        samples = jit_registry_lookup_samples(hash);
+        time_ms = (samples * 1000u) / (uint32_t)st->hz;
+    }
+
+    if (calls <= 0 && samples == 0)
+        return; /* nothing recorded */
+
     const char *name = js_jit_fb_get_func_name(st->rt, b);
 
-    /* Escape the name: replace '"' with ' ' (names are identifiers, rare) */
+    /* Escape the name: replace '"' and '\' (names are identifiers, rare) */
     char safe_name[256];
     if (name) {
         int i = 0;
@@ -7333,8 +7457,17 @@ static void profile_walk_cb(JSFunctionBytecode *b, void *opaque)
 
     if (!st->first)
         fprintf(st->f, ",\n");
-    fprintf(st->f, "  {\"hash\":\"%016llx\",\"calls\":%d,\"name\":\"%s\"}",
+
+    if (st->hz > 0) {
+        fprintf(st->f,
+            "  {\"hash\":\"%016llx\",\"calls\":%d,"
+            "\"time_ms\":%u,\"name\":\"%s\"}",
+            (unsigned long long)hash, calls, time_ms, safe_name);
+    } else {
+        fprintf(st->f,
+            "  {\"hash\":\"%016llx\",\"calls\":%d,\"name\":\"%s\"}",
             (unsigned long long)hash, calls, safe_name);
+    }
     st->first = 0;
 }
 
@@ -7344,7 +7477,20 @@ int js_jit_write_profile(JSContext *ctx, const char *path)
     if (!f)
         return -1;
     fprintf(f, "{\"functions\":[\n");
-    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx) };
+    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), 0 };
+    js_jit_walk_all_modules(ctx, profile_walk_cb, &st);
+    fprintf(f, "\n]}\n");
+    fclose(f);
+    return 0;
+}
+
+int js_jit_write_profile_timed(JSContext *ctx, const char *path, int hz)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "{\"functions\":[\n");
+    ProfileWalkState st = { f, 1, JS_GetRuntime(ctx), hz };
     js_jit_walk_all_modules(ctx, profile_walk_cb, &st);
     fprintf(f, "\n]}\n");
     fclose(f);
@@ -7364,10 +7510,15 @@ void js_jit_free_bytecode(JSFunctionBytecode *b)
     uint8_t tier   = js_jit_fb_get_tier(b);
     void   *handle = js_jit_fb_get_handle(b);
 
+    /* P36.1: remove from sampling registry before releasing .so */
+    JSJITFunc func = js_jit_fb_get_func(b);
     js_jit_fb_clear_handles(b);
 
-    if (tier == 2 && handle)
+    if (tier == 2 && handle) {
+        if (func)
+            jit_registry_remove((uintptr_t)func);
         dlclose(handle);
+    }
 }
 
 #endif /* CONFIG_JIT */

@@ -1058,6 +1058,14 @@ int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
                               JSValue **cpool_out, JSVarRef ***var_refs_out);
 
 /*
+ * P36.1: JIT address range registry — public accessors for jit-tests.
+ *
+ * js_jit_registry_count(): number of live entries in the registry.
+ * (The registry itself is file-static; tests access it through this.)
+ */
+int js_jit_registry_count(void);
+
+/*
  * js_jit_write_profile() — P35.5
  * Write a JSON call-count profile to <path>.
  * Walks all live module bytecodes via js_jit_walk_all_modules() and records
@@ -1074,6 +1082,16 @@ int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
  * this API is designed for module-based server workloads.
  */
 int js_jit_write_profile(JSContext *ctx, const char *path);
+
+/*
+ * js_jit_write_profile_timed() — P36.3
+ * Like js_jit_write_profile() but also emits "time_ms" for each function
+ * computed from the P36.1 sampling registry: time_ms = samples * 1000 / hz.
+ * Must be called after js_jit_sampler_stop().
+ * hz: rate used in js_jit_sampler_start(hz).
+ * Returns 0 on success, -1 if fopen fails.
+ */
+int js_jit_write_profile_timed(JSContext *ctx, const char *path, int hz);
 
 #endif /* CONFIG_JIT */
 #endif /* QUICKJS_JIT_H */
