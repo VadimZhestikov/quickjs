@@ -13,7 +13,7 @@
 9. [Inline Property Cache (IC)](#9-inline-property-cache-ic)
 10. [Phase 10 — LTO Combined Library](#10-phase-10--lto-combined-library)
 11. [Eligibility and Limitations](#11-eligibility-and-limitations)
-12. [Embedding API](#12-embedding-api)
+12. [Embedding API](#12-embedding-api) — including [Hybrid module API (P34)](#hybrid-module-api--phase-34)
 13. [Debugging and Diagnostics](#13-debugging-and-diagnostics)
 14. [Performance Notes](#14-performance-notes)
 
@@ -62,6 +62,7 @@ calls transparently invoke the native version.
 | `quickjs-jit.c` | Code generator, cache manager, GCC driver, IC check macro |
 | `quickjs-jit.h` | Public JIT API; `JSJITICEntry`; `JIT_IC_CHECK` macro |
 | `qjs.c` | CLI wiring for `--jit-aot`, `--jit-warmup`, `--jit-link`, `--jit-dump-c`, `--jit-threshold-gcc`, `--jit-save-sources` |
+| `qjsc.c` | `--jit-hybrid` flag: generates hybrid bytecode+JIT C module files (P34) |
 | `quickjs-libc.c` | `js_loadScript` AOT hook: installs combined.so for `load()`'d files |
 
 ### 2.2 Hot-path probe
@@ -248,6 +249,49 @@ Useful for:
   what was compiled and what native code it produced.
 - **Tooling** — scripts correlating hash → function name → source can read `.js`
   directly instead of parsing the `/* JS function: name */` comment in `.c`.
+
+### `qjsc --jit-hybrid`  *(Phase 34)*
+
+**Hybrid module compilation.**  Combines bytecode and JIT-compiled C into a single
+`.c` file that can be compiled to a self-contained `.so` module.
+
+```sh
+./qjsc --jit-hybrid -o mod.c mod.js
+gcc -O2 -shared -fPIC -DCONFIG_JIT -I. -o mod.so mod.c
+./qjs -m -e "import { add } from './mod.so'; print(add(2, 3));"
+```
+
+The generated `.c` contains five sections:
+
+1. `static const uint8_t _bc[]` — serialised module bytecode
+2. `JSValue __jit_f_<hash>(…)` — one JIT function body per eligible inner function
+3. `_jit_table[]` — hash-to-function-pointer dispatch table
+4. `_install_cb()` — walks bytecodes and sets `tier = 2` for table entries
+5. `js_init_module()` — standard module entry point; deserialises bytecode and
+   calls `js_jit_walk_bytecodes(_install_cb)` when `CONFIG_JIT` is defined
+
+The generated C compiles with and without `CONFIG_JIT`:
+
+```sh
+# JIT path — functions run at tier 2 immediately
+gcc -O2 -shared -fPIC -DCONFIG_JIT -I. -o mod.so mod.c
+
+# Interpreter-only fallback — bytecode only, no JIT
+gcc -O2 -shared -fPIC            -I. -o mod.so mod.c
+```
+
+Strip behaviour mirrors normal `qjsc`:
+
+| Flag | `toString()` | Source in `.so` |
+|---|---|---|
+| (default) | `function f() { [native code] }` | stripped |
+| `--keep-source` | `function f(a,b){ return a+b; }` | preserved |
+| `-s` | `function f() { [native code] }` | fully stripped |
+
+Functions using `OP_eval` or other unsupported opcodes are silently excluded
+from the dispatch table and execute via the interpreter.
+
+See [phase34-hybrid.md](phase34-hybrid.md) for full documentation.
 
 ---
 
@@ -701,6 +745,57 @@ void     js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f, void *handle, in
 int      js_jit_fb_inc_count(JSFunctionBytecode *b);
 int      js_jit_is_eligible(JSFunctionBytecode *b);
 void     js_jit_free_bytecode(JSFunctionBytecode *b);  /* called when b is freed */
+```
+
+### Hybrid module API  *(Phase 34)*
+
+Used by `qjsc --jit-hybrid` and embedding code that works with precompiled module `.so`
+files.  All symbols available when `CONFIG_JIT` is defined.
+
+```c
+/* P34.1 — 64-bit FNV-1a hash of bytecode; same value used for cache filenames */
+uint64_t js_jit_hash_bytecode_pub(JSFunctionBytecode *b);
+
+/* P34.2 — walk all bytecodes reachable from b (cpool recursion), calling cb once
+ *          per unique pointer; deduplicates shared inner functions */
+void js_jit_walk_bytecodes(JSFunctionBytecode *b,
+                            void (*cb)(JSFunctionBytecode *, void *opaque),
+                            void *opaque);
+
+/* P34.3 — generate JIT C source for a single bytecode.
+ *   bc_hash    : hash for the symbol name (use js_jit_hash_bytecode_pub)
+ *   fname_out  : receives "__jit_f_<hash>" (symbol name)
+ *   unsupported: set to 1 if the function cannot be JIT-compiled
+ *   Returns    : heap-allocated C source (caller must free()), or NULL on error */
+char *js_jit_gen_c_str(JSContext *ctx, JSFunctionBytecode *b,
+                        uint64_t bc_hash,
+                        char *fname_out, size_t fname_sz,
+                        int *unsupported);
+
+/* P34.4 — get the module body JSFunctionBytecode from a JS_TAG_MODULE JSValue */
+JSFunctionBytecode *js_jit_module_get_bc(JSValue module_val);
+
+/* P34.6 — call a JIT-compiled function directly by bytecode pointer.
+ *          var_refs is passed as NULL; suitable for non-closure functions.
+ *          Returns JS_EXCEPTION if the function is not JIT-compiled (tier < 2). */
+JSValue js_jit_call_fb(JSContext *ctx, JSFunctionBytecode *b,
+                        JSValue this_val, int argc, JSValue *argv);
+```
+
+Typical embedding pattern (mirrors what `js_init_module` does in generated C):
+
+```c
+/* 1. Deserialise module from embedded bytecode */
+JSValue obj = JS_ReadObject(ctx, _bc, _bc_size, JS_READ_OBJ_BYTECODE);
+
+/* 2. Walk all inner bytecodes and install JIT functions */
+JSFunctionBytecode *root = js_jit_module_get_bc(obj);
+if (root) js_jit_walk_bytecodes(root, my_install_cb, NULL);
+
+/* 3. Return the module */
+JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(obj);
+JS_FreeValue(ctx, obj);
+return m;
 ```
 
 ---

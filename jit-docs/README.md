@@ -47,6 +47,7 @@ C as the intermediate representation.
 | [phase18-todo.md](phase18-todo.md) | Phase 31: need_home_object — class methods with super.prop/super.method(); eligibility check removed, already handled via js_jit_special_object HOME_OBJECT |
 | [phase18-todo.md](phase18-todo.md) | Phase 32: is_derived_ctor — derived class constructors; fixed jit_rt_call_constructor to forward new_target via JS_CallConstructor2; +19% v8bench score |
 | [phase18-todo.md](phase18-todo.md) | Phase 33: has_simple_parameter_list=false — rest params, default params, destructuring params; GEN_GET/PUT/SET_ARG made unconditional for complex params; jit_argc passes original argc for OP_rest; COPY_ARGV buffer overread fixed for spread/apply calls |
+| [phase34-hybrid.md](phase34-hybrid.md) | Phase 34: `qjsc --jit-hybrid` — bytecode + JIT C in one `.so`; `import './mod.so'` with no source `.js`; P34.1–P34.8 API and test suite |
 | [MANUAL.md](MANUAL.md) | Fix: close_var_refs missing from JIT exit path — js_closure2 (called from define_class inside JIT) creates JSVarRefs attached to sf; without close_var_refs on JIT return, closures held dangling pvalue pointers; crashes on 2nd cached run |
 | [MANUAL.md](MANUAL.md) | Feature: --jit-threshold-gcc=N — runtime override for JIT_THRESHOLD_GCC; N=0 triggers AOT pre-pass (compile_all+drain) before execution; N>=1 sets call-count threshold |
 | [MANUAL.md](MANUAL.md) | Feature: --jit-save-sources — writes original JS source of each JIT-compiled function to <hash>.js in cache; self-documenting cache, useful for debugging and tooling |
@@ -608,6 +609,11 @@ rebuild using `--jit-threshold-gcc=N`.
 ./qjs --jit-warmup        script.js   # Step 1: warm all functions, write .so + .c to cache
 ./qjs --jit-warmup --jit-link script.js  # Step 2: combine .c files → combined.so (LTO)
 ./qjs --jit-aot           script.js   # Step 3: execute with combined.so (fast load, inlined)
+
+# Phase 34: precompile a JS module to a self-contained hybrid .so:
+./qjsc --jit-hybrid -o mod.c mod.js   # generate bytecode + JIT C
+gcc -O2 -shared -fPIC -DCONFIG_JIT -I. -o mod.so mod.c
+./qjs -m -e "import { add } from './mod.so'; print(add(2,3));"  # no mod.js needed
 ```
 
 Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
@@ -625,3 +631,4 @@ Cache location: `$QJS_JIT_CACHE` or `~/.cache/qjs-jit/<hash16hex>.so`.
 | `jit_perf_tests/bench_aot.js` | Micro-benchmark suite for `--jit-aot` mode (no warm-up needed) |
 | `jit_perf_tests/v8bench/` | V8 benchmark suite port |
 | `jit_perf_tests/RESULTS.md` | Raw measurements for all phases |
+| `jit_tests/P34/` | Phase 34 C + shell test suite (`make -C jit_tests/P34 run`) |
