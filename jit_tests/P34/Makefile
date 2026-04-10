@@ -17,7 +17,7 @@ OBJS   := $(QJS_DIR)/.obj/quickjs.o \
            $(QJS_DIR)/.obj/cutils.o
 LIBS   := -lm -lpthread -ldl
 
-BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5 /tmp/test_p34_6
+BINS := /tmp/test_p34_1 /tmp/test_p34_2 /tmp/test_p34_3 /tmp/test_p34_5 /tmp/test_p34_6 /tmp/test_p34_7
 
 .PHONY: all run clean
 
@@ -39,6 +39,10 @@ all: $(BINS)
 	    -o $@ $< $(OBJS) $(LIBS)
 
 /tmp/test_p34_6: test_p34_6.c
+	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' -rdynamic \
+	    -o $@ $< $(OBJS) $(LIBS)
+
+/tmp/test_p34_7: test_p34_7.c
 	gcc $(CFLAGS) -DQJS_DIR='"$(QJS_DIR)"' -rdynamic \
 	    -o $@ $< $(OBJS) $(LIBS)
 
@@ -65,7 +69,10 @@ run: all
 	@echo "=== P34.6: js_jit_call_fb executes JIT native code ==="
 	@/tmp/test_p34_6
 	@echo ""
+	@echo "=== P34.7: unsupported (eval) functions fall back to interpreter ==="
+	@/tmp/test_p34_7
+	@echo ""
 	@echo "=== ALL P34 TESTS COMPLETE ==="
 
 clean:
-	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_* /tmp/p34_6_*
+	rm -f $(BINS) /tmp/p34_4_* /tmp/test_p34_3_* /tmp/p34_5_* /tmp/p34_6_* /tmp/p34_7_*
