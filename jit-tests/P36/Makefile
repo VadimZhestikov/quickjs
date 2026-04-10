@@ -12,15 +12,20 @@ LIBS   := -lm -lpthread -ldl
 
 .PHONY: all run clean
 
-all: /tmp/test_p36_1
+all: /tmp/test_p36_1 /tmp/test_p36_2
 
 /tmp/test_p36_1: test_p36_1.c
+	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
+
+/tmp/test_p36_2: test_p36_2.c
 	gcc $(CFLAGS) -rdynamic -o $@ $< $(OBJS) $(LIBS)
 
 run: all
 	@echo "=== P36.1: JIT address range registry ==="
 	@/tmp/test_p36_1
+	@echo "=== P36.2: SIGPROF sampler ==="
+	@/tmp/test_p36_2
 	@echo "=== ALL P36 TESTS COMPLETE ==="
 
 clean:
-	rm -f /tmp/test_p36_1
+	rm -f /tmp/test_p36_1 /tmp/test_p36_2

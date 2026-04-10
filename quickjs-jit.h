@@ -1063,7 +1063,31 @@ int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
  * js_jit_registry_count(): number of live entries in the registry.
  * (The registry itself is file-static; tests access it through this.)
  */
-int js_jit_registry_count(void);
+int      js_jit_registry_count(void);
+uint32_t js_jit_registry_max_samples(void); /* max sample count across all entries */
+
+/*
+ * js_jit_sampler_start() / js_jit_sampler_stop() — P36.2
+ *
+ * Install a SIGPROF handler that fires at <hz> samples/second (ITIMER_PROF,
+ * accounting CPU time).  Each signal increments the sample counter for the
+ * JIT function currently executing, identified via ucontext %rip binary-search
+ * of the P36.1 address registry.
+ *
+ * Supported platforms: Linux x86-64, macOS x86-64, Linux aarch64.
+ * On other platforms the handler is a no-op (start/stop still work safely).
+ *
+ * js_jit_sampler_start(hz): install handler and start timer.  No-op if
+ *   already running.  hz <= 0 defaults to 100.
+ * js_jit_sampler_stop(): stop timer and restore previous signal handler.
+ *   No-op if not running.
+ * js_jit_sampler_hz(): returns current sample rate, 0 if stopped.
+ *
+ * Thread safety: call only from the main thread.
+ */
+void js_jit_sampler_start(int hz);
+void js_jit_sampler_stop(void);
+int  js_jit_sampler_hz(void);
 
 /*
  * js_jit_write_profile() — P35.5

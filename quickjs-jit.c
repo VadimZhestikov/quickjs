@@ -40,6 +40,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
+/* P36.2: SIGPROF sampler */
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/time.h>
 
 #include "quickjs.h"
 #include "quickjs-jit.h"
@@ -7409,8 +7413,118 @@ uint32_t jit_registry_lookup_samples(uint64_t bc_hash)
     return 0;
 }
 
-/* Public accessor used by jit-tests. */
+/* Public accessors used by jit-tests. */
 int js_jit_registry_count(void) { return jit_addr_count; }
+
+/* Returns the maximum sample count across all registry entries.
+ * Used by tests to verify the sampler accumulated at least one sample. */
+uint32_t js_jit_registry_max_samples(void)
+{
+    uint32_t mx = 0;
+    int cnt = jit_addr_count;
+    for (int i = 0; i < cnt; i++) {
+        uint32_t s = __atomic_load_n(&jit_addr_registry[i].samples, __ATOMIC_RELAXED);
+        if (s > mx) mx = s;
+    }
+    return mx;
+}
+
+/* -----------------------------------------------------------------------
+ * P36.2: SIGPROF sampling profiler
+ *
+ * Fires SIGPROF at <hz> Hz using ITIMER_PROF (CPU time: user+kernel).
+ * The signal handler reads %rip / equivalent PC from ucontext_t, binary-
+ * searches jit_addr_registry[], and atomically increments the sample counter
+ * for the enclosing JIT function.
+ *
+ * The signal handler must be async-signal-safe:
+ *   - no malloc, no stdio, no mutex
+ *   - seqlock for registry read (spin + retry)
+ *   - __ATOMIC_RELAXED increment of the sample counter
+ * ----------------------------------------------------------------------- */
+
+static int              jit_sampler_hz = 0;      /* 0 = stopped */
+static struct sigaction jit_old_sigaction;
+static struct itimerval jit_old_itimer;
+
+static void jit_sigprof_handler(int sig, siginfo_t *si, void *ctx_raw)
+{
+    (void)sig; (void)si;
+    ucontext_t *uc = (ucontext_t *)ctx_raw;
+
+    /* Extract program counter — platform-specific */
+#if defined(__x86_64__) && defined(__linux__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__x86_64__) && defined(__APPLE__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#elif defined(__aarch64__) && defined(__linux__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+#else
+    (void)uc;
+    return; /* unsupported platform: no-op */
+#endif
+
+    /* Binary-search registry for the largest func_ptr <= pc.
+     * Use seqlock retry loop so we never read a partially-modified array. */
+    int found = -1;
+    uint32_t seq;
+    do {
+        seq = jit_seqlock_read_begin();
+        int lo = 0, hi = jit_addr_count - 1;
+        found = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            if (jit_addr_registry[mid].func_ptr <= pc) {
+                found = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+    } while (jit_seqlock_retry(seq));
+
+    if (found >= 0) {
+        __atomic_fetch_add(&jit_addr_registry[found].samples, 1,
+                           __ATOMIC_RELAXED);
+    }
+}
+
+void js_jit_sampler_start(int hz)
+{
+    if (jit_sampler_hz > 0)
+        return; /* already running */
+    if (hz <= 0)
+        hz = 100;
+    jit_sampler_hz = hz;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = jit_sigprof_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, &jit_old_sigaction);
+
+    long usec = 1000000L / hz;
+    struct itimerval it;
+    it.it_interval.tv_sec  = 0;
+    it.it_interval.tv_usec = usec;
+    it.it_value.tv_sec     = 0;
+    it.it_value.tv_usec    = usec;
+    setitimer(ITIMER_PROF, &it, &jit_old_itimer);
+}
+
+void js_jit_sampler_stop(void)
+{
+    if (jit_sampler_hz == 0)
+        return; /* not running */
+    /* Disable the timer first, then restore the old handler */
+    struct itimerval zero = {{0,0},{0,0}};
+    setitimer(ITIMER_PROF, &zero, NULL);
+    sigaction(SIGPROF, &jit_old_sigaction, NULL);
+    jit_sampler_hz = 0;
+}
+
+int js_jit_sampler_hz(void) { return jit_sampler_hz; }
 
 /* -----------------------------------------------------------------------
  * P35.5: call-count profile writer
