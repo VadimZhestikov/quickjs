@@ -4046,6 +4046,20 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 
 /**********************************************************/
 
+#ifdef CONFIG_JIT
+/* __jit_drain() — block until all pending GCC compilations have completed,
+ * then install the compiled functions into their live bytecodes.
+ * Useful in bench_runner.js warmup: call after triggering compilation to
+ * ensure the JIT-compiled version runs during the measurement phase. */
+static JSValue js_jit_drain_builtin(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    js_jit_drain();
+    js_jit_install_results();
+    return JS_UNDEFINED;
+}
+#endif
+
 static JSValue js_print(JSContext *ctx, JSValueConst this_val,
                         int argc, JSValueConst *argv)
 {
@@ -4112,6 +4126,11 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
                       JS_NewCFunction(ctx, js_print, "print", 1));
     JS_SetPropertyStr(ctx, global_obj, "__loadScript",
                       JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1));
+
+#ifdef CONFIG_JIT
+    JS_SetPropertyStr(ctx, global_obj, "__jit_drain",
+                      JS_NewCFunction(ctx, js_jit_drain_builtin, "__jit_drain", 0));
+#endif
 
     JS_FreeValue(ctx, global_obj);
 }

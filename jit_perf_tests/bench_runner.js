@@ -15,8 +15,10 @@ if (typeof print === 'undefined') var print = console.log.bind(console);
 if (typeof performance === 'undefined') var performance = { now: function() { return Date.now(); } };
 
 function bench(name, warmup_iters, iters, fn) {
-    /* Warm-up: let the JIT compile (threshold=2 means 2 warm-up calls suffice) */
+    /* Warm-up: trigger JIT compilation. */
     for (let i = 0; i < warmup_iters; i++) fn();
+    /* Wait for GCC async compilation to finish (no-op in non-JIT builds). */
+    if (typeof __jit_drain !== 'undefined') __jit_drain();
 
     const t0 = performance.now();
     for (let i = 0; i < iters; i++) fn();
