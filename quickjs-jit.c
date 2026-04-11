@@ -5416,9 +5416,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     }
                     jit_buf_str(cb,
                         "extern JSValue js_jit_ic_direct_call"
-                        "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n");
+                        "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n"
+                        "extern JSValue js_jit_ic_fast_call"
+                        "(JSContext*,JSValue,JSJITCallICEntry*);\n");
                     jit_buf_printf(cb,
-                        "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0};\n"
+                        "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0};\n"
                         "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
                               "?JS_VALUE_GET_PTR(_f):NULL;\n"
                         "      JSValue _r;\n"
@@ -5438,7 +5440,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         pc, pc, pc, pc, pc, pc);
                     /* Use js_jit_ic_direct_call to pad args to callee_arg_count and dup them.
                      * This matches js_jit_call's padding so the callee's put_arg write-backs
-                     * operate on a private copy, not the caller's stack slots. */
+                     * operate on a private copy, not the caller's stack slots.
+                     *
+                     * P41.2: for zero-arg calls where callee_is_fast == 1 (NORMAL closure,
+                     * no HOME_OBJECT, no var_refs, arg_count==0), bypass all SF mutation
+                     * and arg padding by calling direct_jit() via js_jit_ic_fast_call. */
                     if (nargs > 0)
                         jit_buf_printf(cb,
                             "          _r=js_jit_ic_direct_call(ctx,JS_UNDEFINED,%d,_ca%d,"
@@ -5447,10 +5453,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                             nargs, pc, pc);
                     else
                         jit_buf_printf(cb,
-                            "          _r=js_jit_ic_direct_call(ctx,JS_UNDEFINED,0,NULL,"
-                                       "&_cic%d,"
-                                       "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
-                            pc);
+                            "          if(js_likely(_cic%d.callee_is_fast))\n"
+                            "            _r=js_jit_ic_fast_call(ctx,JS_UNDEFINED,&_cic%d);\n"
+                            "          else\n"
+                            "            _r=js_jit_ic_direct_call(ctx,JS_UNDEFINED,0,NULL,"
+                                         "&_cic%d,"
+                                         "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                            pc, pc, pc);
                     if (nargs > 0)
                         jit_buf_printf(cb,
                             "        } else _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n"
@@ -5505,9 +5514,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 /* P11.3: method call IC — same structure as OP_call */
                 jit_buf_str(cb,
                     "extern JSValue js_jit_ic_direct_call"
-                    "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n");
+                    "(JSContext*,JSValue,int,JSValue*,JSJITCallICEntry*,JSVarRef**);\n"
+                    "extern JSValue js_jit_ic_fast_call"
+                    "(JSContext*,JSValue,JSJITCallICEntry*);\n");
                 jit_buf_printf(cb,
-                    "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0};\n"
+                    "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0};\n"
                     "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
                           "?JS_VALUE_GET_PTR(_f):NULL;\n"
                     "      JSValue _r;\n"
@@ -5520,7 +5531,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                                             "+JIT_BC_BCHASH_OFF)==_cic%d.callee_bc_hash){\n"
                     "          if(_RT->poll_interrupts(ctx)) goto _ex;\n",
                     pc, pc, pc, pc, pc, pc);
-                /* Use js_jit_ic_direct_call for arg padding (same reason as OP_call). */
+                /* Use js_jit_ic_direct_call for arg padding (same reason as OP_call).
+                 * P41.2: for zero-arg method calls, use fast path when callee_is_fast. */
                 if (nargs > 0)
                     jit_buf_printf(cb,
                         "          _r=js_jit_ic_direct_call(ctx,_t,%d,_ca%d,"
@@ -5529,10 +5541,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         nargs, pc, pc);
                 else
                     jit_buf_printf(cb,
-                        "          _r=js_jit_ic_direct_call(ctx,_t,0,NULL,"
-                                   "&_cic%d,"
-                                   "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
-                        pc);
+                        "          if(js_likely(_cic%d.callee_is_fast))\n"
+                        "            _r=js_jit_ic_fast_call(ctx,_t,&_cic%d);\n"
+                        "          else\n"
+                        "            _r=js_jit_ic_direct_call(ctx,_t,0,NULL,"
+                                     "&_cic%d,"
+                                     "*(JSVarRef***)((char*)_fo+JIT_FUNC_VARREFS_OFF));\n",
+                        pc, pc, pc);
                 if (nargs > 0)
                     jit_buf_printf(cb,
                         "        } else _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n"

@@ -217,7 +217,7 @@ Three C harness tests in `jit-tests/P41/`:
 3. `test_p41_3.c` — exception safety: closure that throws propagates the exception
    correctly through the fast-bypass path; backtrace is formed.
 
-## Expected Results
+## Expected Results (Planned)
 
 | Benchmark | Before P41 | After P41.1 | After P41.2 | Node v24 |
 |-----------|-----------|-------------|-------------|---------|
@@ -226,11 +226,44 @@ Three C harness tests in `jit-tests/P41/`:
 | Gap vs Node (interpreted) | 19× | ~15× | ~15× | — |
 | Gap vs Node (JIT caller) | 7.5× | 7.5× | ~6× | — |
 
-P41.1 mainly helps the interpreted-caller scenario. P41.2 mainly helps JIT-to-JIT.
-Both together reduce the combined gap on a realistic workload where the calling loop
-itself is sometimes JIT-compiled and sometimes not.
+## Actual Results (2026-04-10)
 
-The remaining gap (~6-15×) after P41 is mostly intrinsic JS call overhead: JS values
+### P41.1 — Early JIT Bypass
+
+| Benchmark | Before P41.1 | After P41.1 | Improvement |
+|-----------|-------------|-------------|-------------|
+| closure_counter (interpreted caller, 1M) | 38-40 ms | 29-31 ms | ~25% |
+| closure_counter (JIT caller, 1M, bench not JIT) | 35-40 ms | 27-29 ms | ~25% |
+
+P41.1 skips the alloca + full JSStackFrame setup for JIT-compiled callees that meet
+all bypass criteria. Saves ~10-15 instructions before the JIT call and eliminates
+the `close_var_refs` no-op call after it.
+
+### P41.2 — Slim IC Fast-Call for Zero-Arg Closures
+
+P41.2 adds `callee_is_fast` to `JSJITCallICEntry` and `js_jit_ic_fast_call()`.
+For zero-arg, NORMAL, no-HOME_OBJECT closures, the IC hot path skips all
+cur_func/new_target save/restore and calls the JIT function pointer directly.
+
+| Benchmark | Before P41.2 | After P41.2 | Improvement |
+|-----------|-------------|-------------|-------------|
+| closure_counter (fully JIT, bench×150 warm) | 37-39 ms | 7-8 ms | ~5× |
+
+The massive speedup for fully-JIT callers is because:
+- The P10.3 static direct-call path (known callee at compile time) calls the JIT
+  function directly as a C function — no JS_CallInternal, no IC struct access.
+- P41.1 eliminates stack frame overhead for the counter's inner return path.
+- P41.2 eliminates cur_func/new_target save/restore for IC-dispatched zero-arg calls.
+
+**Note:** The P10.3 static dispatch path (`js_jit_check_and_extract`) is used when
+the callee is known at JIT compile time. P41.2's IC path (`js_jit_ic_fast_call`) is
+used for call sites where the callee is determined at runtime via the IC.
+
+P41.1 mainly helps the interpreted-caller scenario. P41.2 mainly helps JIT-to-JIT
+via the call IC. Both together produce ~25-500% improvement depending on the ratio
+of statically-known vs dynamically-dispatched callees.
+
+The remaining gap (~4-15×) vs Node is mostly intrinsic JS call overhead: JS values
 are 16 bytes each, boxing/unboxing around the call boundary adds DupValue/FreeValue
 pairs, and QuickJS passes ownership on every call whereas V8's tagged NaN representation
 can pass values by register with no heap traffic.

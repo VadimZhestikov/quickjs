@@ -16324,6 +16324,31 @@ JSValue js_jit_ic_direct_call(
  * immediately since they are almost always monomorphic in practice and
  * js_jit_call already handles them cheaply.
  */
+/* P41.2: Compute the callee_is_fast flag for an IC entry.
+ * A callee is "fast" when it is a zero-arg, plain JS_FUNC_NORMAL closure that:
+ *   - arg_count == 0: no argument padding or duplication needed at call site
+ *   - does not use super (need_home_object == 0): cur_func update not needed
+ *   - var_ref_count == 0: does not create var_refs for child closures
+ * For such callees the call IC hot path can call direct_jit() directly —
+ * no alloca, no arg dup/free, no cur_func/new_target save/restore. */
+static uint8_t js_jit_ic_compute_fast(JSFunctionBytecode *b)
+{
+    return (b->arg_count == 0 &&
+            b->func_kind == JS_FUNC_NORMAL &&
+            !b->need_home_object &&
+            b->var_ref_count == 0) ? 1 : 0;
+}
+
+/* P41.2: slim direct call — only for callees where callee_is_fast == 1.
+ * Calls the JIT function directly with no cur_func / new_target mutation.
+ * The caller must check callee_is_fast before using this path. */
+JSValue js_jit_ic_fast_call(JSContext *ctx, JSValue this_val,
+                             JSJITCallICEntry *ic)
+{
+    return ic->direct_jit(ctx, this_val, 0, NULL,
+                          ic->callee_cpool, ic->callee_var_refs);
+}
+
 void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
 {
     (void)ctx;
@@ -16348,6 +16373,7 @@ void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
         ic->callee_var_refs   = fo->u.func.var_refs;
         ic->callee_arg_count  = b->arg_count;
         ic->callee_bc_hash    = b->jit_bc_hash;
+        ic->callee_is_fast    = js_jit_ic_compute_fast(b); /* P41.2 */
     } else if (ic->expected_func == fo && ic->expected_bc == b) {
         /* Same callee — refresh jit_func if it was compiled since last fill */
         if (ic->direct_jit == NULL) {
@@ -19546,6 +19572,65 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          (JSValueConst *)argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+#ifdef CONFIG_JIT
+    /* P41.1: Early JIT fast-path — fires before alloca and most JSStackFrame setup.
+     *
+     * When a function is already JIT-compiled and meets all bypass criteria, we skip
+     * the alloca (for var_buf / stack_buf / var_refs array), all initialization loops,
+     * and the close_var_refs call after the JIT function returns.
+     *
+     * Bypass conditions (all must hold):
+     *   1. jit_func != NULL          — already compiled; call it directly
+     *   2. var_ref_count == 0        — the JIT function never writes to sf->var_refs[];
+     *                                  close_var_refs() is provably a no-op
+     *   3. has_simple_parameter_list — no rest / default / destructuring; arg_count
+     *                                  is the exact parameter count; no argc padding
+     *   4. argc >= arg_count         — caller supplies all needed arguments; no padding
+     *   5. func_kind == NORMAL       — generators and async functions reuse the
+     *                                  JSStackFrame for coroutine resumption; they need
+     *                                  the full alloca'd var_buf and stack_buf
+     *   6. !(flags & COPY_ARGV)      — the JIT may write back to argv[i] via GEN_PUT_ARG;
+     *                                  COPY_ARGV means the caller requires argv to be
+     *                                  preserved, so we cannot pass it directly
+     *
+     * Fields set on sf (the C-stack local sf_s, already allocated):
+     *   prev_frame  — restore chain for current_stack_frame after the call
+     *   cur_func    — callee function object (read by js_jit_special_object + backtrace)
+     *   new_target  — forwarded new.target (read by OP_special_object NEW_TARGET)
+     *   arg_count   — original argc (fallback for exception-recovery code)
+     *   cur_pc      — pointer to start of bytecode (function name visible in backtrace)
+     *   var_refs    — NULL; var_ref_count==0 guarantees it is never dereferenced
+     *
+     * Not set (and not needed):
+     *   arg_buf / var_buf — JIT uses its own C locals (_jsv_* / _jsi_*)
+     *   js_mode           — JIT ignores it; only the interpreter switch uses it
+     *   var_refs[]        — no OP_define_class / js_closure2 runs in NORMAL+var_ref_count==0 */
+    {
+        JSJITFunc _jf41 = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
+        if (_jf41 != NULL &&
+            b->var_ref_count == 0 &&
+            b->has_simple_parameter_list &&
+            argc >= b->arg_count &&
+            b->func_kind == JS_FUNC_NORMAL &&
+            !(flags & JS_CALL_FLAG_COPY_ARGV))
+        {
+            sf->prev_frame  = rt->current_stack_frame;
+            sf->cur_func    = (JSValue)func_obj;
+            sf->new_target  = (JSValue)new_target;
+            sf->arg_count   = argc;
+            sf->cur_pc      = b->byte_code_buf; /* start of bytecode for backtrace */
+            sf->var_refs    = NULL;              /* var_ref_count==0: never accessed */
+            rt->current_stack_frame = sf;
+            ctx = b->realm;                      /* must switch to callee's realm */
+            JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, b->arg_count,
+                                   argv, b->cpool, p->u.func.var_refs);
+            rt->current_stack_frame = sf->prev_frame;
+            /* close_var_refs() is a no-op when var_ref_count==0 — skip it. */
+            return _ret41;
+        }
+    }
+#endif /* CONFIG_JIT */
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;

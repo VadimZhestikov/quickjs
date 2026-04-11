@@ -748,6 +748,10 @@ typedef struct {
     JSVarRef           **callee_var_refs;    /* callee's closure var refs */
     int                  callee_arg_count;   /* b->arg_count (for arg padding) */
     uint64_t             callee_bc_hash;     /* P11.3 double-ABA guard: b->jit_bc_hash */
+    /* P41.2: 1 if callee is a simple closure: func_kind==NORMAL, !need_home_object,
+     * var_ref_count==0.  Allows the call IC hot path to bypass cur_func/new_target
+     * save/restore and call direct_jit() with no SF mutation. */
+    uint8_t              callee_is_fast;
 } JSJITCallICEntry;
 
 /*
@@ -761,6 +765,9 @@ void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic);
 JSValue js_jit_ic_direct_call(JSContext *ctx, JSValue this_val,
                                int nargs, JSValue *argv,
                                JSJITCallICEntry *ic, JSVarRef **var_refs);
+/* P41.2: slim direct call for simple closures (no cur_func/new_target update). */
+JSValue js_jit_ic_fast_call(JSContext *ctx, JSValue this_val,
+                             JSJITCallICEntry *ic);
 #endif
 
 /* ======================================================================= */
