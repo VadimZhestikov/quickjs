@@ -202,3 +202,54 @@ These two modes are **statistically indistinguishable** across all benchmarks (w
 ## 5. Conclusion
 
 The QuickJS GCC-backend JIT delivers **large, consistent speedups on compute-bound workloads**: 16–21× for tight arithmetic loops, 3–5× for recursive and array-access patterns. These gains bring integer-loop performance to within 10–50% of V8 TurboFan. The primary remaining gap is property access, where the absence of type specialization leaves 10–20× performance on the table. The warm link-time and AOT modes are equivalent at steady state; the combined LTO `.so` provides a measurable advantage for IC-heavy code over separate per-function `.so` files.
+
+---
+
+## 6. P37 Results (2026-04-10)
+
+Phase 37 targeted the property-access gap with four sub-phases:
+
+| Sub-phase | Change |
+|---|---|
+| P37.1 | Remove redundant atom check from `JIT_IC_CHECK` (P36 promoted `shape_gen` to uint32_t) |
+| P37.2 | Hoist runtime guard (`_rt = JS_GetRuntime(ctx)`) to function preamble; replace `JIT_IC_CHECK` with `JIT_IC_CHECK_FAST` in emitters |
+| P37.3 | Peephole: skip `DupValue`/`FreeValue` pair for get_loc→get_field pattern (refcount elision) |
+| P37.4 | Bimorphic IC: upgrade from `JSJITICEntry` (1 slot) to `JSJITICEntry2` (2 slots) |
+
+### 6.1 prop_read and prop_write: before vs after P37
+
+All figures use the LTO-optimized binary (`CONFIG_JIT=y CONFIG_LTO=y`), warm run (cached `.so`).
+
+| Mode | prop_read Before | prop_read After | prop_write Before | prop_write After |
+|---|---:|---:|---:|---:|
+| Interpreter | 422 ms | 432 ms | 322 ms | 330 ms |
+| JIT AOT (warm) | 184 ms | **92 ms** | 239 ms | **75 ms** |
+| Node v24 | 10 ms | 9 ms | 10 ms | 9 ms |
+
+**prop_read speedup**: 184 ms → 92 ms (**2× faster**, from 18.4× behind Node to 10.2× behind Node)
+
+**prop_write speedup**: 239 ms → 75 ms (**3.2× faster**, from 23.9× behind Node to 8.3× behind Node)
+
+### 6.2 Which sub-phase contributed what
+
+- **P37.3 (refcount elision)** is the dominant factor for `prop_read`: the `get_loc→get_field` peephole eliminates 1M unnecessary `DupValue`/`FreeValue` pairs in the hot loop, removing two conditional memory read-writes per iteration.
+- **P37.1+P37.2 (IC check simplification)** reduce the per-hit check from 9 conditions to 5: one `_rt` pointer comparison, one shape pointer comparison, one `shape_gen` comparison, and one `prop_count` comparison.
+- **P37.4 (bimorphic IC)** prevents early megamorphic demotion when two shapes alternate; its benefit is most visible in polymorphic workloads (not captured by the monomorphic `prop_read`/`prop_write` benchmarks).
+- **prop_write** benefits from P37.1+P37.2+P37.4 but not P37.3 (the `put_field` pattern is `get_loc_obj, get_loc_val, put_field` and the object is loaded independently).
+
+### 6.3 Full P37 benchmark table (warm AOT)
+
+| Benchmark | Interpreter | JIT AOT (Before P37) | JIT AOT (After P37) | Node v24 |
+|---|---:|---:|---:|---:|
+| fib(30) x1 | 75 ms | 24 ms | 25 ms | 8 ms |
+| sum_loop(1e6) | 548 ms | 26 ms | 27 ms | 23 ms |
+| sum_sq(1e6) | 423 ms | 26 ms | 27 ms | 18 ms |
+| **prop_read(1e6)** | 432 ms | 184 ms | **92 ms** | 9 ms |
+| **prop_write(1e6)** | 330 ms | 239 ms | **75 ms** | 9 ms |
+| closure_counter(1e6) | 33 ms | 15 ms | 15 ms | 2 ms |
+| ipow(2,20) x1e5 | 68 ms | 28 ms | 30 ms | 11 ms |
+| str_concat(5000) | 38 ms | 42 ms | 42 ms | 5 ms |
+| count_primes(3000) | 5 ms | 1.5 ms | 1.4 ms | 1 ms |
+| arr_sum(10000) x1e3 | 210 ms | 48 ms | 49 ms | 9 ms |
+
+Non-property-access benchmarks are unaffected by P37, as expected.

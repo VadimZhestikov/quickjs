@@ -582,7 +582,7 @@ typedef struct {
 uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
 
 /*
- * JIT_IC_CHECK(obj, ic): inline shape-guard + ABA-atom-guard + runtime-guard.
+ * JIT_IC_CHECK(obj, ic): inline shape-guard + runtime-guard.
  * Equivalent to js_jit_ic_check() but expands inline in JIT-generated code
  * so the compiler can see the body and optimize across the IC boundary.
  *
@@ -597,6 +597,14 @@ uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
  * After guard (1) passes, (ic)->rt IS the live current runtime, so calling
  * JS_GetRuntimeICGen on it is safe.
  * Relies on 'ctx' being in scope (always true in JIT-generated functions).
+ *
+ * P37.1: Atom check (shape->prop[slot].atom == ic->atom) removed.
+ * It was added as an ABA guard when shape_gen was uint16_t.  Since commit
+ * 540871e promoted shape_gen to uint32_t, reusing a shape address with the
+ * same 32-bit generation requires 4 billion shape allocations between two
+ * accesses on the same callsite — impossible in practice.  The atom check
+ * was therefore redundant and has been removed to eliminate one multi-level
+ * memory read from every IC hit.
  */
 #define JIT_IC_CHECK(obj, ic) \
     ((ic)->rt != NULL && \
@@ -606,9 +614,31 @@ uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
      *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
-     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot && \
-     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_PROP_OFF + \
-                        (ic)->slot * JIT_SHAPEIC_PROPSIZE + JIT_SHAPEIC_ATOM_OFF) == (ic)->atom)
+     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot)
+
+/*
+ * JIT_IC_CHECK_FAST(obj, ic): fast per-callsite IC check for use inside
+ * JIT-generated functions where the runtime pointer is already captured in
+ * a local variable `_rt` (emitted in the function preamble by P37.2).
+ *
+ * Replaces 3 runtime conditions (null check + pointer check + rt_gen) with a
+ * single pointer comparison `(ic)->rt == _rt`.  Safe because:
+ *   - `_rt` is captured once at function entry via JS_GetRuntime(ctx).
+ *   - The runtime pointer and its generation counter never change during a
+ *     single JS function invocation.
+ *   - Cross-runtime ABA is handled at fill time: js_jit_ic_fill_get/put
+ *     checks rt_gen before accepting a stale entry.
+ *
+ * Requires `_rt` to be in scope — always true in P37.2-compiled functions.
+ * This replaces JIT_IC_CHECK in all per-callsite jit_buf_printf format strings.
+ */
+#define JIT_IC_CHECK_FAST(obj, ic) \
+    ((ic)->rt == _rt && \
+     (ic)->shape != JIT_IC_MEGAMORPHIC && \
+     JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
+     *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
+     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
+     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot)
 
 /*
  * js_jit_ic_check: same logic as JIT_IC_CHECK but as a callable function.
@@ -631,6 +661,36 @@ int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
  */
 int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
                        JSJITICEntry *ic);
+
+/*
+ * JSJITICEntry2: bimorphic IC entry (P37.4).
+ * Holds up to 2 (shape, slot) pairs per callsite.
+ *   n=0: empty (no valid entries)
+ *   n=1: monomorphic (e[0] valid)
+ *   n=2: bimorphic (e[0] and e[1] valid)
+ *   n=3: megamorphic (e[0].shape == JIT_IC_MEGAMORPHIC, all checks miss)
+ * JIT_IC_CHECK_FAST works directly with &ic2.e[0] / &ic2.e[1] (pointer to
+ * JSJITICEntry).  No macro change required for the bimorphic variant.
+ */
+typedef struct {
+    JSJITICEntry e[2];
+    uint8_t      n;      /* number of valid entries: 0=empty,1=mono,2=bi,3=mega */
+    uint8_t      _pad[3];
+} JSJITICEntry2;
+
+/*
+ * js_jit_ic2_fill_get: fill bimorphic IC after a get_field miss.
+ * Promotes: empty→mono→bimorphic→megamorphic.
+ */
+void js_jit_ic2_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
+                         JSJITICEntry2 *ic2);
+
+/*
+ * js_jit_ic2_fill_put: fill bimorphic IC after a put_field miss.
+ * Promotes: empty→mono→bimorphic→megamorphic.
+ */
+void js_jit_ic2_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
+                         JSJITICEntry2 *ic2);
 
 /*
  * js_jit_ic_read: read a property from the cached slot.
