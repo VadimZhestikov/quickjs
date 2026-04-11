@@ -17314,52 +17314,49 @@ int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
     return 1;
 }
 
-/* P37.4: Bimorphic IC fill for get_field.
- * Promotes: empty(n=0)→mono(n=1)→bimorphic(n=2)→megamorphic(n=3).
- * Once megamorphic, all checks miss permanently for this callsite. */
+/* P43.2: Quadrimorphic IC fill for get_field.
+ * Promotes: empty(0)→mono(1)→bi(2)→tri(3)→quad(4)→megamorphic(5).
+ * Once megamorphic (n==5), all checks miss permanently for this callsite. */
 void js_jit_ic2_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
                           JSJITICEntry2 *ic2)
 {
-    if (ic2->n == 3) return; /* already megamorphic — nothing to do */
-    if (ic2->n == 0) {
+    uint8_t n = ic2->n;
+    if (n >= 5) return; /* megamorphic */
+    /* Stale mega sentinel from a prior promotion (shouldn't happen, but guard). */
+    if (n > 0 && ic2->e[0].shape == JIT_IC_MEGAMORPHIC) { ic2->n = 5; return; }
+    if (n == 0) {
         js_jit_ic_fill_get(ctx, obj, atom, &ic2->e[0]);
-        if (ic2->e[0].shape != NULL)
-            ic2->n = 1;
-    } else if (ic2->n == 1) {
-        if (ic2->e[0].shape == JIT_IC_MEGAMORPHIC) { ic2->n = 3; return; }
-        /* Fill secondary slot — independent from primary (no demotion yet). */
-        memset(&ic2->e[1], 0, sizeof(ic2->e[1]));
-        js_jit_ic_fill_get(ctx, obj, atom, &ic2->e[1]);
-        if (ic2->e[1].shape != NULL && ic2->e[1].shape != JIT_IC_MEGAMORPHIC)
-            ic2->n = 2;
-        else { /* not cacheable — go mega */ ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 3; }
-    } else { /* n == 2: third distinct shape → megamorphic */
-        ic2->e[0].shape = JIT_IC_MEGAMORPHIC;
-        ic2->n = 3;
+        if (ic2->e[0].shape != NULL) ic2->n = 1;
+        return;
     }
+    /* n == 1, 2, or 3: fill the next slot; n == 4: 5th shape → megamorphic. */
+    if (n >= 4) { ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 5; return; }
+    memset(&ic2->e[n], 0, sizeof(ic2->e[n]));
+    js_jit_ic_fill_get(ctx, obj, atom, &ic2->e[n]);
+    if (ic2->e[n].shape != NULL && ic2->e[n].shape != JIT_IC_MEGAMORPHIC)
+        ic2->n = n + 1;
+    else { ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 5; }
 }
 
-/* P37.4: Bimorphic IC fill for put_field.
+/* P43.2: Quadrimorphic IC fill for put_field.
  * Same promotion sequence as js_jit_ic2_fill_get. */
 void js_jit_ic2_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
                           JSJITICEntry2 *ic2)
 {
-    if (ic2->n == 3) return;
-    if (ic2->n == 0) {
+    uint8_t n = ic2->n;
+    if (n >= 5) return;
+    if (n > 0 && ic2->e[0].shape == JIT_IC_MEGAMORPHIC) { ic2->n = 5; return; }
+    if (n == 0) {
         js_jit_ic_fill_put(ctx, obj, atom, &ic2->e[0]);
-        if (ic2->e[0].shape != NULL)
-            ic2->n = 1;
-    } else if (ic2->n == 1) {
-        if (ic2->e[0].shape == JIT_IC_MEGAMORPHIC) { ic2->n = 3; return; }
-        memset(&ic2->e[1], 0, sizeof(ic2->e[1]));
-        js_jit_ic_fill_put(ctx, obj, atom, &ic2->e[1]);
-        if (ic2->e[1].shape != NULL && ic2->e[1].shape != JIT_IC_MEGAMORPHIC)
-            ic2->n = 2;
-        else { ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 3; }
-    } else {
-        ic2->e[0].shape = JIT_IC_MEGAMORPHIC;
-        ic2->n = 3;
+        if (ic2->e[0].shape != NULL) ic2->n = 1;
+        return;
     }
+    if (n >= 4) { ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 5; return; }
+    memset(&ic2->e[n], 0, sizeof(ic2->e[n]));
+    js_jit_ic_fill_put(ctx, obj, atom, &ic2->e[n]);
+    if (ic2->e[n].shape != NULL && ic2->e[n].shape != JIT_IC_MEGAMORPHIC)
+        ic2->n = n + 1;
+    else { ic2->e[0].shape = JIT_IC_MEGAMORPHIC; ic2->n = 5; }
 }
 
 /* Read property from cached slot (IC hit — returns new reference). */

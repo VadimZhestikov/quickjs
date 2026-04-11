@@ -673,31 +673,33 @@ int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
                        JSJITICEntry *ic);
 
 /*
- * JSJITICEntry2: bimorphic IC entry (P37.4).
- * Holds up to 2 (shape, slot) pairs per callsite.
+ * JSJITICEntry2: quadrimorphic IC entry (P43.2, upgraded from P37.4 bimorphic).
+ * Holds up to 4 (shape, slot) pairs per callsite.
  *   n=0: empty (no valid entries)
  *   n=1: monomorphic (e[0] valid)
  *   n=2: bimorphic (e[0] and e[1] valid)
- *   n=3: megamorphic (e[0].shape == JIT_IC_MEGAMORPHIC, all checks miss)
- * JIT_IC_CHECK_FAST works directly with &ic2.e[0] / &ic2.e[1] (pointer to
- * JSJITICEntry).  No macro change required for the bimorphic variant.
+ *   n=3: trimorphic (e[0], e[1], e[2] valid)
+ *   n=4: quadrimorphic (e[0], e[1], e[2], e[3] valid)
+ *   n=5: megamorphic (e[0].shape == JIT_IC_MEGAMORPHIC, all checks miss)
+ * JIT_IC_CHECK_FAST works directly with &ic2.e[i] (pointer to JSJITICEntry).
+ * sizeof(JSJITICEntry)==48, so e[4]==192 bytes; struct total = 200 bytes.
  */
 typedef struct {
-    JSJITICEntry e[2];
-    uint8_t      n;      /* number of valid entries: 0=empty,1=mono,2=bi,3=mega */
-    uint8_t      _pad[3];
+    JSJITICEntry e[4];
+    uint8_t      n;      /* number of valid entries: 0=empty,1..4=poly,5=mega */
+    uint8_t      _pad[7]; /* explicit padding to sizeof==200 (8-byte aligned) */
 } JSJITICEntry2;
 
 /*
- * js_jit_ic2_fill_get: fill bimorphic IC after a get_field miss.
- * Promotes: empty→mono→bimorphic→megamorphic.
+ * js_jit_ic2_fill_get: fill quadrimorphic IC after a get_field miss.
+ * Promotes: empty→mono→bi→tri→quad→megamorphic.
  */
 void js_jit_ic2_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
                          JSJITICEntry2 *ic2);
 
 /*
- * js_jit_ic2_fill_put: fill bimorphic IC after a put_field miss.
- * Promotes: empty→mono→bimorphic→megamorphic.
+ * js_jit_ic2_fill_put: fill quadrimorphic IC after a put_field miss.
+ * Promotes: empty→mono→bi→tri→quad→megamorphic.
  */
 void js_jit_ic2_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
                          JSJITICEntry2 *ic2);

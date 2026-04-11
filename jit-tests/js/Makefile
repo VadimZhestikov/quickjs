@@ -36,7 +36,8 @@ JS_TESTS := \
     test_jit_p31p32.js \
     test_jit_p33.js \
     test_jit_p123_async.js \
-    test_jit_p124_closures_async_gen.js
+    test_jit_p124_closures_async_gen.js \
+    test_jit_p43_ic.js
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
