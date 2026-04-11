@@ -5,7 +5,32 @@
 - P41 committed (0d25a05) — early JIT bypass + slim IC fast-call
 - V8 benchmark suite at `jit_perf_tests/v8bench/` with `run_qjs.js`
 - Node.js available for reference scoring: `node --version`
-- Cold-JIT baseline recorded in `phase43-v8bench.md`
+- Warm-cache baseline collected (2026-04-11) and recorded in `phase43-v8bench.md`
+
+## Known Warm-Cache Baseline (2026-04-11)
+
+These numbers are the starting point for all P43 improvements:
+
+| Benchmark | Interpreter | JIT warm | Delta |
+|-----------|-------------|----------|-------|
+| Richards | 1058 | 1056 | −0% |
+| DeltaBlue | 941 | 933 | −1% |
+| Crypto | 1245 | 1216 | **−2%** |
+| RayTrace | 1322 | 1362 | +3% |
+| EarleyBoyer | 1707 | 1632 | **−4%** |
+| RegExp | 441 | 435 | −1% |
+| Splay | 2648 | 2825 | +7% |
+| **Score** | **1184** | **1184** | **0%** |
+
+P43.5 (Splay investigation) is **resolved** — warm Splay JIT (+7%) confirmed
+the cold-start regression was a measurement artifact. No code change needed.
+
+## Implementation Order
+
+1. **Step 1** — Measurement harness (`run_bench.sh`)
+2. **Step 2** — Quadrimorphic IC (P43.2) — fixes EarleyBoyer −4% + DeltaBlue
+3. **Step 3** — Crypto bit-op audit (P43.4) — fixes Crypto −2%
+4. **Step 4** — Tests and result recording (P43.6)
 
 ## Step 1 — Two-Pass Measurement Harness (P43.1)
 

@@ -1,81 +1,91 @@
 # Phase 43: V8 Benchmark Profiling + Targeted Fixes
 
-## Baseline Data (2026-04-10, after P41)
+## Baseline Data (2026-04-11, after P41)
 
-Run from `jit_perf_tests/v8bench/` with fresh JIT cache:
+Three runs collected. `qjs` = current build (P41, warm JIT cache).
+`qjs_nojit` = interpreter only. `qjs_jit --jit-aot` = pre-P41 binary in AOT mode.
 
-| Benchmark | No-JIT | JIT (cold) | JIT vs Interp | Node v24 | Gap vs Node |
-|-----------|--------|-----------|---------------|----------|-------------|
-| Richards | 842 | 935 | **+11%** | 28175 | 30× |
-| DeltaBlue | 726 | 822 | **+13%** | 63268 | 77× |
-| Crypto | 837 | 1057 | **+26%** | 36072 | 34× |
-| RayTrace | 1048 | 1128 | **+8%** | 67043 | 59× |
-| EarleyBoyer | 1329 | 1389 | **+5%** | 54824 | 39× |
-| RegExp | 359 | 380 | **+6%** | 8397 | 22× |
-| Splay | 2407 | 1964 | **−18%** | 29883 | 15× |
-| **Score** | **933** | **993** | **+6%** | **34595** | **35×** |
+| Benchmark | Interpreter | JIT warm | JIT AOT (old) | Node v24 | Interp gap | JIT gap |
+|-----------|-------------|----------|--------------|----------|-----------|---------|
+| Richards | 1058 | 1056 | 1030 | 28175 | 27× | 27× |
+| DeltaBlue | 941 | 933 | 889 | 63268 | 67× | 68× |
+| Crypto | 1245 | 1216 | 1195 | 36072 | 29× | 30× |
+| RayTrace | 1322 | 1362 | 1259 | 67043 | 51× | 49× |
+| EarleyBoyer | **1707** | **1632** | 1631 | 54824 | 32× | 34× |
+| RegExp | 441 | 435 | 448 | 8397 | 19× | 19× |
+| Splay | 2648 | **2825** | 2573 | 29883 | 11× | 11× |
+| **Score** | **1184** | **1184** | **1146** | **34595** | **29×** | **29×** |
 
-265 JIT functions compiled across all benchmarks.
+*Cold JIT (2026-04-10, fresh cache):* 993 overall — 16% below warm due to GCC
+ compilation competing with the benchmark main thread during the 1000 ms window.
 
 ## Root Cause Analysis
 
-### Finding 1: JIT gains are small (+6% overall)
+### Finding 1: Warm JIT score = interpreter score exactly (1184 = 1184)
 
-The V8 benchmark runs each sub-benchmark for at least 1000ms. Within that window:
-- Calls 1–100: interpreter (threshold not yet hit)
-- Calls 101+: JIT compilation is queued to a background GCC thread; interpreter
-  continues until the `.so` is linked and installed
-- The benchmark measures **wall time of the main thread** while GCC runs on another
-  core in the background
+The JIT provides **zero net benefit** on the V8 benchmark suite when the cache
+is warm. IC overhead in the JIT path roughly cancels the savings from skipping
+bytecode dispatch. Per-benchmark detail:
 
-The "cold JIT" numbers include two costs absent from the interpreter baseline:
-1. GCC compilation CPU time competing with the main thread
-2. The ~100 interpreter calls before the threshold is crossed
+| Benchmark | JIT delta | Explanation |
+|-----------|-----------|-------------|
+| RayTrace | **+3%** | Float arithmetic: JIT_T_NUMBER paths remove some JSValue boxing |
+| Splay | **+7%** | Property IC hits 100% (single shape), P41.1 closure call bypass |
+| Richards | **−0%** | Tied — IC overhead ≈ dispatch savings |
+| DeltaBlue | **−1%** | IC overhead marginally worse than interpreter on poly sites |
+| Crypto | **−2%** | Surprise: JIT slightly slower. See Finding 3. |
+| RegExp | **−1%** | Dominated by regexp engine, JIT irrelevant |
+| EarleyBoyer | **−4%** | JIT slower — see Finding 4 |
 
-Once the JIT cache is warm (second run), scores will be higher. P43.1 creates
-a proper two-pass measurement harness to separate these effects.
+### Finding 2: Splay warm-cache regression is fully resolved
 
-### Finding 2: Splay is −18% with JIT (regression)
+Cold JIT scored 1964 (−18% vs interpreter). Warm JIT scores 2825 (+7% vs
+interpreter). This confirms the cold-start regression was **entirely a
+measurement artifact** of GCC background compilation competing with the main
+thread during the 1000ms timing window. No code fix needed for Splay.
 
-Splay tree operations are very fast in the interpreter (~2400 score). When JIT
-compilation fires, GCC spends ~1–3 seconds compiling 10–20 Splay functions in the
-background. This CPU contention directly reduces the iteration count in the
-1000ms measurement window, dropping the score.
+### Finding 3: Crypto JIT is 2% slower than interpreter (warm cache)
 
-**This is a measurement artifact of the cold-start model, not a correctness or
-code quality issue.** With a warm JIT cache (second pass), Splay should be at
-least as fast as the interpreter, and likely faster due to the property IC.
+This is unexpected given Crypto uses integer bit operations where `JIT_T_INT`
+should produce native int64_t arithmetic. Possible causes:
+- The hot functions exceed the JIT threshold but are not the innermost loops
+- `safe_add` and similar functions are called from an outer loop that IS
+  JIT-compiled, but the JIT call overhead (IC + arg dup) offsets the savings
+- Some bit operations may not be hitting the `JIT_T_INT` fast path
 
-### Finding 3: Property IC and call IC are the key bottlenecks
+**Action required:** Inspect generated JIT `.c` for Crypto's hot functions
+(Step 3 of implementation). If the fast paths are correct, the issue is
+call-site overhead and P43.2 (IC) is the fix.
 
-For object-heavy benchmarks (Richards, DeltaBlue, RayTrace), the dominant
-operations are:
-- `obj.prop` reads (OP_get_field → bimorphic IC)
-- `obj.method()` calls (OP_call_method → call IC)
-- `obj.prop = val` writes (OP_put_field → bimorphic IC)
+### Finding 4: EarleyBoyer JIT is 4% slower than interpreter (warm cache)
 
-The JIT IC is bimorphic (2 shape slots). When more than 2 shapes appear at a
-call site — which happens in DeltaBlue's constraint graph traversal — both slots
-fill and all subsequent accesses take the slow `_RT->get_prop()` vtable path.
-This is **strictly worse than the interpreter's IC**, which transitions shapes
-on miss rather than going fully generic.
+EarleyBoyer scores 1632 JIT vs 1707 interpreter (−4%). This is a real
+regression, not a cold-start artifact. EarleyBoyer exercises:
+- Heavy closure creation and calls (P41.1 helps, but call IC overhead remains)
+- List traversal via property access on cons-cell-style objects
+- String operations
 
-### Finding 4: Crypto is the best case (+26%)
+The likely cause: EarleyBoyer's functions are moderately sized (20–50 opcodes),
+not tiny. For medium-sized functions the call setup overhead is amortized, but
+the bimorphic IC on list traversal (`car`, `cdr` on different object types) goes
+megamorphic and falls back to `_RT->get_prop()` on every access after 2 shapes.
+The interpreter's IC handles this gracefully; the JIT's does not.
 
-Crypto uses integer bit operations (shift, and, or, xor) on integer arrays.
-The JIT type inference propagates `JIT_T_INT` through these operations and
-emits native `int64_t` arithmetic without JSValue boxing. This is a genuine
-win from the JIT. The remaining gap to Node is mainly from:
-1. Array bounds checking overhead (QuickJS checks every access)
-2. 32-bit wrapping (`| 0`, `>>> 0` patterns) that QuickJS does through
-   `JS_NewInt32` vs V8's unboxed Int32
+**This makes P43.2 (quadrimorphic IC) the highest-priority fix** — it directly
+addresses both the EarleyBoyer regression and the DeltaBlue stall.
 
-### Finding 5: RegExp is bottlenecked by the regexp engine, not the JIT
+### Finding 5: JIT AOT mode is consistently slower than warm JIT
 
-RegExp scores 380 vs Node's 8397 (22× gap). The JIT cannot help the regexp
-engine itself — this is a separate module (`libregexp.c`). JIT accelerates
-the JS glue code around the regexp calls but the engine dominates runtime.
-**P43 does not target RegExp.**
+`qjs_jit --jit-aot` scores 1146 vs warm JIT 1184 (−3%). AOT mode pre-compiles
+all functions before the benchmark starts (no cold-start overlap). Despite this,
+it scores lower. This suggests the old `qjs_jit` binary (pre-P41) generates
+slightly worse code — P41.1 + P40 improvements in the current `qjs` binary
+actually matter even for non-closure-heavy workloads.
+
+### Finding 6: RegExp gap is the regexp engine, not the JIT
+
+JIT: 435, interpreter: 441, Node: 8397. The JIT cannot help the regexp engine
+(`libregexp.c`). **P43 does not target RegExp.**
 
 ## Sub-phases
 
@@ -206,9 +216,13 @@ If GCC is emitting a real call to `JS_DupValue` in the `.so`, adding
 
 ---
 
-### P43.4 — Crypto: Verify JIT_T_INT Propagation Through All Bit Ops
+### P43.4 — Crypto + EarleyBoyer: Fix JIT_T_INT Propagation and IC Regressions
 
-**Problem:** Crypto (+26% with JIT) uses patterns like:
+**Problem:** Warm-cache measurements (2026-04-11) show Crypto JIT is **2% slower**
+than interpreter (1216 vs 1245), and EarleyBoyer JIT is **4% slower** (1632 vs 1707).
+These are genuine regressions with the JIT active, not cold-start artifacts.
+
+For Crypto, the hot functions use patterns like:
 
 ```js
 function safe_add(x, y) {
@@ -237,27 +251,20 @@ integer-typed operands, those are bugs to fix by ensuring the correct
 **Files changed:** `quickjs-jit.c` (scan pass type rules for OP_and,
 OP_or, OP_shl, OP_sar, OP_sar1, OP_lnot, OP_not).
 
-**Expected improvement:** 5–10% on Crypto if any ops are currently missing
-the fast path.
+**Expected improvement:** 2–5% on Crypto if bit ops are currently missing
+the fast path; fixing EarleyBoyer IC megamorphism is shared with P43.2.
+
+**Note:** For EarleyBoyer the fix is primarily P43.2 (quadrimorphic IC).
+EarleyBoyer's cons-cell objects (`car`, `cdr`) appear in 3–5 shapes at
+the same access site — exactly the megamorphic IC miss scenario.
 
 ---
 
-### P43.5 — Splay: Confirm Regression Is Cold-Start Only
+### P43.5 — Splay: ✓ Confirmed Not a Problem
 
-Run Splay in isolation with a pre-warmed JIT cache and verify the score
-meets or exceeds the interpreter baseline. If it does, the regression is
-entirely cold-start and P43.1's two-pass harness resolves it.
-
-If Splay is still slower with a warm cache, investigate the generated JIT
-code for `SplayTree.prototype.splay_` (the inner recursive function).
-Likely causes:
-- The recursive self-call in `splay_` uses the call IC path rather than P8.2
-  (self-function direct call). Verify P8.2 applies to prototype methods.
-- The bimorphic IC has > 2 shapes at `this.left`, `this.right` accesses
-  (unlikely since all nodes have the same shape, but verify).
-
-**Fix if needed:** Ensure P8.2 applies to prototype method self-recursion
-by detecting the pattern in the emitter.
+Warm-cache measurement (2026-04-11) shows Splay JIT = 2825 vs interpreter
+2648 (+7%). The cold-start regression (1964, −18%) was entirely a measurement
+artifact. **No code change needed for Splay.**
 
 ---
 
@@ -272,39 +279,64 @@ by detecting the pattern in the emitter.
 
 ---
 
-## Expected Results After P43
+## Actual Warm-Cache Results (2026-04-11)
 
-| Benchmark | JIT cold (now) | JIT warm (P43.1) | After P43.2–5 | Node v24 |
-|-----------|---------------|-----------------|--------------|---------|
-| Richards | 935 | ~1050 | ~1300 | 28175 |
-| DeltaBlue | 822 | ~900 | ~1100 | 63268 |
-| Crypto | 1057 | ~1200 | ~1350 | 36072 |
-| RayTrace | 1128 | ~1250 | ~1350 | 67043 |
-| EarleyBoyer | 1389 | ~1500 | ~1600 | 54824 |
-| RegExp | 380 | ~380 | ~380 | 8397 |
-| Splay | 1964 | ~2600 | ~2700 | 29883 |
-| **Score** | **993** | **~1200** | **~1380** | **34595** |
+Collected after P41, JIT cache already warm (second run):
 
-The expected ~40% improvement from warm cache + targeted fixes still leaves
-a ~25× gap vs Node. The root causes of that gap are:
-1. **Object allocation**: QuickJS uses a reference-counted GC; Node uses
+| Benchmark | Interpreter | JIT warm | JIT vs Interp | Node v24 | Gap vs Node |
+|-----------|-------------|----------|--------------|----------|-------------|
+| Richards | 1058 | 1056 | −0% | 28175 | 27× |
+| DeltaBlue | 941 | 933 | −1% | 63268 | 68× |
+| Crypto | 1245 | 1216 | **−2%** | 36072 | 30× |
+| RayTrace | 1322 | 1362 | +3% | 67043 | 49× |
+| EarleyBoyer | 1707 | 1632 | **−4%** | 54824 | 34× |
+| RegExp | 441 | 435 | −1% | 8397 | 19× |
+| Splay | 2648 | 2825 | +7% | 29883 | 11× |
+| **Score** | **1184** | **1184** | **0%** | **34595** | **29×** |
+
+**Key result: JIT = interpreter on the geometric mean.** The IC overhead in the
+JIT path exactly cancels the bytecode dispatch savings. Two benchmarks show real
+JIT regressions (Crypto −2%, EarleyBoyer −4%); two show real wins (RayTrace +3%,
+Splay +7%).
+
+## Expected Results After P43 Fixes
+
+Starting from the warm-cache baseline (1184):
+
+| Benchmark | JIT warm (now) | After P43.2 | After P43.4 | Node v24 |
+|-----------|---------------|------------|------------|---------|
+| Richards | 1056 | ~1150 | ~1150 | 28175 |
+| DeltaBlue | 933 | ~1100 | ~1100 | 63268 |
+| Crypto | 1216 | ~1250 | ~1350 | 36072 |
+| RayTrace | 1362 | ~1400 | ~1400 | 67043 |
+| EarleyBoyer | 1632 | ~1800 | ~1800 | 54824 |
+| RegExp | 435 | ~435 | ~435 | 8397 |
+| Splay | 2825 | ~2900 | ~2900 | 29883 |
+| **Score** | **1184** | **~1380** | **~1440** | **34595** |
+
+P43.2 (quadrimorphic IC) is expected to be the dominant improvement (~17%
+overall) by fixing the megamorphic IC miss on EarleyBoyer and DeltaBlue.
+P43.4 (Crypto bit-op audit) is expected to add ~5% on Crypto specifically.
+
+The remaining ~24× gap vs Node after P43 is structural:
+1. **Object allocation**: QuickJS uses reference-counted GC; Node uses
    a generational heap with bump-pointer young-space allocation
-2. **Unboxed integer/float representations**: V8 represents integers as
-   tagged small integers with no heap allocation; QuickJS uses 16-byte
-   JSValues with GC overhead for int32 values in object properties
-3. **Inline caches**: V8's ICs are in native machine code; QuickJS's JIT
-   ICs are in GCC-compiled C with additional indirection
-4. **Code specialization**: V8 JIT-compiles per-type; QuickJS JIT has
-   one compiled version that handles both int and float cases
+2. **Unboxed value representation**: V8 uses tagged small integers (31-bit
+   smi) stored directly in property slots; QuickJS uses 16-byte JSValues
+3. **Native IC**: V8's ICs are machine code stubs; QuickJS JIT ICs are
+   GCC-compiled C with one additional indirection layer
+4. **Type specialization**: V8 compiles separate versions per observed type;
+   QuickJS JIT emits a single version handling all types via branches
 
-These are fundamental architecture gaps that require significantly larger
-changes (typed value representation, generational GC) beyond P43 scope.
+These require architectural changes beyond P43 scope.
 
 ## Priority Order for Implementation
 
-1. **P43.1** (measurement harness) — prerequisite for accurate data
-2. **P43.5** (Splay warm check) — validates P43.1 resolves regression
-3. **P43.2** (quadrimorphic IC) — highest single-benchmark impact (DeltaBlue)
-4. **P43.4** (Crypto bit-op audit) — low-hanging fruit, might reveal bugs
-5. **P43.3** (DupValue inlining) — small but free complexity-wise
-6. **P43.6** (docs + benchmark recording) — always last
+1. **P43.1** (measurement harness) — `run_bench.sh` two-pass script; done
+   conceptually since we now have warm-cache data
+2. **P43.2** (quadrimorphic IC) — highest impact: fixes EarleyBoyer −4%
+   regression + DeltaBlue stall; ~17% overall gain expected
+3. **P43.4** (Crypto + EarleyBoyer bit-op audit) — investigate Crypto −2%;
+   inspect generated `.c` for vtable calls where `_ti*` should appear
+4. **P43.3** (DupValue inlining) — verify `JS_DupValue` inlines in `.so`
+5. **P43.6** (tests + results recording) — always last
