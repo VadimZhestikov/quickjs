@@ -892,10 +892,12 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
                 _TI_PUSH(a); _TI_PUSH(r); break;
             }
 
-            /* ---- Bitwise: always int → NUMBER ---- */
-            case OP_shl: case OP_sar: case OP_shr:
-            case OP_and: case OP_or:  case OP_xor: _TI_DROPN(2); _TI_PUSH(JIT_T_NUMBER); break;
-            case OP_not: _TI_DROPN(1); _TI_PUSH(JIT_T_NUMBER); break;
+            /* ---- Bitwise: and/or/xor/shl/sar/not always produce ToInt32 → INT.
+             * shr (>>>) produces ToUint32 which may exceed INT32_MAX → NUMBER. */
+            case OP_and: case OP_or:  case OP_xor:
+            case OP_shl: case OP_sar: _TI_DROPN(2); _TI_PUSH(JIT_T_INT); break;
+            case OP_shr:               _TI_DROPN(2); _TI_PUSH(JIT_T_NUMBER); break;
+            case OP_not:               _TI_DROPN(1); _TI_PUSH(JIT_T_INT); break;
 
             /* ---- Boolean / comparison / typeof → JSVAL ---- */
             /* P18: type-test ops: consume 1, push bool (JSVAL) */
@@ -4070,29 +4072,71 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* Shift operators must mask the shift count to & 31, matching the
          * JavaScript spec (ToInt32 semantics) and avoiding C UB for shifts
          * by >= 32 (e.g. 1 << 32 must equal 1, not 0). */
-        case OP_shl:
-            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
-            jit_buf_printf(cb,
-                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _tsv%d=JS_NewInt32(ctx,(int32_t)((uint32_t)JS_VALUE_GET_INT(_a)<<(JS_VALUE_GET_INT(_b)&31)));\n"
-                "      else { _sp=%d; JSValue _r=_RT->shl(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
-                "      _sp=%d; }\n",
-                d-1, d-2, d-2, d-2, d-2, d-1);
+        case OP_shl: {
+            uint8_t _t2 = _GS_TOP2(), _t1 = _GS_TOP();
+            if (_t2 == JIT_T_INT && _t1 == JIT_T_INT) {
+                /* P43.4: both INT — emit native shift, result stays in _ti */
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)((uint32_t)_ti%d<<(_ti%d&31)); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
+            } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _tsv%d=JS_NewInt32(ctx,(int32_t)((uint32_t)JS_VALUE_GET_INT(_a)<<(JS_VALUE_GET_INT(_b)&31)));\n"
+                    "      else { _sp=%d; JSValue _r=_RT->shl(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-2, d-2, d-2, d-2, d-1);
+            }
             break;
-        case OP_sar:
-            _P94_ENSURE(d-2); _P94_ENSURE(d-1); /* P9.4: box typed slots */
-            jit_buf_printf(cb,
-                "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
-                "        _tsv%d=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31));\n"
-                "      else { _sp=%d; JSValue _r=_RT->sar(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
-                "      _sp=%d; }\n",
-                d-1, d-2, d-2, d-2, d-2, d-1);
+        }
+        case OP_sar: {
+            uint8_t _t2 = _GS_TOP2(), _t1 = _GS_TOP();
+            if (_t2 == JIT_T_INT && _t1 == JIT_T_INT) {
+                /* P43.4: both INT — emit native arithmetic shift, result stays in _ti */
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)(_ti%d>>(_ti%d&31)); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
+            } else {
+                _P94_ENSURE(d-2); _P94_ENSURE(d-1);
+                jit_buf_printf(cb,
+                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT&&JS_VALUE_GET_TAG(_b)==JS_TAG_INT)\n"
+                    "        _tsv%d=JS_NewInt32(ctx,JS_VALUE_GET_INT(_a)>>(JS_VALUE_GET_INT(_b)&31));\n"
+                    "      else { _sp=%d; JSValue _r=_RT->sar(ctx,_a,_b); _CHK(_r); _tsv%d=_r; }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-2, d-2, d-2, d-2, d-1);
+            }
             break;
-        case OP_and: _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("&",  "band"); break;
-        case OP_or:  _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("|",  "bor");  break;
-        case OP_xor: _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("^",  "bxor"); break;
+        }
+        case OP_and: {
+            uint8_t _t2 = _GS_TOP2(), _t1 = _GS_TOP();
+            if (_t2 == JIT_T_INT && _t1 == JIT_T_INT) {
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)(_ti%d&_ti%d); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
+            } else { _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("&",  "band"); }
+            break;
+        }
+        case OP_or: {
+            uint8_t _t2 = _GS_TOP2(), _t1 = _GS_TOP();
+            if (_t2 == JIT_T_INT && _t1 == JIT_T_INT) {
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)(_ti%d|_ti%d); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
+            } else { _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("|",  "bor"); }
+            break;
+        }
+        case OP_xor: {
+            uint8_t _t2 = _GS_TOP2(), _t1 = _GS_TOP();
+            if (_t2 == JIT_T_INT && _t1 == JIT_T_INT) {
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)(_ti%d^_ti%d); _sp=%d;\n",
+                    d-2, d-2, d-1, d-1);
+            } else { _P94_ENSURE(d-2); _P94_ENSURE(d-1); GEN_BITOP_INT("^",  "bxor"); }
+            break;
+        }
 
         /* shr is unsigned right shift — result may exceed INT32_MAX */
         case OP_shr:
@@ -4157,16 +4201,25 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     d-1, d-1, d-1, d-1, d);
             }
             break;
-        case OP_not: /* bitwise ~ */
-            _P94_ENSURE(d-1); /* P9.4: box typed slot before JSValue read */
-            jit_buf_printf(cb,
-                "    { JSValue _a=_tsv%d;\n"
-                "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
-                "        _tsv%d=JS_NewInt32(ctx,~JS_VALUE_GET_INT(_a));\n"
-                "      else { _sp=%d; JSValue _r=_RT->bnot(ctx,_a); _CHK(_r); _tsv%d=_r; }\n"
-                "      _sp=%d; }\n",
-                d-1, d-1, d-1, d-1, d);
+        case OP_not: { /* bitwise ~ */
+            uint8_t _t1 = _GS_TOP();
+            if (_t1 == JIT_T_INT) {
+                /* P43.4: INT input — emit native bitwise NOT, result stays in _ti */
+                jit_buf_printf(cb,
+                    "    _ti%d=(int64_t)(int32_t)(~(int32_t)_ti%d); _sp=%d;\n",
+                    d-1, d-1, d);
+            } else {
+                _P94_ENSURE(d-1);
+                jit_buf_printf(cb,
+                    "    { JSValue _a=_tsv%d;\n"
+                    "      if(JS_VALUE_GET_TAG(_a)==JS_TAG_INT)\n"
+                    "        _tsv%d=JS_NewInt32(ctx,~JS_VALUE_GET_INT(_a));\n"
+                    "      else { _sp=%d; JSValue _r=_RT->bnot(ctx,_a); _CHK(_r); _tsv%d=_r; }\n"
+                    "      _sp=%d; }\n",
+                    d-1, d-1, d-1, d-1, d);
+            }
             break;
+        }
         case OP_typeof:
             _P94_ENSURE(d-1); /* P9.4: box typed slot before JSValue read */
             jit_buf_printf(cb,
@@ -6983,10 +7036,23 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 _gs_push = (_t2>=JIT_T_NUMBER&&_t1>=JIT_T_NUMBER) ? JIT_T_NUMBER : JIT_T_JSVAL;
                 break;
             }
-            /* --- Bitwise: result is an int32 stored in _tsv, not _tsd → JSVAL --- */
-            case OP_shl: case OP_sar: case OP_shr:
-            case OP_and: case OP_or:  case OP_xor: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
-            case OP_not:                            _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
+            /* --- Bitwise: and/or/xor/shl/sar/not always produce int32.
+             * When both inputs are INT, emit native _ti path → push INT.
+             * Otherwise fall back to _tsv tag-check path → push JSVAL.
+             * shr (>>>) result may exceed INT32_MAX → always JSVAL. */
+            case OP_and: case OP_or: case OP_xor:
+            case OP_shl: case OP_sar: {
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                _gs_drop=2;
+                _gs_push=(_t2==JIT_T_INT&&_t1==JIT_T_INT)?JIT_T_INT:JIT_T_JSVAL;
+                break;
+            }
+            case OP_shr: _gs_drop=2; _gs_push=JIT_T_JSVAL; break;
+            case OP_not: {
+                _gs_drop=1;
+                _gs_push=(_GS_TOP()==JIT_T_INT)?JIT_T_INT:JIT_T_JSVAL;
+                break;
+            }
 
             /* --- Unary numeric: INT/NUMBER if operand was numeric, else JSVAL --- */
             case OP_neg: case OP_plus: case OP_inc: case OP_dec:
