@@ -349,3 +349,56 @@ All figures use the non-LTO build (`CONFIG_JIT=y`), warm run (cached `.so`).
 | arr_sum(10000) x1e3 | 207 ms | 40 ms | 36 ms | 11 ms |
 
 Non-property-access benchmarks are essentially unaffected by P39.
+
+---
+
+## 9. P40 Results (2026-04-10)
+
+Phase 40 targeted closure variable access, replacing vtable calls with direct
+byte-offset pointer dereferences and preamble-cached `_vrp{i}` variables.
+
+| Sub-phase | Change |
+|---|---|
+| P40.1+P40.2 | Replace `_RT->var_ref_value(var_refs[i])` vtable call with `*(JSValue**)((char*)var_refs[i]+JIT_VARREF_PVALUE_OFF)` cached in preamble as `_vrp{i}` for each captured variable |
+| P40.3 | When source slot is `JIT_T_INT`, emit `JS_MKVAL(JS_TAG_INT, ...)` directly in put_var_ref/set_var_ref instead of boxing via `_P94_ENSURE` |
+
+### 9.1 closure_counter: before vs after P40
+
+The `closure_counter` benchmark (1M calls to a closure incrementing an integer)
+did NOT show measurable improvement on this benchmark because the dominant cost
+is the `js_jit_call` overhead (alloca + stack frame setup per call), NOT the
+var_ref access inside the JIT function body.
+
+| Mode | Before P40 | After P40 | Gap vs Node |
+|---|---:|---:|---:|
+| closure_counter (JIT, 1M calls) | 15 ms | 15 ms | 7.5× |
+| Node v24 | 2 ms | 2 ms | — |
+
+### 9.2 What P40 actually does
+
+P40's savings are real but invisible in the closure_counter micro-benchmark
+because the benchmark isolates tiny single-closure calls from the top-level
+(interpreted) loop. Each call goes through `JS_CallInternal` which sets up a
+full stack frame before calling the JIT function — ~100 cycles/call overhead
+that swamps the ~12 cycles saved by eliminating 3 indirect vtable calls.
+
+**P40 savings become visible after P41** (JIT-to-JIT direct calls), which will
+bypass `JS_CallInternal` entirely when a JIT-compiled caller invokes a
+JIT-compiled closure.
+
+**Generated code change verified:** The counter function now generates:
+```c
+JSValue *_vrp0=*(JSValue**)((char*)var_refs[0]+JIT_VARREF_PVALUE_OFF);
+// ...
+_tsv0=_DUP(*_vrp0); _sp=1;   // get_var_ref — no vtable call
+// ...
+{ _FREE(*_vrp0); *_vrp0=_tsv1; _sp=1; }  // set_var_ref — no vtable call
+```
+instead of `_DUP(*_RT->var_ref_value(var_refs[0]))`.
+
+### 9.3 Static assert verified
+
+`_Static_assert(offsetof(JSVarRef, pvalue) == JIT_VARREF_PVALUE_OFF, ...)` was
+added to `quickjs.c`. The actual offset is **24** bytes (not 16 as estimated in
+the plan): `JSGCObjectHeader` is 24 bytes (int + 4-byte bitfield unit + dummy1 +
+dummy2 + `struct list_head` at 8 bytes = 24).

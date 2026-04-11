@@ -550,6 +550,12 @@ typedef struct {
 #define JIT_SHAPEIC_PROPSIZE       8
 #define JIT_SHAPEIC_ATOM_OFF       4
 
+/* P40: JSVarRef.pvalue byte offset within the struct.
+ * JSGCObjectHeader is 24 bytes (int ref_count + bitfields + dummy1/dummy2 + list_head(16)).
+ * pvalue immediately follows at offset 24.
+ * Verified by _Static_assert in quickjs.c. */
+#define JIT_VARREF_PVALUE_OFF     24
+
 /*
  * P11.4: JSObject layout constants for inline array element fast path.
  *   JSObject.class_id         = byte  6  (uint16_t inside bitfield word)

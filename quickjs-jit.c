@@ -2383,6 +2383,20 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         jit_buf_str(cb, "    (void)_aim;\n");
     }
 
+    /* P40.2: hoist pvalue pointers for all captured variables into locals.
+     * var_refs[i] is stable for the entire JIT call; pvalue within each ref
+     * is also stable (changes only at scope-exit detachment which triggers a
+     * JIT exit before control returns here).  Caching in _vrp{i} lets GCC
+     * keep the pointer in a register and avoids re-loading var_refs[i] and
+     * dereferencing pvalue on every get/put_var_ref opcode. */
+    if (closure_var_count > 0) {
+        for (int vri = 0; vri < closure_var_count; vri++) {
+            jit_buf_printf(cb,
+                "    JSValue *_vrp%d=*(JSValue**)((char*)var_refs[%d]+JIT_VARREF_PVALUE_OFF);\n",
+                vri, vri);
+        }
+    }
+
     /* P13.4: shadow arrays for closure capture.
      * Only emitted when the function contains at least one OP_fclosure. */
     if (sr && sr->has_fclosure) {
@@ -3717,20 +3731,39 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Closure variable access ---- */
 /* P9.2: closure var access uses _tsv{d} for push, _tsv{d-1} for pop/peek.
  * _VRV(idx) returns a pointer to the JSValue stored inside var_refs[idx].
- * We use the vtable accessor rather than ->pvalue directly because JSVarRef
- * is defined only in quickjs.c (incomplete type in generated C). */
+ * P40.2: use _vrp{idx} (pvalue pointer cached in preamble) instead of a vtable
+ * call.  JSVarRef is an opaque type in generated C; _vrp{idx} was set up in
+ * the preamble via JIT_VARREF_PVALUE_OFF so no complete-type access is needed. */
 #define GEN_GET_VR(idx) \
-    jit_buf_printf(cb, "    _tsv%d=_DUP(*_RT->var_ref_value(var_refs[%d])); _sp=%d;\n", \
-                   d, idx, d+1)
+    jit_buf_printf(cb, "    _tsv%d=_DUP(*_vrp%d); _sp=%d;\n", d, idx, d+1)
+/* P40.3: when the source slot is a raw int64_t (_ti{d-1}), skip boxing with
+ * _P94_ENSURE and store JS_MKVAL(TAG_INT, ...) directly.  The js_unlikely hint
+ * on the refcount branch lets GCC eliminate it for integer old values. */
 #define GEN_PUT_VR(idx) do { \
-    _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
-    jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1); \
+    if (gen_st[d-1] == JIT_T_INT) { \
+        jit_buf_printf(cb, \
+            "    { JSValue _nv=JS_MKVAL(JS_TAG_INT,(int32_t)_ti%d);" \
+            " if(js_unlikely(JS_VALUE_HAS_REF_COUNT(*_vrp%d))) _RT->free_value(ctx,*_vrp%d);" \
+            " *_vrp%d=_nv; _sp=%d; }\n", \
+            d-1, idx, idx, idx, d-1); \
+    } else { \
+        _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
+        jit_buf_printf(cb, "    { _FREE(*_vrp%d); *_vrp%d=_tsv%d; _sp=%d; }\n", \
+                       idx, idx, d-1, d-1); \
+    } \
 } while(0)
 #define GEN_SET_VR(idx) do { \
-    _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
-    jit_buf_printf(cb, "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);" \
-                       " _FREE(*_p); *_p=_DUP(_tsv%d); }\n", idx, d-1); \
+    if (gen_st[d-1] == JIT_T_INT) { \
+        jit_buf_printf(cb, \
+            "    { JSValue _nv=JS_MKVAL(JS_TAG_INT,(int32_t)_ti%d);" \
+            " if(js_unlikely(JS_VALUE_HAS_REF_COUNT(*_vrp%d))) _RT->free_value(ctx,*_vrp%d);" \
+            " *_vrp%d=_nv; }\n", \
+            d-1, idx, idx, idx); \
+    } else { \
+        _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
+        jit_buf_printf(cb, "    { _FREE(*_vrp%d); *_vrp%d=_DUP(_tsv%d); }\n", \
+                       idx, idx, d-1); \
+    } \
 } while(0)
 
         case OP_get_var_ref:
@@ -3772,14 +3805,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
              * so the slow path needs no closure_var access at runtime. */
             JSAtom cv_atom     = js_jit_fb_get_closure_var_atom(b, idx);
             int    cv_is_lex   = js_jit_fb_get_closure_var_is_lexical(b, idx);
-            /* P9.2: push into _tsv{d}; set _sp before _CHK for exception safety */
+            /* P9.2: push into _tsv{d}; set _sp before _CHK for exception safety.
+             * P40.2: use _vrp{idx} (pvalue cached in preamble). */
             jit_buf_printf(cb,
-                "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
-                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED){\n"
+                "    { if(JS_VALUE_GET_TAG(*_vrp%d)==JS_TAG_UNINITIALIZED){\n"
                 "        JSValue _r=_RT->get_var_slow(ctx,%uu,%d);\n"
                 "        _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
-                "      } else { _tsv%d=_DUP(*_pv); _sp=%d; } }\n",
-                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, d+1);
+                "      } else { _tsv%d=_DUP(*_vrp%d); _sp=%d; } }\n",
+                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, idx, d+1);
             break;
         }
         case OP_put_var:
@@ -3792,20 +3825,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             /* OP_put_var_init on a lexical slot is the normal initialisation
              * path (let x = expr): write directly even if UNINITIALIZED.
              * For all other cases, check UNINITIALIZED and call the slow path
-             * (implicit global → JS_SetPropertyInternal; lexical TDZ → throw). */
+             * (implicit global → JS_SetPropertyInternal; lexical TDZ → throw).
+             * P40.2: use _vrp{idx} (pvalue cached in preamble). */
             if (is_init && cv_is_lex) {
                 /* lexical init: always write directly, never needs slow path */
                 jit_buf_printf(cb,
-                    "    { JSValue *_p=_RT->var_ref_value(var_refs[%d]);"
-                    " _FREE(*_p); *_p=_tsv%d; _sp=%d; }\n", idx, d-1, d-1);
+                    "    { _FREE(*_vrp%d); *_vrp%d=_tsv%d; _sp=%d; }\n",
+                    idx, idx, d-1, d-1);
             } else {
                 jit_buf_printf(cb,
                     "    { JSValue _v=_tsv%d; _sp=%d;\n"
-                    "      JSValue *_p=_RT->var_ref_value(var_refs[%d]);\n"
-                    "      if(js_unlikely(JS_VALUE_GET_TAG(*_p)==JS_TAG_UNINITIALIZED)){\n"
+                    "      if(js_unlikely(JS_VALUE_GET_TAG(*_vrp%d)==JS_TAG_UNINITIALIZED)){\n"
                     "        if(_RT->put_var_slow(ctx,%uu,%d,%d,_v)<0) goto _ex;\n"
-                    "      } else { _FREE(*_p); *_p=_v; } }\n",
-                    d-1, d-1, idx, (unsigned)cv_atom, cv_is_lex, is_init);
+                    "      } else { _FREE(*_vrp%d); *_vrp%d=_v; } }\n",
+                    d-1, d-1, idx, (unsigned)cv_atom, cv_is_lex, is_init, idx, idx);
             }
             break;
         }
@@ -6123,13 +6156,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             int idx = (int)bc_u16(&bc[pc+1]);
             JSAtom cv_atom   = js_jit_fb_get_closure_var_atom(b, idx);
             int    cv_is_lex = js_jit_fb_get_closure_var_is_lexical(b, idx);
+            /* P40.2: use _vrp{idx} (pvalue cached in preamble). */
             jit_buf_printf(cb,
-                "    { JSValue *_pv=_RT->var_ref_value(var_refs[%d]);\n"
-                "      if(JS_VALUE_GET_TAG(*_pv)==JS_TAG_UNINITIALIZED){\n"
+                "    { if(JS_VALUE_GET_TAG(*_vrp%d)==JS_TAG_UNINITIALIZED){\n"
                 "        JSValue _r=_RT->get_var_undef(ctx,%uu,%d);\n"
                 "        _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
-                "      } else { _tsv%d=_DUP(*_pv); _sp=%d; } }\n",
-                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, d+1);
+                "      } else { _tsv%d=_DUP(*_vrp%d); _sp=%d; } }\n",
+                idx, (unsigned)cv_atom, cv_is_lex, d, d, d+1, d, idx, d+1);
             break;
         }
 

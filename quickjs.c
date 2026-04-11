@@ -17169,6 +17169,11 @@ _Static_assert(offsetof(JSObject, u.array.count)      == JIT_ARR_COUNT_OFF,
 _Static_assert(offsetof(JSObject, u.array.u.values)   == JIT_ARR_VALUES_OFF,
                "JIT_ARR_VALUES_OFF mismatch");
 
+/* P40: Verify JSVarRef.pvalue offset used by the direct byte-offset access
+ * in the generated JIT C code (JIT_VARREF_PVALUE_OFF). */
+_Static_assert(offsetof(JSVarRef, pvalue) == JIT_VARREF_PVALUE_OFF,
+               "JIT_VARREF_PVALUE_OFF mismatch — update JIT_VARREF_PVALUE_OFF in quickjs-jit.h");
+
 /* P11.3: Verify JSObject bytecode-function layout constants used by the
  * call IC in quickjs-jit.c (OP_call / OP_call_method). */
 _Static_assert(offsetof(JSObject, u.func.function_bytecode) == JIT_FUNC_BC_OFF,

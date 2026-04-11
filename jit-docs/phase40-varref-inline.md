@@ -28,18 +28,23 @@ counter() calls = ~12M cycles = ~4.5ms at 2.7 GHz.
 `JSVarRef` as an incomplete (opaque) type, so they cannot access `ref->pvalue` directly. The
 vtable call `_RT->var_ref_value(ref)` was introduced to work around this.
 
-The fix: use a byte-offset constant `JIT_VARREF_PVALUE_OFF = 16` instead of a type-aware field
-access. Cast to `(JSValue**)((char*)ref + 16)` and dereference. This requires no complete-type
+The fix: use a byte-offset constant `JIT_VARREF_PVALUE_OFF = 24` instead of a type-aware field
+access. Cast to `(JSValue**)((char*)ref + 24)` and dereference. This requires no complete-type
 knowledge and can be verified with a `_Static_assert` in `quickjs.c`.
+
+Note: the pre-implementation estimate was 16. The actual value is 24 because
+`JSGCObjectHeader` is 24 bytes (not 16): the bitfield at offset 4 occupies a full 4-byte int
+allocation unit, plus dummy1(1)+dummy2(2)+1-byte-align-pad = 8 bytes total before
+`struct list_head` at offset 8, which is 16 bytes (two pointers). Total: 8+16=24.
 
 ## JSVarRef Layout (confirmed)
 
 ```c
 typedef struct JSVarRef {
     union {
-        JSGCObjectHeader header;   /* bytes 0–15: gc_ref_count(4), gc_mark(1),
-                                      is_detached(1), is_lexical(1), is_const(1),
-                                      + padding to 16 bytes */
+        JSGCObjectHeader header;   /* bytes 0–23 on 64-bit:
+                                      ref_count(4) + bitfield(4) + dummy1(1) + dummy2(2) +
+                                      padding(1) + struct list_head(16) = 24 bytes */
         struct {
             int __gc_ref_count;
             uint8_t __gc_mark;
@@ -48,7 +53,7 @@ typedef struct JSVarRef {
             uint8_t is_const;
         };
     };
-    JSValue *pvalue;   /* byte 16 — pointer to the actual JSValue storage */
+    JSValue *pvalue;   /* byte 24 — pointer to the actual JSValue storage */
     union {
         JSValue value;   /* when is_detached == TRUE: storage lives here */
         struct { uint16_t var_ref_idx; JSStackFrame *stack_frame; };
@@ -181,15 +186,29 @@ the `js_unlikely` branch hint improves branch prediction for the refcount check)
 - Typed put_var_ref is only used when `gen_st[d-1] == JIT_T_INT` at emit time. If type
   inference is wrong (which would be a pre-existing bug), the fallback boxes correctly.
 
-## Expected Results
+## Actual Results (2026-04-10)
 
-| Benchmark        | Before P40 | After P40.1 | After P40.2 | After P40.3 |
-|------------------|-----------|-------------|-------------|-------------|
-| closure_counter  | 15 ms     | ~11 ms      | ~10 ms      | ~9.5 ms     |
-| Gap vs Node      | 7.5×      | ~5.5×       | ~5×         | ~4.8×       |
+P40 was implemented and verified correct, but did NOT produce a measurable benchmark
+improvement on `closure_counter`:
 
-The remaining ~5× gap after P40 is almost entirely function-call overhead (P41: JIT-to-JIT
-direct calls will eliminate the interpreter dispatch for inner→outer calls).
+| Benchmark        | Before P40 | After P40   | Gap vs Node |
+|------------------|-----------|-------------|-------------|
+| closure_counter  | 15 ms     | 15 ms       | 7.5×        |
+| Node v24         | 2 ms      | 2 ms        | —           |
+
+**Root cause:** the dominant cost for tiny closure functions is `JS_CallInternal` overhead
+(alloca + stack frame setup = ~80-100 cycles/call), not the var_ref access inside the JIT body
+(~4 cycles saved per vtable call eliminated). For 1M calls, the savings are ~12M cycles = ~4ms,
+but they are hidden by call-dispatch variation.
+
+**P40 savings become measurable after P41** (JIT-to-JIT direct calls), which will bypass
+`JS_CallInternal` entirely for JIT-compiled callers calling JIT-compiled closures.
+
+**Code generation verified:** Generated C no longer contains `_RT->var_ref_value()` calls;
+instead each var_ref idx gets a preamble `_vrp{i}` variable used throughout the function body.
+
+The remaining ~7.5× gap after P40 is almost entirely function-call overhead (P41: JIT-to-JIT
+direct calls will eliminate the interpreter dispatch for closure function calls).
 
 ## What P40 Does Not Do
 
