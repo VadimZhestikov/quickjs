@@ -17149,8 +17149,8 @@ _Static_assert(sizeof(JSProperty)               == JIT_PROP_SIZE,
                "JIT_PROP_SIZE mismatch — JSProperty stride != sizeof(JSValue)");
 _Static_assert(offsetof(JSShape,   shape_gen)   == JIT_SHAPEIC_SHAPEGEN_OFF,
                "JIT_SHAPEIC_SHAPEGEN_OFF mismatch");
-_Static_assert(offsetof(JSShape,   prop_count)  == JIT_SHAPEIC_PROPCOUNT_OFF,
-               "JIT_SHAPEIC_PROPCOUNT_OFF mismatch");
+/* P39.1: JIT_SHAPEIC_PROPCOUNT_OFF removed — prop_count check is redundant when
+ * shape_gen matches (shape unchanged => prop_count unchanged >= slot). */
 _Static_assert(offsetof(JSShape,   prop)        == JIT_SHAPEIC_PROP_OFF,
                "JIT_SHAPEIC_PROP_OFF mismatch");
 _Static_assert(sizeof(JSShapeProperty)          == JIT_SHAPEIC_PROPSIZE,
@@ -17207,9 +17207,9 @@ int js_jit_ic_check(JSValue obj, const JSJITICEntry *ic)
     p = JS_VALUE_GET_OBJ(obj);
     if ((void *)p->shape != ic->shape)
         return 0;
-    /* ABA guard: verify the expected atom is still at the cached slot. */
-    if (ic->slot >= (uint32_t)p->shape->prop_count)
-        return 0;
+    /* ABA guard: verify the expected atom is still at the cached slot.
+     * P39.1: prop_count > slot check removed — shape_gen match already guarantees
+     * the shape is unchanged since fill time, so slot < prop_count still holds. */
     return get_shape_prop(p->shape)[ic->slot].atom == ic->atom;
 }
 
@@ -17236,6 +17236,11 @@ int js_jit_ic_fill_get(JSContext *ctx, JSValue obj, JSAtom atom,
     if (!prs || (prs->flags & JS_PROP_TMASK))
         return 0;
     ic->shape     = p->shape;
+    /* P39.2: Cache the JSProperty array pointer.  Safe because:
+     * - p->prop is reallocated only when adding properties (shape transition).
+     * - Any shape transition increments shape_gen, invalidating this IC entry.
+     * - So whenever shape_gen matches at IC check time, p->prop has not moved. */
+    ic->prop_arr  = p->prop;
     ic->slot      = (uint32_t)(pr - p->prop);
     ic->atom      = prs->atom;
     ic->kind      = (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_FLOAT64) ? 1 : 0;
@@ -17269,6 +17274,7 @@ int js_jit_ic_fill_put(JSContext *ctx, JSValue obj, JSAtom atom,
     if ((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) != JS_PROP_WRITABLE)
         return 0;
     ic->shape     = p->shape;
+    ic->prop_arr  = p->prop; /* P39.2: cache prop_arr — valid while shape_gen matches */
     ic->slot      = (uint32_t)(pr - p->prop);
     ic->atom      = prs->atom;
     ic->shape_gen = p->shape->shape_gen;

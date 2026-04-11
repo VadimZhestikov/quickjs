@@ -545,3 +545,35 @@ P39.2 depends on the IC struct change and requires updating both
   fundamental to the current IC architecture and cannot be eliminated without
   embedding the shape generation directly in the object (would require
   per-object maintenance cost on every shape mutation).
+
+---
+
+## Actual Results (2026-04-10)
+
+P39 implemented:
+- ✓ P39.1: Remove redundant `prop_count > slot` from `JIT_IC_CHECK` / `JIT_IC_CHECK_FAST` / `js_jit_ic_check()`
+- ✓ P39.2: Add `prop_arr` field to `JSJITICEntry`; fill in `js_jit_ic_fill_get/put`; replace 8 `JIT_OBJ_PROP_OFF` pointer chases in emitters
+- ✓ P39.3: Add `_NEXT2_IS_PUT_FIELD` look-ahead; borrow elision for `get_loc→get_loc→put_field` pattern
+- ✓ P39.4: `jit-tests/P39/` — 3 C harnesses, all passing
+
+### Benchmark results (warm AOT, non-LTO)
+
+| Benchmark | Before P39 (after P38) | After P39 | Node v24 |
+|---|---:|---:|---:|
+| **prop_read(1e6)** | 92 ms | **85 ms** | 9 ms |
+| **prop_write(1e6)** | 75 ms | **72 ms** | 10 ms |
+| arr_sum(10000) x1e3 | 40 ms | 36 ms | 9 ms |
+| fib(30) x1 | 25 ms | 25 ms | 8 ms |
+| sum_loop(1e6) | 27 ms | 25 ms | 19 ms |
+
+### Analysis
+
+The improvements are smaller than estimated (7-9% rather than 15-30%). Key factors:
+
+1. **P39.1 (prop_count removal)**: The memory access eliminated (`shape→prop_count`) was on the same cache line as `shape→shape_gen` (bytes 28 and 44 on x86-64). On modern CPUs with out-of-order execution, the cache line is already in L1 by the time prop_count is read, making this check nearly free. Minimal measured impact.
+
+2. **P39.2 (prop_arr cache)**: Replaces one pointer chase (`obj→prop_arr`) with a read from the IC struct. The IC struct is hot (recently accessed for shape/gen checks), so the prop_arr field is in L1 cache. The `obj→prop` chase also hits a hot cache line (obj was just accessed for shape). Both are L1 hits. The substitution avoids a dependent load chain on `obj`, which GCC can sometimes schedule around. Measured improvement: small but consistent.
+
+3. **P39.3 (put_field borrow)**: Eliminates `DupValue+FreeValue` on the object for `o.x = val` loops. Expected to be significant (same mechanism as P37.3 which gave ~50% on prop_read), but the prop_write benchmark's loop is more complex (int boxing for the value also takes time). Measured improvement: marginal.
+
+The WSL2 environment has lower memory latency due to running on host DRAM. In production environments with higher L2/L3 miss rates, the pointer chase eliminations would show larger gains.

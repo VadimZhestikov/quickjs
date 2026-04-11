@@ -14,11 +14,11 @@
 QJS_DIR := $(realpath ..)
 
 .PHONY: all run clean \
-        run-p1 run-p2 run-p5 run-p8 run-p9 run-p10 run-p34 run-p35 run-p37 run-p38 run-js
+        run-p1 run-p2 run-p5 run-p8 run-p9 run-p10 run-p34 run-p35 run-p37 run-p38 run-p39 run-js
 
 all: run
 
-run: run-p1 run-p2 run-p5 run-p8 run-p9 run-p10 run-p34 run-p35 run-p37 run-p38 run-js
+run: run-p1 run-p2 run-p5 run-p8 run-p9 run-p10 run-p34 run-p35 run-p37 run-p38 run-p39 run-js
 	@echo ""
 	@echo "=== ALL JIT TESTS COMPLETE ==="
 
@@ -52,6 +52,9 @@ run-p37:
 run-p38:
 	@make -C P38 run
 
+run-p39:
+	@make -C P39 run
+
 run-js:
 	@make -C js run
 
@@ -66,3 +69,4 @@ clean:
 	@make -C P35 clean
 	@make -C P37 clean
 	@make -C P38 clean
+	@make -C P39 clean

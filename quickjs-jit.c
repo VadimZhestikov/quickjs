@@ -3423,6 +3423,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
      (next_pc) + op_sz[bc[(next_pc)]] < bc_len && \
      bc[(next_pc) + op_sz[bc[(next_pc)]]] == OP_get_array_el)
 
+/* P39.3: 2-opcode look-ahead: next is any get_loc variant AND next+sz is put_field.
+ * Detects the o.x = val pattern and enables borrow elision for obj on the write side. */
+#define _NEXT2_IS_PUT_FIELD(next_pc) \
+    ((next_pc) < bc_len && \
+     _IS_GET_LOC_OP(bc[(next_pc)]) && \
+     (next_pc) + op_sz[bc[(next_pc)]] < bc_len && \
+     bc[(next_pc) + op_sz[bc[(next_pc)]]] == OP_put_field)
+
 #define GEN_PUT_LOC(idx) do { \
     if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) { \
         /* P11.6: INT source → read _ti directly */ \
@@ -3503,6 +3511,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                  * gen_st push is handled by the secondary pass (phase 6.1 below). */
                 jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc_idx), d+1);
                 _borrowed_depth = d;
+            } else if (_NEXT2_IS_PUT_FIELD(pc + sz) &&  /* P39.3 */
+                       !_IS_INT(_loc_idx) && !_IS_NUM(_loc_idx) && !_CAP_LOC(_loc_idx)) {
+                /* 2-ahead: this get_loc pushes the object; next is get_loc val;
+                 * after that is put_field.  Borrow obj — no DupValue. */
+                jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc_idx), d+1);
+                _borrowed_depth = d;
             } else {
                 GEN_GET_LOC(_loc_idx);
                 /* do NOT reset _borrowed_depth here — it may be set by prior get_loc for arr */
@@ -3523,6 +3537,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                      !_IS_INT(_loc8) && !_IS_NUM(_loc8) && !_CAP_LOC(_loc8)) {
                 jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc8), d+1);
                 _borrowed_depth = d;
+            } else if (_NEXT2_IS_PUT_FIELD(pc + sz) &&  /* P39.3 */
+                       !_IS_INT(_loc8) && !_IS_NUM(_loc8) && !_CAP_LOC(_loc8)) {
+                jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc8), d+1);
+                _borrowed_depth = d;
             } else { GEN_GET_LOC(_loc8); } /* do NOT reset _borrowed_depth here */
             break;
         }
@@ -3535,6 +3553,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(n); \
     else if (_NEXT2_IS_ARRAY_GET(pc + sz) && \
              !_IS_INT(n) && !_IS_NUM(n) && !_CAP_LOC(n)) { \
+        jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(n), d+1); \
+        _borrowed_depth = d; \
+    } else if (_NEXT2_IS_PUT_FIELD(pc + sz) &&  /* P39.3 */ \
+               !_IS_INT(n) && !_IS_NUM(n) && !_CAP_LOC(n)) { \
         jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(n), d+1); \
         _borrowed_depth = d; \
     } else { GEN_GET_LOC(n); } \
@@ -3560,6 +3582,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef _NEXT_IS_GET_FIELD
 #undef _IS_GET_LOC_OP
 #undef _NEXT2_IS_ARRAY_GET
+#undef _NEXT2_IS_PUT_FIELD
 #undef GEN_PUT_LOC
 #undef GEN_SET_LOC
 
@@ -4921,11 +4944,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    { static JSJITICEntry2 _ic%d={{},0};\n"
                     "      JSValue _o=_tsv%d, _r;\n"
                     "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
-                    "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[0].prop_arr;\n"  /* P39.2 */
                     "          _r=_pp[_ic%d.e[0].slot]; JS_DupValue(ctx,_r);\n"
                     "          _tsv%d=_r; _sp=%d; }\n"
                     "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
-                    "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[1].prop_arr;\n"  /* P39.2 */
                     "          _r=_pp[_ic%d.e[1].slot]; JS_DupValue(ctx,_r);\n"
                     "          _tsv%d=_r; _sp=%d; }\n"
                     "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
@@ -4934,9 +4957,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     pc,   /* _ic%d static */
                     d-1,  /* _o=_tsv%d */
                     pc,   /* JIT_IC_CHECK_FAST e[0] */
+                    pc,   /* e[0].prop_arr */
                     pc,   /* e[0].slot */
                     d-1, d, /* _tsv%d=_r; _sp=%d */
                     pc, pc, /* n>=2 && e[1] */
+                    pc,   /* e[1].prop_arr */
                     pc,   /* e[1].slot */
                     d-1, d, /* _tsv%d=_r; _sp=%d */
                     atom, atom, pc, /* miss path */
@@ -4946,11 +4971,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "    { static JSJITICEntry2 _ic%d={{},0};\n"
                     "      JSValue _o=_tsv%d, _r;\n"
                     "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
-                    "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[0].prop_arr;\n"  /* P39.2 */
                     "          _r=_pp[_ic%d.e[0].slot]; JS_DupValue(ctx,_r);\n"
                     "          _FREE(_o); _tsv%d=_r; _sp=%d; }\n"
                     "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
-                    "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[1].prop_arr;\n"  /* P39.2 */
                     "          _r=_pp[_ic%d.e[1].slot]; JS_DupValue(ctx,_r);\n"
                     "          _FREE(_o); _tsv%d=_r; _sp=%d; }\n"
                     "      else { _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
@@ -4959,9 +4984,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     pc,   /* _ic%d static */
                     d-1,  /* _o=_tsv%d */
                     pc,   /* JIT_IC_CHECK_FAST e[0] */
+                    pc,   /* e[0].prop_arr */
                     pc,   /* e[0].slot */
                     d-1, d, /* _FREE(_o); _tsv%d=_r; _sp=%d */
                     pc, pc, /* n>=2 && e[1] */
+                    pc,   /* e[1].prop_arr */
                     pc,   /* e[1].slot */
                     d-1, d, /* _FREE(_o); _tsv%d=_r; _sp=%d */
                     atom, atom, pc, /* miss path */
@@ -4980,11 +5007,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "    { static JSJITICEntry2 _ic%d={{},0};\n"
                 "      JSValue _r;\n"
                 "      if (js_likely(JIT_IC_CHECK_FAST(_tsv%d,&_ic%d.e[0]))){\n"
-                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_tsv%d)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue *_pp=(JSValue*)_ic%d.e[0].prop_arr;\n"  /* P39.2 */
                 "          _r=_pp[_ic%d.e[0].slot]; JS_DupValue(ctx,_r);\n"
                 "          _tsv%d=_r; _sp=%d; }\n"
                 "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_tsv%d,&_ic%d.e[1]))){\n"
-                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_tsv%d)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue *_pp=(JSValue*)_ic%d.e[1].prop_arr;\n"  /* P39.2 */
                 "          _r=_pp[_ic%d.e[1].slot]; JS_DupValue(ctx,_r);\n"
                 "          _tsv%d=_r; _sp=%d; }\n"
                 "      else { _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
@@ -4992,11 +5019,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "             _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; } }\n",
                 pc,        /* _ic%d */
                 d-1, pc,   /* _tsv%d, e[0] */
-                d-1,       /* JS_VALUE_GET_PTR(_tsv%d) */
+                pc,        /* e[0].prop_arr */
                 pc,        /* e[0].slot */
                 d, d+1,    /* _tsv%d=_r; _sp=%d */
                 pc, d-1, pc, /* n>=2 && _tsv%d, e[1] */
-                d-1,       /* JS_VALUE_GET_PTR(_tsv%d) */
+                pc,        /* e[1].prop_arr */
                 pc,        /* e[1].slot */
                 d, d+1,    /* _tsv%d=_r; _sp=%d */
                 d-1, atom, /* miss get_prop(_tsv%d, atom) */
@@ -5009,29 +5036,60 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             /* P11.1: IC write hit path inlined — no call to js_jit_ic_write.
              * P37.4: bimorphic — two shape slots for write IC.
-             * Equivalent to set_value(ctx, &p->prop[slot].u.value, val):
-             * load old, store new, free old. */
-            jit_buf_printf(cb,
-                "    { static JSJITICEntry2 _ic%d={{},0};\n"
-                "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
-                "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
-                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
-                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
-                "          JSValue *_pp=*(JSValue**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
-                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
-                "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
-                "      _FREE(_o); if(_ret<0) goto _ex; }\n",
-                pc,        /* _ic%d */
-                d-1, d-2, d-2, /* _v=_tsv%d, _o=_tsv%d, _sp=%d */
-                pc,        /* JIT_IC_CHECK_FAST e[0] */
-                pc, pc,    /* e[0].slot (old), e[0].slot (new) */
-                pc, pc,    /* n>=2 && e[1] */
-                pc, pc,    /* e[1].slot (old), e[1].slot (new) */
-                atom, atom, pc); /* miss path */
+             * P39.2: use cached prop_arr from IC entry instead of obj→prop dereference.
+             * P39.3: if obj was borrowed (get_loc skipped DupValue), skip _FREE(_o). */
+            int _pf_borrowed = (borrowed_depth_snap == d-2);   /* P39.3 */
+            if (_pf_borrowed) {
+                /* Object was loaded without DupValue — skip _FREE(_o). */
+                jit_buf_printf(cb,
+                    "    { static JSJITICEntry2 _ic%d={{},0};\n"
+                    "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
+                    "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[0].prop_arr;\n"
+                    "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
+                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                    "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[1].prop_arr;\n"
+                    "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
+                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                    "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
+                    "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
+                    "      if(_ret<0) goto _ex; }\n",  /* no _FREE(_o) — obj was borrowed */
+                    pc,        /* _ic%d */
+                    d-1, d-2, d-2, /* _v=_tsv%d, _o=_tsv%d, _sp=%d */
+                    pc,        /* JIT_IC_CHECK_FAST e[0] */
+                    pc,        /* e[0].prop_arr */
+                    pc, pc,    /* e[0].slot (old), e[0].slot (new) */
+                    pc, pc,    /* n>=2 && e[1] */
+                    pc,        /* e[1].prop_arr */
+                    pc, pc,    /* e[1].slot (old), e[1].slot (new) */
+                    atom, atom, pc); /* miss path */
+            } else {
+                jit_buf_printf(cb,
+                    "    { static JSJITICEntry2 _ic%d={{},0};\n"
+                    "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
+                    "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[0].prop_arr;\n"
+                    "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
+                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                    "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
+                    "          JSValue *_pp=(JSValue*)_ic%d.e[1].prop_arr;\n"
+                    "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
+                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                    "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
+                    "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
+                    "      _FREE(_o); if(_ret<0) goto _ex; }\n",
+                    pc,        /* _ic%d */
+                    d-1, d-2, d-2, /* _v=_tsv%d, _o=_tsv%d, _sp=%d */
+                    pc,        /* JIT_IC_CHECK_FAST e[0] */
+                    pc,        /* e[0].prop_arr */
+                    pc, pc,    /* e[0].slot (old), e[0].slot (new) */
+                    pc, pc,    /* n>=2 && e[1] */
+                    pc,        /* e[1].prop_arr */
+                    pc, pc,    /* e[1].slot (old), e[1].slot (new) */
+                    atom, atom, pc); /* miss path */
+            }
+            _borrowed_depth = -1; /* P39.3: borrow consumed by put_field */
             break;
         }
         /* P11.4: dense array element fast path — fully inlined.

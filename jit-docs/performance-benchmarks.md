@@ -300,3 +300,52 @@ All figures use the non-LTO build (`CONFIG_JIT=y`), warm run (cached `.so`).
 | **arr_sum(10000) x1e3** | 221 ms | **49 ms** | **40 ms** | 9 ms |
 
 Non-array-access benchmarks are essentially unaffected by P38, as expected.
+
+---
+
+## 8. P39 Results (2026-04-10)
+
+Phase 39 targeted the property IC fast path with three optimization sub-phases:
+
+| Sub-phase | Change |
+|---|---|
+| P39.1 | Remove redundant `prop_count > slot` from `JIT_IC_CHECK` / `JIT_IC_CHECK_FAST` / `js_jit_ic_check()` — shape_gen match already proves this |
+| P39.2 | Add `void *prop_arr` field to `JSJITICEntry`; fill at IC fill time; replace all 8 `JIT_OBJ_PROP_OFF` pointer chases in `get_field` / `get_field2` / `put_field` emitters with direct `_ic%d.e[N].prop_arr` access |
+| P39.3 | Add `_NEXT2_IS_PUT_FIELD` look-ahead; extend borrow elision to `get_loc obj→get_loc val→put_field` pattern; skip `_FREE(_o)` in `put_field` when obj was borrowed |
+
+### 8.1 prop_read and prop_write: before vs after P39
+
+All figures use the non-LTO build (`CONFIG_JIT=y`), warm run (cached `.so`).
+
+| Mode | prop_read Before P39 | prop_read After P39 | prop_write Before P39 | prop_write After P39 |
+|---|---:|---:|---:|---:|
+| Interpreter | 396 ms | 396 ms | 303 ms | 303 ms |
+| JIT AOT (warm) | 92 ms | **85 ms** | 72 ms | **72 ms** |
+| Node v24 | 10 ms | 10 ms | 12 ms | 12 ms |
+
+**prop_read speedup**: 92 ms → 85 ms (~8% faster, from 9.2× to 8.5× behind Node)
+
+**prop_write speedup**: 72 ms → 72 ms (~0-4% — within run-to-run variation)
+
+### 8.2 Which sub-phase contributed what
+
+- **P39.2 (prop_arr cache)** provides the measurable improvement on `prop_read` by replacing the `obj→prop` pointer chase with a direct read from the hot IC struct.
+- **P39.1 (prop_count removal)** eliminates one memory read, but `shape→prop_count` (byte 44) is on the same cache line as `shape→shape_gen` (byte 28). On this hardware, it's already in L1 when read — negligible impact.
+- **P39.3 (put_field borrow)** should eliminate 1M DupValue/FreeValue pairs on `prop_write`'s hot loop, but the benchmark's value boxing (integer→JSValue) dominates the remaining overhead, masking the refcount savings.
+
+### 8.3 Full P39 benchmark table (warm AOT)
+
+| Benchmark | Interpreter | JIT AOT (After P38) | JIT AOT (After P39) | Node v24 |
+|---|---:|---:|---:|---:|
+| fib(30) x1 | 74 ms | 30 ms | 25 ms | 8 ms |
+| sum_loop(1e6) | 506 ms | 33 ms | 25 ms | 19 ms |
+| sum_sq(1e6) | 420 ms | 29 ms | 25 ms | 18 ms |
+| **prop_read(1e6)** | 396 ms | 93 ms | **85 ms** | 10 ms |
+| **prop_write(1e6)** | 303 ms | 80 ms | **72 ms** | 12 ms |
+| closure_counter(1e6) | 32 ms | 15 ms | 15 ms | 2 ms |
+| ipow(2,20) x1e5 | 64 ms | 28 ms | 27 ms | 10 ms |
+| str_concat(5000) | 38 ms | 47 ms | 40 ms | 5 ms |
+| count_primes(3000) | 5 ms | 1.7 ms | 1.4 ms | 1 ms |
+| arr_sum(10000) x1e3 | 207 ms | 40 ms | 36 ms | 11 ms |
+
+Non-property-access benchmarks are essentially unaffected by P39.

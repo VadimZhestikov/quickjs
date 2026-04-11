@@ -493,6 +493,11 @@ void js_jit_varref_reattach(JSVarRef *vr, JSValue *slot);
  */
 typedef struct {
     void     *shape;    /* JSShape* — opaque outside quickjs.c */
+    void     *prop_arr; /* JSObject.prop (JSProperty*) cached at fill time.       ← P39.2
+                         * Valid while shape_gen matches: property add/remove
+                         * always transitions to a new shape (new shape_gen),
+                         * invalidating the IC and forcing a refill with updated
+                         * prop_arr.  Never read when shape==NULL or MEGAMORPHIC. */
     uint32_t  slot;     /* index into JSObject->prop[] */
     uint32_t  atom;     /* JSAtom at slot — ABA guard: if shape is freed and
                          * reallocated for a different layout, the atom at this
@@ -529,17 +534,18 @@ typedef struct {
  *   JSObject.shape        = byte 32
  *   JSObject.prop         = byte 40  (pointer to JSProperty array)
  *   JSShape.shape_gen     = byte 28  (uint32_t generation counter — shape ABA guard)
- *   JSShape.prop_count    = byte 44
  *   JSShape.prop[]        = byte 72  (flexible array of JSShapeProperty)
  *   JSShapeProperty.atom  = byte  4  (after 4-byte bitfield word)
  *   sizeof(JSShapeProperty) = 8
  *   sizeof(JSProperty)    = 16       (= sizeof(JSValue); u.value is at offset 0)
+ * Note: JSShape.prop_count (byte 44) is NOT accessed at runtime — slot < prop_count
+ * is proven by shape_gen match (shape_gen unchanged → shape unchanged → prop_count
+ * unchanged and >= slot, as verified at IC fill time). P39.1 removed that check.
  */
 #define JIT_OBJIC_SHAPE_OFF       32
 #define JIT_OBJ_PROP_OFF          40  /* JSObject.prop pointer */
 #define JIT_PROP_SIZE             16  /* sizeof(JSProperty) == sizeof(JSValue) */
 #define JIT_SHAPEIC_SHAPEGEN_OFF  28  /* JSShape.shape_gen (uint32_t) — within-runtime ABA guard */
-#define JIT_SHAPEIC_PROPCOUNT_OFF 44
 #define JIT_SHAPEIC_PROP_OFF      72
 #define JIT_SHAPEIC_PROPSIZE       8
 #define JIT_SHAPEIC_ATOM_OFF       4
@@ -613,8 +619,7 @@ uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
-     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
-     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot)
+     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen)
 
 /*
  * JIT_IC_CHECK_FAST(obj, ic): fast per-callsite IC check for use inside
@@ -637,8 +642,7 @@ uint32_t JS_GetRuntimeICGen(JSRuntime *rt);
      (ic)->shape != JIT_IC_MEGAMORPHIC && \
      JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && \
      *(void **)((char*)JS_VALUE_GET_PTR(obj) + JIT_OBJIC_SHAPE_OFF) == (ic)->shape && \
-     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen && \
-     (uint32_t)*(const int *)((const char*)(ic)->shape + JIT_SHAPEIC_PROPCOUNT_OFF) > (ic)->slot)
+     *(const uint32_t*)((const char*)(ic)->shape + JIT_SHAPEIC_SHAPEGEN_OFF) == (ic)->shape_gen)
 
 /*
  * js_jit_ic_check: same logic as JIT_IC_CHECK but as a callable function.
