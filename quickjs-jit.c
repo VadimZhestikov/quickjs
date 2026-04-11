@@ -2312,12 +2312,19 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         fname_out);
 
     /* P9.2: named temp stack slots — declare _tsv0.._tsv{stack_size-1}.
-     * P11.2: NOT initialized to JS_UNDEFINED.  The _ex cleanup path uses
-     * runtime _sp guards (if(_sp>N){_FREE(_tsvN);}) so only live slots are
-     * freed.  _sp starts at 0 and is incremented only after a slot is written,
-     * so uninitialized slots are never accessed on the exception path. */
+     * P43.5: initialized to JS_UNDEFINED so the _ex cleanup path can safely
+     * call JS_FreeValue on any slot when _sp>N.  INT fast paths (OP_and/or/xor/
+     * shl/sar/not, add_i, push_i32, get_loc_i, etc.) write _ti{N} without
+     * writing _tsv{N} but still increment _sp; if an exception fires while such
+     * a slot is live the cleanup reads _tsv{N} for JS_FreeValue.
+     * JS_UNDEFINED is a no-op for JS_FreeValue, so initializing to it prevents
+     * UAF/heap-corruption from uninitialized stack garbage being treated as a
+     * live refcounted JSValue.  ASAN masks the bug (different allocator layout);
+     * non-ASAN reproduces as a RayTrace/DeltaBlue incorrect-property-read caused
+     * by the heap corruption on the first exception path taken after bitop INT
+     * fast paths. */
     for (int j = 0; j < stack_size; j++)
-        jit_buf_printf(cb, "    JSValue _tsv%d;\n", j);
+        jit_buf_printf(cb, "    JSValue _tsv%d=JS_UNDEFINED;\n", j);
     /* P9.4: raw double temporaries for JIT_T_NUMBER stack slots.
      * P11.2: not initialized — always assigned before use by the type system. */
     for (int j = 0; j < stack_size; j++)
