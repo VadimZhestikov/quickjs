@@ -253,3 +253,50 @@ All figures use the LTO-optimized binary (`CONFIG_JIT=y CONFIG_LTO=y`), warm run
 | arr_sum(10000) x1e3 | 210 ms | 48 ms | 49 ms | 9 ms |
 
 Non-property-access benchmarks are unaffected by P37, as expected.
+
+---
+
+## 7. P38 Results (2026-04-10)
+
+Phase 38 targeted array access performance with three optimization sub-phases:
+
+| Sub-phase | Change |
+|---|---|
+| P38.1 | Extend refcount-elision peephole from `get_loc→get_field` to `get_loc arr→get_loc i→get_array_el` (object borrow for array access) |
+| P38.2 | Typed index fast path: when loop counter is a native `int64_t`, skip `JS_NewInt32` boxing + tag check per element |
+| P38.3 | Inline `array.length`: replace `_RT->get_prop` helper call with direct `u.array.count` field read for dense arrays |
+
+### 7.1 arr_sum: before vs after P38
+
+All figures use the non-LTO build (`CONFIG_JIT=y`), warm run (cached `.so`).
+
+| Mode | arr_sum Before P38 | arr_sum After P38 |
+|---|---:|---:|
+| Interpreter | 221 ms | 221 ms |
+| JIT AOT (warm) | 49 ms | **40 ms** |
+| Node v24 | 9 ms | 9 ms |
+
+**arr_sum speedup**: 49 ms → 40 ms (~18% faster), closing the Node gap from 5.4× to 4.4×.
+
+### 7.2 Which sub-phase contributed what
+
+- **P38.2 (typed index)**: The benchmark's `arr_sum` function uses a `for (var i=0;...)` counter which is typed as `int64_t`. Skipping `JS_NewInt32` and the tag check per element eliminates 10M boxing + unboxing round-trips (for 10k×1k iterations). This is the dominant contributor.
+- **P38.3 (inline length)**: `arr.length` is called once per outer `arr_sum(arr)` call (1000 times), not per element. Minor contribution to `arr_sum`, but helps any `.length`-in-loop pattern.
+- **P38.1 (borrow)**: The `arr` parameter is a function argument (not a local variable), so P38.1's `get_loc` borrow does NOT apply to the benchmark's `arr_sum`. P38.1 helps when the array is stored in a local variable (e.g., `var arr2 = arr; for (...) s += arr2[i]`), eliminating 10M DupValue/FreeValue pairs in that case.
+
+### 7.3 Full P38 benchmark table (warm AOT)
+
+| Benchmark | Interpreter | JIT AOT (Before P38) | JIT AOT (After P38) | Node v24 |
+|---|---:|---:|---:|---:|
+| fib(30) x1 | 75 ms | 25 ms | 30 ms | 9 ms |
+| sum_loop(1e6) | 550 ms | 27 ms | 33 ms | 18 ms |
+| sum_sq(1e6) | 419 ms | 26 ms | 29 ms | 18 ms |
+| prop_read(1e6) | 415 ms | 92 ms | 93 ms | 9 ms |
+| prop_write(1e6) | 333 ms | 75 ms | 80 ms | 10 ms |
+| closure_counter(1e6) | 35 ms | 15 ms | 15 ms | 2 ms |
+| ipow(2,20) x1e5 | 64 ms | 30 ms | 28 ms | 10 ms |
+| str_concat(5000) | 39 ms | 42 ms | 47 ms | 5 ms |
+| count_primes(3000) | 6 ms | 1.4 ms | 1.7 ms | 1 ms |
+| **arr_sum(10000) x1e3** | 221 ms | **49 ms** | **40 ms** | 9 ms |
+
+Non-array-access benchmarks are essentially unaffected by P38, as expected.

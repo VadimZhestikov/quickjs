@@ -2754,30 +2754,30 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     snprintf(self_jit_sym, sizeof(self_jit_sym), "__jit_f_%016llx",
              (unsigned long long)bc_hash);
 
-    /* P37.3: refcount elision flag.  When a get_loc emitter skips DupValue
-     * (look-ahead shows the next opcode is get_field/get_field2), it sets
-     * _top_borrowed=1.  The get_field emitter reads top_borrowed (saved at
-     * loop top) and omits _FREE(_o) from both IC hit and miss paths.
-     * Both halves must match: no-dup in get_loc AND no-free in get_field. */
-    int _top_borrowed = 0;
+    /* P38.1: refcount elision depth.  When a get_loc emitter skips DupValue
+     * (look-ahead shows next op(s) consume the object), it sets _borrowed_depth=d.
+     * The consumer (get_field / get_array_el) reads borrowed_depth_snap and omits
+     * _FREE(_o).  -1 means no borrow is active. */
+    int _borrowed_depth = -1;
 
     while (pc < bc_len) {
-        /* P37.3: save borrow flag from previous iteration and clear for next.
-         * top_borrowed is read by get_field/get_field2 emitters this iteration.
-         * _top_borrowed is set by get_loc emitters and cleared here at top of
-         * each iteration so any non-get-field opcode resets it to 0. */
-        int top_borrowed = _top_borrowed;
-        _top_borrowed = 0;
+        /* P38.1: snapshot borrow depth for this iteration.
+         * top_borrowed is the compat shim used by get_field emitters.
+         * borrowed_depth_snap is used by get_array_el for depth-aware check.
+         * Individual opcodes own _borrowed_depth lifecycle; do NOT reset here. */
+        int top_borrowed = (_borrowed_depth != -1);          /* compat for get_field */
+        int borrowed_depth_snap = _borrowed_depth;           /* full depth for get_array_el */
 
         /* P9.2: stack depth BEFORE this opcode.  sdt[pc]==0xffff means unreachable.
          * Computed early so _P94_ENSURE (which uses d) works in the label block. */
         int d = (sdt && sdt[pc] != 0xffff) ? (int)sdt[pc] : 0;
 
-        /* P37.3: if this PC is a branch target, other paths may jump here
-         * without executing the preceding get_loc.  Discard any borrow flag
-         * that the sequential predecessor may have set. */
-        if (scan_is_target(sr, pc))
+        /* P38.1: if this PC is a branch target, other paths may jump here
+         * without executing the preceding get_loc.  Discard any borrow. */
+        if (scan_is_target(sr, pc)) {
             top_borrowed = 0;
+            _borrowed_depth = -1;
+        }
 
         /* Emit label if this offset is a branch target.
          * Also reset gen_st conservatively — multiple control-flow paths merge
@@ -3383,20 +3383,20 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         jit_buf_printf(cb, "    _tsv%d=_DUP(_jsv_%s); _sp=%d;\n", d, LNAME(idx), d+1); \
 } while(0)
 
-/* P37.3: borrowed variant — omits DupValue for get_loc when the immediately
- * following opcode is get_field/get_field2.  The object refcount is NOT
+/* P38.1 (was P37.3): borrowed variant — omits DupValue for get_loc when the
+ * immediately following opcode is get_field.  The object refcount is NOT
  * incremented here; get_field must NOT call _FREE(_o) in this case.
  * Only applies to JSVAL locals (not INT/NUM — those are type-converted). */
 #define GEN_GET_LOC_BORROW(idx) do { \
     if (_IS_INT(idx) || _IS_NUM(idx)) { \
         GEN_GET_LOC(idx); /* typed: can't borrow, fall back to normal */ \
-        _top_borrowed = 0; \
+        _borrowed_depth = -1; \
     } else if (_CAP_LOC(idx)) { \
         jit_buf_printf(cb, "    _tsv%d=_DUP(_cap_buf[%d]); _sp=%d;\n", d, (idx), d+1); \
-        _top_borrowed = 0; /* captured local: DupValue needed (ref outside frame) */ \
+        _borrowed_depth = -1; /* captured local: DupValue needed (ref outside frame) */ \
     } else { \
         jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(idx), d+1); \
-        _top_borrowed = 1; /* no DupValue — get_field must skip _FREE(_o) */ \
+        _borrowed_depth = d;  /* no DupValue — get_field must skip _FREE(_o) */ \
     } \
 } while(0)
 
@@ -3407,6 +3407,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  * dangling alias after the stack slot is later popped. */
 #define _NEXT_IS_GET_FIELD(next_pc) \
     ((next_pc) < bc_len && bc[(next_pc)] == OP_get_field)
+
+/* P38.1: 2-opcode look-ahead: next is any get_loc variant (idx) AND next+sz is get_array_el.
+ * Used to detect arr[i] pattern and skip DupValue for arr.
+ * Includes short-form opcodes OP_get_loc0..3 and OP_get_loc8 since the compiler
+ * may use those for locals at indices 0..3 or 0..255. */
+#define _IS_GET_LOC_OP(opcode) \
+    ((opcode) == OP_get_loc || (opcode) == OP_get_loc_check || \
+     (opcode) == OP_get_loc0 || (opcode) == OP_get_loc1 || \
+     (opcode) == OP_get_loc2 || (opcode) == OP_get_loc3 || \
+     (opcode) == OP_get_loc8)
+#define _NEXT2_IS_ARRAY_GET(next_pc) \
+    ((next_pc) < bc_len && \
+     _IS_GET_LOC_OP(bc[(next_pc)]) && \
+     (next_pc) + op_sz[bc[(next_pc)]] < bc_len && \
+     bc[(next_pc) + op_sz[bc[(next_pc)]]] == OP_get_array_el)
 
 #define GEN_PUT_LOC(idx) do { \
     if (_IS_INT(idx) && gen_sp > 0 && gen_st[gen_sp-1] == JIT_T_INT) { \
@@ -3472,37 +3487,63 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     } \
 } while(0)
 
-        /* P37.3: get_loc variants use GEN_GET_LOC_BORROW when next opcode is
-         * get_field/get_field2, skipping DupValue and setting _top_borrowed=1
-         * so the subsequent get_field emitter omits _FREE(_o). */
+        /* P38.1 (was P37.3): get_loc variants use GEN_GET_LOC_BORROW when next
+         * opcode is get_field, or 2-opcode look-ahead for arr[i] pattern. */
         case OP_get_loc:  case OP_get_loc_check:
         case OP_get_loc_checkthis:
-            if (_NEXT_IS_GET_FIELD(pc + sz))
-                GEN_GET_LOC_BORROW((int)bc_u16(&bc[pc+1]));
-            else
-                GEN_GET_LOC((int)bc_u16(&bc[pc+1]));
+        {
+            int _loc_idx = (int)bc_u16(&bc[pc+1]);
+            if (_NEXT_IS_GET_FIELD(pc + sz)) {
+                GEN_GET_LOC_BORROW(_loc_idx);
+                /* _borrowed_depth updated inside GEN_GET_LOC_BORROW */
+            } else if (_NEXT2_IS_ARRAY_GET(pc + sz) &&
+                       !_IS_INT(_loc_idx) && !_IS_NUM(_loc_idx) && !_CAP_LOC(_loc_idx)) {
+                /* 2-ahead: this get_loc pushes the array obj; next is get_loc idx;
+                 * after that is get_array_el.  Borrow obj — no DupValue.
+                 * gen_st push is handled by the secondary pass (phase 6.1 below). */
+                jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc_idx), d+1);
+                _borrowed_depth = d;
+            } else {
+                GEN_GET_LOC(_loc_idx);
+                /* do NOT reset _borrowed_depth here — it may be set by prior get_loc for arr */
+            }
             break;
+        }
         case OP_put_loc:  case OP_put_loc_check:
-        case OP_put_loc_check_init: GEN_PUT_LOC((int)bc_u16(&bc[pc+1])); break;
-        case OP_set_loc:  GEN_SET_LOC((int)bc_u16(&bc[pc+1])); break;
+        case OP_put_loc_check_init: GEN_PUT_LOC((int)bc_u16(&bc[pc+1])); _borrowed_depth = -1; break;
+        case OP_set_loc:  GEN_SET_LOC((int)bc_u16(&bc[pc+1])); _borrowed_depth = -1; break;
         /* TDZ init: mark local as uninitialized — skip in JIT (no TDZ checking) */
         case OP_set_loc_uninitialized: break;
         case OP_get_loc8:
+        {
+            int _loc8 = (int)bc[pc+1];
             if (_NEXT_IS_GET_FIELD(pc + sz))
-                GEN_GET_LOC_BORROW((int)bc[pc+1]);
-            else
-                GEN_GET_LOC((int)bc[pc+1]);
+                GEN_GET_LOC_BORROW(_loc8);
+            else if (_NEXT2_IS_ARRAY_GET(pc + sz) &&
+                     !_IS_INT(_loc8) && !_IS_NUM(_loc8) && !_CAP_LOC(_loc8)) {
+                jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(_loc8), d+1);
+                _borrowed_depth = d;
+            } else { GEN_GET_LOC(_loc8); } /* do NOT reset _borrowed_depth here */
             break;
-        case OP_put_loc8: GEN_PUT_LOC((int)bc[pc+1]); break;
-        case OP_set_loc8: GEN_SET_LOC((int)bc[pc+1]); break;
-        case OP_get_loc0:
-            if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(0); else GEN_GET_LOC(0); break;
-        case OP_get_loc1:
-            if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(1); else GEN_GET_LOC(1); break;
-        case OP_get_loc2:
-            if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(2); else GEN_GET_LOC(2); break;
-        case OP_get_loc3:
-            if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(3); else GEN_GET_LOC(3); break;
+        }
+        case OP_put_loc8: GEN_PUT_LOC((int)bc[pc+1]); _borrowed_depth = -1; break;
+        case OP_set_loc8: GEN_SET_LOC((int)bc[pc+1]); _borrowed_depth = -1; break;
+/* P38.1: helper macro for get_loc0..3 borrow extension.
+ * Note: the else branch does NOT reset _borrowed_depth — it may have been set
+ * by the previous get_loc (for arr) and must survive until get_array_el. */
+#define _GEN_GET_LOC_N(n) do { \
+    if (_NEXT_IS_GET_FIELD(pc + sz)) GEN_GET_LOC_BORROW(n); \
+    else if (_NEXT2_IS_ARRAY_GET(pc + sz) && \
+             !_IS_INT(n) && !_IS_NUM(n) && !_CAP_LOC(n)) { \
+        jit_buf_printf(cb, "    _tsv%d=_jsv_%s; _sp=%d;\n", d, LNAME(n), d+1); \
+        _borrowed_depth = d; \
+    } else { GEN_GET_LOC(n); } \
+} while(0)
+        case OP_get_loc0: _GEN_GET_LOC_N(0); break;
+        case OP_get_loc1: _GEN_GET_LOC_N(1); break;
+        case OP_get_loc2: _GEN_GET_LOC_N(2); break;
+        case OP_get_loc3: _GEN_GET_LOC_N(3); break;
+#undef _GEN_GET_LOC_N
         case OP_put_loc0: GEN_PUT_LOC(0); break;
         case OP_put_loc1: GEN_PUT_LOC(1); break;
         case OP_put_loc2: GEN_PUT_LOC(2); break;
@@ -3517,6 +3558,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 #undef GEN_GET_LOC
 #undef GEN_GET_LOC_BORROW
 #undef _NEXT_IS_GET_FIELD
+#undef _IS_GET_LOC_OP
+#undef _NEXT2_IS_ARRAY_GET
 #undef GEN_PUT_LOC
 #undef GEN_SET_LOC
 
@@ -4759,6 +4802,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_if_false: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a branch */
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — 0.0 or NaN is falsy.
                  * Box any typed slots below the condition before branching. */
@@ -4782,6 +4826,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_if_true: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a branch */
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — non-zero and non-NaN is truthy.
                  * Box any typed slots below the condition before branching. */
@@ -4801,6 +4846,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_goto: {
             int32_t delta = (int32_t)bc_u32(&bc[pc+1]);
             int tgt = pc + 1 + delta;
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a goto */
             /* P9.4: box typed surviving slots before goto — target label resets gen_st */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
@@ -4808,6 +4854,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_if_false8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a branch */
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — box surviving slots below condition */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
@@ -4825,6 +4872,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_if_true8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a branch */
             if (gen_sp > 0 && gen_st[gen_sp-1] >= JIT_T_NUMBER) {
                 /* P9.4: typed fast path — box surviving slots below condition */
                 { int _bx; for (_bx=0; _bx < d-1 && _bx < gen_sp-1; _bx++) _P94_ENSURE(_bx); }
@@ -4842,6 +4890,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_goto8: {
             int tgt = pc + 1 + (int)(int8_t)bc[pc+1];
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a goto */
             /* P9.4: box typed surviving slots before goto */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
@@ -4849,6 +4898,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_goto16: {
             int tgt = pc + 1 + (int)(int16_t)bc_u16(&bc[pc+1]);
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a goto */
             /* P9.4: box typed surviving slots before goto */
             { int _bx; for (_bx=0; _bx < gen_sp; _bx++) _P94_ENSURE(_bx); }
             jit_buf_printf(cb, "    goto _L%d;\n", tgt);
@@ -4917,6 +4967,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     atom, atom, pc, /* miss path */
                     d-1, d-1, d);   /* _FREE; _sp=%d; _CHK; _tsv%d=_r; _sp=%d */
             }
+            _borrowed_depth = -1; /* P38.1: borrow consumed by get_field */
             break;
         }
         case OP_get_field2: { /* keep object on stack; push result: depth d -> d+1 */
@@ -5000,63 +5051,169 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
          * P9.4/P9.2: get_array_el: box typed idx slot, pop idx(_tsv{d-1}),
          *   pop obj(_tsv{d-2}), push result(_tsv{d-2}); depth d->d-1 */
         case OP_get_array_el:
-            _P94_ENSURE(d-1); /* P9.4: box typed idx slot before index check */
-            jit_buf_printf(cb,
-                "    { JSValue _idx=_tsv%d,_o=_tsv%d; JSValue _r;\n"
-                "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
-                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
-                "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
-                "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
-                "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
-                "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
-                "          _r=(*(JSValue**)(_op+JIT_ARR_VALUES_OFF))[_ai];\n"
-                "          JS_DupValue(ctx,_r);\n"
-                "          _FREE(_o);_FREE(_idx); _sp=%d; _tsv%d=_r; _sp=%d;\n"
-                "          goto _aok%d;}}\n"
-                "      _r=_RT->get_array_el(ctx,_o,_idx);\n"
-                "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
-                "      _aok%d:; }\n",
-                d-1, d-2,
-                d-2, d-2, d-1, pc,  /* fast path: _sp, _tsv, _sp, goto label */
-                d-2, d-2, d-1, pc); /* slow path: _sp, _tsv, _sp, label */
+        {
+            /* P38.2: detect typed index before boxing */
+            int _idx_typed = (gen_sp > (d-1) && gen_st[d-1] == JIT_T_INT);
+            int _obj_borrowed = (borrowed_depth_snap == d-2);   /* P38.1 */
+            _borrowed_depth = -1; /* consume borrow */
+
+            if (_idx_typed) {
+                /* P38.2: Index is a native int64_t _ti{d-1}; no boxing or tag check.
+                 * Object may or may not be borrowed (P38.1). */
+                _P94_ENSURE(d-2);  /* box obj slot if somehow typed (defensive) */
+                const char *_o_free = _obj_borrowed ? "" : "_FREE(_o);";
+                jit_buf_printf(cb,
+                    "    { JSValue _o=_tsv%d; JSValue _r;\n"
+                    "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
+                    "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                    "        uint32_t _ai=(uint32_t)_ti%d;\n"
+                    "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                    "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                    "          _r=(*(JSValue**)(_op+JIT_ARR_VALUES_OFF))[_ai];\n"
+                    "          JS_DupValue(ctx,_r);\n"
+                    "          %s _sp=%d; _tsv%d=_r; _sp=%d; goto _aok%d;}}\n"
+                    "      { int64_t _iv%d=_ti%d;\n"
+                    "        JSValue _idx=((int64_t)(int32_t)_iv%d==_iv%d)\n"
+                    "            ?JS_MKVAL(JS_TAG_INT,(int32_t)_iv%d)\n"
+                    "            :JS_NewFloat64(ctx,(double)_iv%d);\n"
+                    "        _r=_RT->get_array_el(ctx,_o,_idx);\n"
+                    "        %s _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d; }\n"
+                    "      _aok%d:; }\n",
+                    d-2,                                    /* _o=_tsv{d-2} */
+                    d-1,                                    /* _ai=(uint32_t)_ti{d-1} */
+                    _o_free, d-2, d-2, d-1, pc,            /* fast: free,sp,tsv,sp,goto */
+                    pc, d-1, pc, pc, pc, pc,                /* slow: box _ti{d-1} → _idx */
+                    _o_free, d-2, d-2, d-1, pc);            /* slow: free,sp,chk,tsv,sp,label */
+            } else {
+                /* Not typed index: box the index slot, then use P38.1 borrow for obj */
+                _P94_ENSURE(d-1); /* P9.4: box typed idx slot before index check */
+                if (_obj_borrowed) {
+                    /* P38.1: arr was pushed without DupValue — skip _FREE(_o) */
+                    jit_buf_printf(cb,
+                        "    { JSValue _idx=_tsv%d,_o=_tsv%d; JSValue _r;\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                                       "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          _r=(*(JSValue**)(_op+JIT_ARR_VALUES_OFF))[_ai];\n"
+                        "          JS_DupValue(ctx,_r);\n"
+                        "          _FREE(_idx); _sp=%d; _tsv%d=_r; _sp=%d;\n"  /* no _FREE(_o) */
+                        "          goto _aok%d;}}\n"
+                        "      _r=_RT->get_array_el(ctx,_o,_idx);\n"
+                        "      _FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n" /* no _FREE(_o) */
+                        "      _aok%d:; }\n",
+                        d-1, d-2,
+                        d-2, d-2, d-1, pc,  /* fast path: _sp, _tsv, _sp, goto */
+                        d-2, d-2, d-1, pc); /* slow path: _sp, _tsv, _sp, label */
+                } else {
+                    /* Original path: both _FREE(_o) and _FREE(_idx) */
+                    jit_buf_printf(cb,
+                        "    { JSValue _idx=_tsv%d,_o=_tsv%d; JSValue _r;\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                                       "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          _r=(*(JSValue**)(_op+JIT_ARR_VALUES_OFF))[_ai];\n"
+                        "          JS_DupValue(ctx,_r);\n"
+                        "          _FREE(_o);_FREE(_idx); _sp=%d; _tsv%d=_r; _sp=%d;\n"
+                        "          goto _aok%d;}}\n"
+                        "      _r=_RT->get_array_el(ctx,_o,_idx);\n"
+                        "      _FREE(_o);_FREE(_idx); _sp=%d; _CHK(_r); _tsv%d=_r; _sp=%d;\n"
+                        "      _aok%d:; }\n",
+                        d-1, d-2,
+                        d-2, d-2, d-1, pc,  /* fast path: _sp, _tsv, _sp, goto label */
+                        d-2, d-2, d-1, pc); /* slow path: _sp, _tsv, _sp, label */
+                }
+            }
             break;
+        }
         /* P11.4: put_array_el inlined similarly.
+         * P38.2: typed index fast path for put_array_el.
          * P9.4/P9.2: box typed slots, pop v(_tsv{d-1}), idx(_tsv{d-2}),
          *   obj(_tsv{d-3}); depth d->d-3 */
         case OP_put_array_el:
+        {
+            int _pidx_typed = (gen_sp > (d-2) && gen_st[d-2] == JIT_T_INT);
+            _borrowed_depth = -1;
             _P94_ENSURE(d-3); /* P9.4: box typed obj slot (unlikely but safe) */
-            _P94_ENSURE(d-2); /* P9.4: box typed idx slot before index check */
+            /* P38.2: skip _P94_ENSURE(d-2) when index is a typed int */
+            if (!_pidx_typed)
+                _P94_ENSURE(d-2); /* P9.4: box typed idx slot before index check */
             _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
-            jit_buf_printf(cb,
-                "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
-                "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
-                               "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
-                "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
-                "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
-                "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
-                "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
-                "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
-                "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
-                "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
-                "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
-                "      _aok%d:; }\n",
-                d-1, d-2, d-3, d-3, pc, pc);
+            if (_pidx_typed) {
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d,_o=_tsv%d; _sp=%d;\n"
+                    "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
+                    "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                    "        uint32_t _ai=(uint32_t)_ti%d;\n"
+                    "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                    "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                    "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                    "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                    "          _FREE(_o); goto _aok%d;}}\n"
+                    "      { int64_t _iv%d=_ti%d;\n"
+                    "        JSValue _idx=((int64_t)(int32_t)_iv%d==_iv%d)\n"
+                    "            ?JS_MKVAL(JS_TAG_INT,(int32_t)_iv%d)\n"
+                    "            :JS_NewFloat64(ctx,(double)_iv%d);\n"
+                    "        int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                    "        _FREE(_o); if(_ret<0) goto _ex; }\n"
+                    "      _aok%d:; }\n",
+                    d-1, d-3, d-3,      /* _v=_tsv{d-1}, _o=_tsv{d-3}, _sp={d-3} */
+                    d-2,                /* _ai=(uint32_t)_ti{d-2} */
+                    pc,                 /* goto _aok */
+                    pc, d-2, pc, pc, pc, pc, /* box _ti{d-2} → _idx */
+                    pc);                /* _aok label */
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
+                    "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                                   "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                    "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                    "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                    "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                    "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                    "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                    "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                    "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
+                    "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                    "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
+                    "      _aok%d:; }\n",
+                    d-1, d-2, d-3, d-3, pc, pc);
+            }
             break;
-        /* P11.8: get_length — result is always a non-negative integer; store in _ti{d-1}.
-         * _RT->get_prop returns JS_TAG_INT for arrays/strings (the overwhelmingly common
-         * case).  Float64 branch handles pathological objects with huge or non-integer
-         * length.  _FREE(_r) is a no-op for immediate values (int/float64). */
+        }
+        /* P38.3: get_length — inline fast path for dense arrays; fall back to get_prop.
+         * Result is always stored in typed int slot _ti{d-1} (no change from P11.8).
+         * Fast path: class_id == JIT_CLASS_ARRAY → direct count field read.
+         * Slow path: any other object → _RT->get_prop (string, proxy, etc.). */
         case OP_get_length:
             _P94_ENSURE(d-1); /* box typed obj slot before JSValue use */
+            _borrowed_depth = -1;
             jit_buf_printf(cb,
-                "    { JSValue _r=_RT->get_prop(ctx,_tsv%d,(JSAtom)%uu);\n"
-                "      _sp=%d; _CHK(_r); _FREE(_tsv%d);\n"
-                "      _ti%d=(JS_VALUE_GET_TAG(_r)==JS_TAG_INT)\n"
-                "           ?(int64_t)JS_VALUE_GET_INT(_r)\n"
-                "           :(int64_t)JS_VALUE_GET_FLOAT64(_r);\n"
-                "      _FREE(_r); _sp=%d; }\n",
-                d-1, (unsigned)JS_ATOM_length, d-1, d-1, d-1, d);
+                "    { JSValue _o=_tsv%d;\n"
+                "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
+                "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY)){\n"
+                "          _ti%d=(int64_t)(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF);\n"
+                "          _FREE(_o); _sp=%d; goto _lenok%d; }}\n"
+                "      { JSValue _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
+                "        _sp=%d; _CHK(_r); _FREE(_o);\n"
+                "        _ti%d=(JS_VALUE_GET_TAG(_r)==JS_TAG_INT)\n"
+                "             ?(int64_t)JS_VALUE_GET_INT(_r)\n"
+                "             :(int64_t)JS_VALUE_GET_FLOAT64(_r);\n"
+                "        _FREE(_r); }\n"
+                "      _lenok%d:; _sp=%d; }\n",
+                d-1,                          /* _o=_tsv{d-1} */
+                d-1,                          /* _ti{d-1} = count (fast path) */
+                d, pc,                        /* _sp after fast; goto label */
+                (unsigned)JS_ATOM_length,     /* atom for slow path */
+                d-1,                          /* _sp before _CHK */
+                d-1,                          /* _ti{d-1} (slow path) */
+                pc, d);                       /* label; _sp after slow path */
             break;
 
         /* ---- Function calls ---- */
@@ -5473,6 +5630,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Return ---- */
         /* P9.2/P9.4: OP_return: box typed slot, pop return value, free remaining stack */
         case OP_return: {
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a return */
             _P94_ENSURE(d-1); /* P9.4: box typed slot before reading as JSValue */
             jit_buf_printf(cb, "    { JSValue _r=_tsv%d; _sp=%d;\n", d-1, d-1);
             /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
@@ -5496,6 +5654,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         /* P9.2: OP_return_undef: free _tsv{0}.._tsv{d-1} and all locals */
         case OP_return_undef: {
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a return */
             jit_buf_str(cb, "    {");
             /* P13.7: heap-promote var_refs before _cap_buf goes out of scope */
             if (sr->has_fclosure) {
@@ -5520,6 +5679,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         /* ---- Throw ---- */
         /* P9.2/P9.4: pop value at _tsv{d-1}, update _sp, then throw */
         case OP_throw:
+            _borrowed_depth = -1; /* P38.1: borrow cannot survive a throw */
             _P94_ENSURE(d-1); /* P9.4: box typed slot before throw */
             jit_buf_printf(cb,
                 "    { JSValue _v=_tsv%d; _sp=%d; _RT->throw_val(ctx,_v);"

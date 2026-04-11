@@ -108,12 +108,12 @@ branch prediction, so it is lower priority than 1–3.
 
 ## Sub-phase Overview
 
-| Sub-phase | Description | Difficulty | Expected gain |
-|---|---|---|---|
-| **P38.1** | Extend `_top_borrowed` peephole: `get_loc → get_array_el` | Low | Eliminates 2 refcount ops per array element access |
-| **P38.2** | Typed index fast path: skip boxing when index is native int | Low-Medium | Eliminates `JS_NewInt32` + tag check per element |
-| **P38.3** | Inline `array.length` fast path in `OP_get_length` | Medium | Replaces helper call with direct memory read for arrays |
-| **P38.4** | Tests, benchmarks, doc update | — | — |
+| Sub-phase | Description | Difficulty | Expected gain | Status |
+|---|---|---|---|---|
+| **P38.1** | Extend `_top_borrowed` peephole: `get_loc arr→get_loc i→get_array_el` | Low | Eliminates 2 refcount ops per array element access (for local vars) | ✓ DONE |
+| **P38.2** | Typed index fast path: skip boxing when index is native int | Low-Medium | Eliminates `JS_NewInt32` + tag check per element | ✓ DONE |
+| **P38.3** | Inline `array.length` fast path in `OP_get_length` | Medium | Replaces helper call with direct memory read for arrays | ✓ DONE |
+| **P38.4** | Tests, benchmarks, doc update | — | — | ✓ DONE |
 
 ---
 
@@ -394,11 +394,15 @@ Focus on `arr_sum(10000) x1e3` (primary target) and verify no regression on
 Update `jit-docs/performance-benchmarks.md` with a P38 Results section.
 Update `jit-docs/phase38-array-access.md` to mark sub-phases ✓ DONE.
 
-Target:
+Actual results (warm AOT, non-LTO build):
 
 | Benchmark | Before P38 | After P38 | Node v24 |
 |---|---:|---:|---:|
-| `arr_sum(10000) x1e3` | 49 ms | < 20 ms | 9 ms |
+| `arr_sum(10000) x1e3` | 49 ms | **40 ms** | 9 ms |
+
+Target was < 20 ms (not reached). Primary limit: `arr_sum` benchmark passes `arr` as a
+function argument (not a local), so P38.1 borrow does not apply. P38.2 (typed index)
+and P38.3 (inline length) contribute ~18% improvement.
 
 ---
 
