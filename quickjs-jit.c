@@ -912,12 +912,25 @@ static uint8_t *jit_infer_types(const uint8_t *bc, int bc_len,
                 _TI_PUSH(a); _TI_PUSH(r); break;
             }
 
-            /* ---- Bitwise: and/or/xor/shl/sar/not always produce ToInt32 → INT.
+            /* ---- Bitwise: and/or/xor/shl/sar/not always produce ToInt32 → INT
+             * when both inputs are already INT.  If either input may be JSVAL
+             * (e.g. a variable that holds a large integer or a non-integer) the
+             * result must be NUMBER so the local that captures it is stored as a
+             * double, which can faithfully represent values up to 2^53.  Using
+             * INT (int64_t) for such a local truncates silently.
              * shr (>>>) produces ToUint32 which may exceed INT32_MAX → NUMBER. */
             case OP_and: case OP_or:  case OP_xor:
-            case OP_shl: case OP_sar: _TI_DROPN(2); _TI_PUSH(JIT_T_INT); break;
-            case OP_shr:               _TI_DROPN(2); _TI_PUSH(JIT_T_NUMBER); break;
-            case OP_not:               _TI_DROPN(1); _TI_PUSH(JIT_T_INT); break;
+            case OP_shl: case OP_sar: {
+                uint8_t _b = _TI_POP(), _a = _TI_POP();
+                _TI_PUSH((_a == JIT_T_INT && _b == JIT_T_INT) ? JIT_T_INT : JIT_T_NUMBER);
+                break;
+            }
+            case OP_shr: _TI_DROPN(2); _TI_PUSH(JIT_T_NUMBER); break;
+            case OP_not: {
+                uint8_t _a = _TI_POP();
+                _TI_PUSH(_a == JIT_T_INT ? JIT_T_INT : JIT_T_NUMBER);
+                break;
+            }
 
             /* ---- Boolean / comparison / typeof → JSVAL ---- */
             /* P18: type-test ops: consume 1, push bool (JSVAL) */
@@ -3326,13 +3339,17 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         case OP_dup1: /* a b -> a a b (insert dup of a below b): depth d -> d+1
                        * _tsv{d-2}=a, _tsv{d-1}=b
-                       * result: _tsv{d-2}=dup(a), _tsv{d-1}=b -> shift b to d, put dup at d-1 */
+                       * result: _tsv{d-2}=a, _tsv{d-1}=dup(a), _tsv{d}=b */
+            /* P9.4: box typed slots — a is DUP'd (_tsv{d-2}), b is moved (_tsv{d-1}) */
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    { JSValue _t=_DUP(_tsv%d);"
                 " _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
                 d-2, d, d-1, d-1, d+1);
             break;
         case OP_dup2: /* a b -> a b a b: depth d -> d+2 */
+            /* P9.4: box typed slots before DUP reads _tsv{d-2} and _tsv{d-1} */
+            _P94_ENSURE(d-2); _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _sp=%d;\n",
                 d, d-2, d+1, d-1, d+2);
@@ -3340,6 +3357,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_insert2: /* obj a -> a obj a (dup_x1): depth d -> d+1
                           * _tsv{d-2}=obj, _tsv{d-1}=a
                           * result: _tsv{d-2}=dup(a), _tsv{d-1}=obj, _tsv{d}=a */
+            /* P9.4: box typed slots — a is DUP'd (_tsv{d-1}), obj is moved (_tsv{d-2}) */
+            _P94_ENSURE(d-1); _P94_ENSURE(d-2);
             jit_buf_printf(cb,
                 "    { JSValue _t=_DUP(_tsv%d);"
                 " _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; _sp=%d; }\n",
@@ -3347,6 +3366,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             break;
         /* OP_pop does not exist; OP_drop handles the pop case */
         case OP_nip: /* a b -> b: depth d -> d-1 */
+            /* P9.4: box typed slots — b is kept (_tsv{d-1}), a is freed (_tsv{d-2}) */
+            _P94_ENSURE(d-1); _P94_ENSURE(d-2);
             jit_buf_printf(cb,
                 "    { JSValue _t=_tsv%d; _FREE(_tsv%d); _tsv%d=_t; _sp=%d; }\n",
                 d-1, d-2, d-2, d-1);
@@ -3360,11 +3381,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 d-1, d-1, d-2, d-2);
             break;
         case OP_rot3l: /* a b c -> b c a: depth unchanged */
+            /* P9.4: box any typed slots before the rotation */
+            _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
                 d-3, d-3, d-2, d-2, d-1, d-1);
             break;
         case OP_rot3r: /* a b c -> c a b: depth unchanged */
+            /* P9.4: box any typed slots before the rotation */
+            _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    { JSValue _t=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_tsv%d; _tsv%d=_t; }\n",
                 d-1, d-1, d-2, d-2, d-3, d-3);
@@ -3372,6 +3397,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
         /* ---- P18: new stack-shuffle opcodes ---- */
         case OP_dup3: /* a b c -> a b c a b c: depth d -> d+3 */
+            /* P9.4: box typed source slots before DUP reads them */
+            _P94_ENSURE(d-3); _P94_ENSURE(d-2); _P94_ENSURE(d-1);
             jit_buf_printf(cb,
                 "    _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _tsv%d=_DUP(_tsv%d); _sp=%d;\n",
                 d, d-3, d+1, d-2, d+2, d-1, d+3);
@@ -7261,13 +7288,69 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             case OP_is_null: case OP_is_undefined: case OP_is_undefined_or_null:
             case OP_typeof_is_undefined: case OP_typeof_is_function:
                 _gs_drop=1; _gs_push=JIT_T_JSVAL; break;
-            /* P18: stack-shuffle ops — must update gen_st[] for existing slots too.
+            /* P18/P9.4: stack-shuffle ops — must update gen_st[] for existing slots too.
              * P94_ENSURE (called in the codegen first-switch) boxes any INT/NUMBER
              * slot to _tsv before the shuffle.  After the shuffle, all involved
              * slots hold JSValues; mark them all JSVAL so the next opcode's
              * P94_ENSURE does not try to re-box a stale _ti value.             */
-            case OP_dup3:   /* a b c -> a b c a b c: +3 */
+            /* --- depth-neutral rotations: mark all involved slots JSVAL --- */
+            case OP_swap:   /* a b -> b a */
+                if (gen_sp >= 2) {
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                break;
+            case OP_rot3l:  /* a b c -> b c a */
+            case OP_rot3r:  /* a b c -> c a b */
+                if (gen_sp >= 3) {
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                break;
+            /* --- dup variants: mark source slots JSVAL, push JSVAL for new slots --- */
+            case OP_dup1: { /* a b -> a a b (+1): a stays, dup(a) at d-1, b at d */
+                if (gen_sp >= 2 && gen_sp < gen_stk_cap) {
+                    /* _P94_ENSURE(d-2) and _P94_ENSURE(d-1) in the codegen section
+                     * boxed BOTH a and b into their _tsv slots before the shuffle.
+                     * After the shuffle, _tsv{d}=_tsv{d-1} holds b's JSValue.
+                     * _ti{d} is stale — mark all three slots JSVAL so subsequent
+                     * opcodes (sub/add INT fast paths, put_loc INT path, etc.) do
+                     * not read the stale _ti{d} register. */
+                    gen_st[gen_sp-2] = JIT_T_JSVAL; /* a: boxed by _P94_ENSURE */
+                    gen_st[gen_sp-1] = JIT_T_JSVAL; /* dup(a) — always JSVAL */
+                    gen_st[gen_sp]   = JIT_T_JSVAL; /* b: boxed by _P94_ENSURE, now in _tsv{d} */
+                    gen_sp++;
+                }
+                break; }
+            case OP_dup2:   /* a b -> a b a b (+2): mark originals JSVAL, push 2 */
+                if (gen_sp >= 2) {
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
+                _gs_push=JIT_T_JSVAL; _gs_push_n=2; break;
+            case OP_dup3:   /* a b c -> a b c a b c (+3): mark originals JSVAL, push 3 */
+                if (gen_sp >= 3) {
+                    gen_st[gen_sp-3] = JIT_T_JSVAL;
+                    gen_st[gen_sp-2] = JIT_T_JSVAL;
+                    gen_st[gen_sp-1] = JIT_T_JSVAL;
+                }
                 _gs_push=JIT_T_JSVAL; _gs_push_n=3; break;
+            /* --- insert2: obj a -> a obj a (+1) --- */
+            case OP_insert2: {
+                if (gen_sp >= 2 && gen_sp < gen_stk_cap) {
+                    /* dup(a) at d-2, obj at d-1, original a at d */
+                    gen_st[gen_sp-2] = JIT_T_JSVAL; /* dup(a) — boxed */
+                    gen_st[gen_sp-1] = JIT_T_JSVAL; /* obj (moved, boxed by _P94_ENSURE) */
+                    gen_st[gen_sp]   = JIT_T_JSVAL; /* original a at top */
+                    gen_sp++;
+                }
+                break; }
+            /* --- nip: a b -> b (-1): mark result slot JSVAL, pop 1 --- */
+            case OP_nip:
+                if (gen_sp >= 2)
+                    gen_st[gen_sp-2] = JIT_T_JSVAL; /* b moved down, boxed */
+                _gs_drop = 1; break;
             case OP_nip1: { /* a b c -> b c: remove slot gen_sp-3, shift down */
                 int s = gen_sp;
                 if (s >= 3) {
