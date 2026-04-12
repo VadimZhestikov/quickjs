@@ -299,26 +299,27 @@ JIT path exactly cancels the bytecode dispatch savings. Two benchmarks show real
 JIT regressions (Crypto −2%, EarleyBoyer −4%); two show real wins (RayTrace +3%,
 Splay +7%).
 
-## Expected Results After P43 Fixes
+## Actual Results After P43 Fixes (2026-04-12)
 
-Starting from the warm-cache baseline (1184):
+All P43 sub-phases complete. Warm-cache measurements (pass 1 = compile,
+pass 2 = measure via `run_qjs.js`):
 
-| Benchmark | JIT warm (now) | After P43.2 | After P43.4 | Node v24 |
-|-----------|---------------|------------|------------|---------|
-| Richards | 1056 | ~1150 | ~1150 | 28175 |
-| DeltaBlue | 933 | ~1100 | ~1100 | 63268 |
-| Crypto | 1216 | ~1250 | ~1350 | 36072 |
-| RayTrace | 1362 | ~1400 | ~1400 | 67043 |
-| EarleyBoyer | 1632 | ~1800 | ~1800 | 54824 |
-| RegExp | 435 | ~435 | ~435 | 8397 |
-| Splay | 2825 | ~2900 | ~2900 | 29883 |
-| **Score** | **1184** | **~1380** | **~1440** | **34595** |
+| Benchmark   | Interpreter | JIT warm | JIT vs Interp | Node v24 | Gap vs Node |
+|-------------|-------------|----------|---------------|----------|-------------|
+| Richards    | 248         | 1268     | +411%         | 28175    | 22×         |
+| DeltaBlue   | 462         | 789      | +71%          | 63268    | 80×         |
+| Crypto      | 805         | 1396     | +73%          | 36072    | 26×         |
+| RayTrace    | 704         | 795      | +13%          | 67043    | 84×         |
+| EarleyBoyer | 545         | 1131     | +107%         | 54824    | 48×         |
+| RegExp      | 197         | 342      | +73%          | 8397     | 25×         |
+| Splay       | 805         | 1524     | +89%          | 29883    | 20×         |
+| **Score**   | **477**     | **941**  | **+97%**      | **34595**| **37×**     |
 
-P43.2 (quadrimorphic IC) is expected to be the dominant improvement (~17%
-overall) by fixing the megamorphic IC miss on EarleyBoyer and DeltaBlue.
-P43.4 (Crypto bit-op audit) is expected to add ~5% on Crypto specifically.
+JIT now beats interpreter by ~2× on the geometric mean. All benchmarks
+show positive JIT speedup (the pre-P43 regressions on Crypto and EarleyBoyer
+are resolved).
 
-The remaining ~24× gap vs Node after P43 is structural:
+The remaining ~37× gap vs Node is structural:
 1. **Object allocation**: QuickJS uses reference-counted GC; Node uses
    a generational heap with bump-pointer young-space allocation
 2. **Unboxed value representation**: V8 uses tagged small integers (31-bit

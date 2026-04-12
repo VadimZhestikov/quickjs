@@ -39,6 +39,7 @@ JS_TESTS := \
     test_jit_p124_closures_async_gen.js \
     test_jit_p43_ic.js \
     test_jit_p43_bitops.js \
+    test_jit_p43_v8bench.js \
     test_jit_p103_argmut.js
 
 PASS_COUNT = 0

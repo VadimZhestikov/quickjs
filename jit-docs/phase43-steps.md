@@ -1,17 +1,18 @@
 # Phase 43 Implementation Steps
 
-## Status (2026-04-11)
+## Status (2026-04-12) — PHASE 43 COMPLETE
 
 | Step | Sub-phase | Status |
 |------|-----------|--------|
 | Measurement harness | P43.1 | **Obsoleted** — `__jit_drain` builtin added instead |
 | Quadrimorphic IC | P43.2 | **Done** (84f18cc) |
-| DupValue inlining audit | P43.3 | Pending |
+| DupValue inlining audit | P43.3 | **Done** (no-op — already fully inlined) |
 | Crypto bit-op audit (INT type prop) | P43.4 | **Done** (d7e56be) |
 | _tsv=JS_UNDEFINED safety fix | P43.5 | **Done** (50e10e0) |
+| INT over-promotion fix + P9.4 shuffles | P43.6 | **Done** (c8c60f1) |
 | Splay investigation | — | **Resolved** — not a real regression |
 | bench_runner.js fix | —  | **Done** (02d04ab) — `__jit_drain` + `js_jit_install_results` |
-| Tests + docs + results | P43.6 | Pending |
+| Tests + docs + results | P43.6 | **Done** (c8c60f1) |
 
 ## Warm-Cache Baseline (2026-04-11, after P41)
 
