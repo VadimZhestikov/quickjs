@@ -460,6 +460,7 @@ typedef struct JSJITScanResult {
     int       has_fclosure;        /* 1 if any OP_fclosure/fclosure8 found */
     uint64_t  captured_local_mask; /* bit i = local i captured by ≥1 inner closure */
     uint64_t  captured_arg_mask;   /* bit i = arg i captured by ≥1 inner closure */
+    uint64_t  mutated_arg_mask;    /* bit i = arg i written by OP_put_arg/OP_set_arg */
     /* P14: try/catch/finally analysis */
     int       has_try;                    /* 1 if any OP_catch/gosub found */
     int       catch_handler_pcs[32];      /* target PC of each OP_catch handler */
@@ -533,6 +534,9 @@ static int scan_is_unsupported(int op)
     }
 }
 
+/* Forward declaration needed by js_jit_scan (full definition appears later). */
+static inline uint16_t bc_u16(const uint8_t *p);
+
 /*
  * js_jit_scan() — run the scan pass on function bytecode b.
  *
@@ -552,6 +556,7 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
     sr->has_fclosure        = 0;
     sr->captured_local_mask = 0;
     sr->captured_arg_mask   = 0;
+    sr->mutated_arg_mask    = 0;
     sr->has_try   = 0;
     sr->n_catch   = 0;
     sr->n_gosub   = 0;
@@ -694,6 +699,21 @@ static int js_jit_scan(JSFunctionBytecode *b, JSJITScanResult *sr)
             /* P29: yield* / async yield* — same suspend/resume machinery as OP_yield */
             sr->has_yield = 1;
             sr->yield_count++;
+        }
+
+        /* Detect OP_put_arg / OP_set_arg: these write back to argv[N], which
+         * violates the P10.3 calling convention (argv is borrowed, not owned).
+         * Track the written arg indices so the code generator can use a local
+         * _arg_cap_buf copy instead of modifying argv[] directly. */
+        {
+            int _maidx = -1;
+            if      (op == OP_put_arg  || op == OP_set_arg)  _maidx = (int)bc_u16(&bc[pc+1]);
+            else if (op == OP_put_arg0 || op == OP_set_arg0) _maidx = 0;
+            else if (op == OP_put_arg1 || op == OP_set_arg1) _maidx = 1;
+            else if (op == OP_put_arg2 || op == OP_set_arg2) _maidx = 2;
+            else if (op == OP_put_arg3 || op == OP_set_arg3) _maidx = 3;
+            if (_maidx >= 0 && _maidx < 64)
+                sr->mutated_arg_mask |= (uint64_t)1 << _maidx;
         }
 
         /* P30: with_* — register conditional-jump target */
@@ -1637,6 +1657,8 @@ void js_jit_install_results(void)
         if (b) {
             /* Bytecode is still alive — install the JIT function. */
             js_jit_fb_set_bc_hash(b, r->bc_hash);
+            /* P10.3: mark safe — fresh-compiled .so always has the version symbol */
+            js_jit_fb_set_p103_safe(b, 1);
             js_jit_fb_set_func(b, r->func, r->handle, 2);
             /* P36.1: register address for sampling profiler */
             jit_registry_add((uintptr_t)r->func, r->bc_hash, r->js_name);
@@ -2040,6 +2062,9 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         for (int _mi = 0; _mi < jit_combined_count; _mi++) {
             if (jit_combined_manifest[_mi].bc_hash == bc_hash) {
                 js_jit_fb_set_bc_hash(b, bc_hash);
+                /* P10.3: combined.so is always freshly compiled with current
+                 * codegen, so mutated_arg_mask protection is guaranteed. */
+                js_jit_fb_set_p103_safe(b, 1);
                 js_jit_fb_set_func(b, jit_combined_manifest[_mi].func_ptr, NULL, 2);
                 /* P36.1: register address for sampling profiler (combined.so path) */
                 jit_registry_add((uintptr_t)jit_combined_manifest[_mi].func_ptr,
@@ -2078,7 +2103,14 @@ void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs
         if (handle) {
             JSJITFunc f = (JSJITFunc)(uintptr_t)dlsym(handle, fname);
             if (f) {
+                /* P10.3: check version symbol — absent means old .so without
+                 * mutated_arg_mask protection; safe flag left 0 in that case. */
+                char cv_sym[64];
+                snprintf(cv_sym, sizeof(cv_sym), "__jit_cv_%016llx",
+                         (unsigned long long)bc_hash);
+                const uint32_t *cv = (const uint32_t *)(uintptr_t)dlsym(handle, cv_sym);
                 js_jit_fb_set_bc_hash(b, bc_hash);
+                js_jit_fb_set_p103_safe(b, cv && *cv == JIT_CODEGEN_VERSION ? 1 : 0);
                 js_jit_fb_set_func(b, f, handle, 2);
                 /* P36.1: register address for sampling profiler (cache-hit path) */
                 jit_registry_add((uintptr_t)f, bc_hash, js_name);
@@ -2302,6 +2334,13 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                           "?JS_VALUE_GET_INT(v):JS_ToBool(ctx,(v)))\n"
     );
 
+    /* P10.3: version marker — lets the loader detect old cached .so files
+     * that lack mutated_arg_mask protection.  If this symbol is present and
+     * equals JIT_CODEGEN_VERSION the function is marked jit_p103_safe=1. */
+    jit_buf_printf(cb,
+        "const uint32_t __jit_cv_%016llx=%uu;\n",
+        (unsigned long long)bc_hash, JIT_CODEGEN_VERSION);
+
     /* Function signature */
     jit_buf_printf(cb,
         "JSValue %s(\n"
@@ -2428,12 +2467,20 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
             /* No var_refs but still has_fclosure (all REF/GLOBAL_REF): emit dummy */
             jit_buf_str(cb, "    JSVarRef **_sf_vrefs=0; (void)_sf_vrefs;\n");
         }
-        /* _arg_cap_buf[arg_idx]: canonical slot for captured arguments.
-         * Initialised with DUP from argv so we own a reference throughout. */
-        if (arg_count > 0 && sr->captured_arg_mask != 0) {
+    }
+    /* _arg_cap_buf[arg_idx]: local copy of captured/mutated arguments.
+     * - Captured args (via captured_arg_mask): JSVarRef pvalue points here.
+     * - Mutated non-captured args (via mutated_arg_mask, non-generator only):
+     *   OP_put_arg writes here instead of argv[], keeping argv[] immutable for
+     *   the P10.3 direct-call convention (argv is borrowed, not owned by callee).
+     * Initialised with DUP from argv so we own a reference throughout. */
+    if (sr && arg_count > 0) {
+        uint64_t _eff_am = sr->captured_arg_mask |
+                           (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+        if (_eff_am != 0) {
             jit_buf_printf(cb, "    JSValue _arg_cap_buf[%d];\n", arg_count);
             for (int j = 0; j < arg_count && j < 64; j++) {
-                if ((sr->captured_arg_mask >> j) & 1)
+                if ((_eff_am >> j) & 1)
                     jit_buf_printf(cb,
                         "    _arg_cap_buf[%d]=(%d<argc)?_DUP(argv[%d]):JS_UNDEFINED;\n",
                         j, j, j);
@@ -2569,11 +2616,13 @@ static void gen_footer(JSJITCodeBuf *cb, int var_count,
         for (int j = 0; j < var_count && j < 64; j++)
             if ((sr->captured_local_mask >> j) & 1)
                 jit_buf_printf(cb, "    _FREE(_cap_buf[%d]);\n", j);
-        if (arg_count > 0) {
-            for (int j = 0; j < arg_count && j < 64; j++)
-                if ((sr->captured_arg_mask >> j) & 1)
-                    jit_buf_printf(cb, "    _FREE(_arg_cap_buf[%d]);\n", j);
-        }
+    }
+    if (sr && arg_count > 0) {
+        uint64_t _eff_am = sr->captured_arg_mask |
+                           (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+        for (int j = 0; j < arg_count && j < 64; j++)
+            if ((_eff_am >> j) & 1)
+                jit_buf_printf(cb, "    _FREE(_arg_cap_buf[%d]);\n", j);
     }
     jit_buf_str(cb, "_ex:\n");
     /* P14: catch dispatch — if there is an active catch handler, redirect to it
@@ -2594,6 +2643,24 @@ static void gen_footer(JSJITCodeBuf *cb, int var_count,
             "          }\n"
             "        }\n"
             "    }\n");
+    }
+    /* P43.6: on final exception exit (all catch handlers exhausted or no handler):
+     * close var_refs so captured locals are heap-promoted, then free shadow arrays.
+     * js_jit_close_caps is idempotent; _cap_buf[j] is initialized to JS_UNDEFINED
+     * so _FREE is always safe even if the slot was never written. */
+    if (sr && sr->has_fclosure) {
+        if (var_ref_count > 0)
+            jit_buf_printf(cb, "    js_jit_close_caps(ctx,_sf_vrefs,%d);\n", var_ref_count);
+        for (int j = 0; j < var_count && j < 64; j++)
+            if ((sr->captured_local_mask >> j) & 1)
+                jit_buf_printf(cb, "    _FREE(_cap_buf[%d]);\n", j);
+    }
+    if (sr && arg_count > 0) {
+        uint64_t _eff_am = sr->captured_arg_mask |
+                           (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+        for (int j = 0; j < arg_count && j < 64; j++)
+            if ((_eff_am >> j) & 1)
+                jit_buf_printf(cb, "    _FREE(_arg_cap_buf[%d]);\n", j);
     }
     for (int j = 0; j < var_count; j++)
         jit_buf_printf(cb, "    _FREE(_jsv_%s);\n", varnames[arg_count + j]);
@@ -3390,8 +3457,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 /* P11.6: INT locals use _ti{d}, NUMBER locals use _tsd{d}, JSVAL use _tsv{d}. */
 #define _CAP_LOC(idx) (sr->has_fclosure && (idx) >= 0 && (idx) < 64 && \
                        (((sr->captured_local_mask) >> (idx)) & 1))
-#define _CAP_ARG(idx) (sr->has_fclosure && (idx) >= 0 && (idx) < 64 && \
-                       (((sr->captured_arg_mask) >> (idx)) & 1))
+/* _CAP_ARG: true when arg idx should be accessed via _arg_cap_buf[] instead of argv[].
+ * Covers both closure-captured args and (for non-generator functions) args written by
+ * OP_put_arg/OP_set_arg — the latter use a local copy to keep argv[] immutable so the
+ * P10.3 direct-call path (which lends argv to the callee) cannot double-free. */
+#define _CAP_ARG(idx) ((idx) >= 0 && (idx) < 64 && \
+                       (((sr->captured_arg_mask | \
+                          (sr->has_yield ? 0ULL : sr->mutated_arg_mask)) >> (idx)) & 1))
 
 #define GEN_GET_LOC(idx) do { \
     if (_IS_INT(idx)) \
@@ -3476,9 +3548,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, d-1, LNAME(idx)); \
     } else if (_CAP_LOC(idx)) { \
+        /* P13: captured local — pop into canonical _cap_buf shadow slot. */ \
         _P94_ENSURE(d-1); \
-        jit_buf_printf(cb, "    _FREE(_cap_buf[%d]); _cap_buf[%d]=_tsv%d; _sp=%d;\n", \
-                       (idx), (idx), d-1, d-1); \
+        jit_buf_printf(cb, "    { _FREE(_cap_buf[%d]); _cap_buf[%d]=_tsv%d; _sp=%d; }\n", \
+                       idx, idx, d-1, d-1); \
     } else { \
         _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_tsv%d; _sp=%d;\n", \
@@ -3508,9 +3581,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             " _jsd_%s=(JS_VALUE_GET_TAG(_t)==JS_TAG_INT)" \
             "?(double)JS_VALUE_GET_INT(_t):JS_VALUE_GET_FLOAT64(_t); }\n", d-1, LNAME(idx)); \
     } else if (_CAP_LOC(idx)) { \
+        /* P13: captured local — peek into canonical _cap_buf shadow slot (no pop). */ \
         _P94_ENSURE(d-1); \
-        jit_buf_printf(cb, "    _FREE(_cap_buf[%d]); _cap_buf[%d]=_DUP(_tsv%d);\n", \
-                       (idx), (idx), d-1); \
+        jit_buf_printf(cb, "    { _FREE(_cap_buf[%d]); _cap_buf[%d]=_DUP(_tsv%d); }\n", \
+                       idx, idx, d-1); \
     } else { \
         _P94_ENSURE(d-1); /* P9.4: box typed slot before storing as JSValue */ \
         jit_buf_printf(cb, "    _FREE(_jsv_%s); _jsv_%s=_DUP(_tsv%d);\n", \
@@ -5405,9 +5479,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
             }
             break;
         }
-        /* P38.3: get_length — inline fast path for dense arrays; fall back to get_prop.
+        /* P38.3: get_length — inline fast path for JS Arrays; fall back to get_prop.
          * Result is always stored in typed int slot _ti{d-1} (no change from P11.8).
-         * Fast path: class_id == JIT_CLASS_ARRAY → direct count field read.
+         * Fast path: class_id == JIT_CLASS_ARRAY → read prop[0].u.value (= length).
+         *   NOTE: u.array.count is the internal allocated-element count, NOT the JS
+         *   length property.  new Array(n) sets length=n but count=0.  We must read
+         *   prop[0] (the length property value stored by set_array_length) instead.
          * Slow path: any other object → _RT->get_prop (string, proxy, etc.). */
         case OP_get_length:
             _P94_ENSURE(d-1); /* box typed obj slot before JSValue use */
@@ -5417,7 +5494,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
                 "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
                 "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY)){\n"
-                "          _ti%d=(int64_t)(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF);\n"
+                "          { JSValue *_lpp=*(JSValue**)(_op+JIT_OBJ_PROP_OFF);\n"
+                "            _ti%d=(JS_VALUE_GET_TAG(_lpp[0])==JS_TAG_INT)\n"
+                "                 ?(int64_t)(uint32_t)JS_VALUE_GET_INT(_lpp[0])\n"
+                "                 :(int64_t)JS_VALUE_GET_FLOAT64(_lpp[0]); }\n"
                 "          _FREE(_o); _sp=%d; goto _lenok%d; }}\n"
                 "      { JSValue _r=_RT->get_prop(ctx,_o,(JSAtom)%uu);\n"
                 "        _sp=%d; _CHK(_r); _FREE(_o);\n"
@@ -5427,7 +5507,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 "        _FREE(_r); }\n"
                 "      _lenok%d:; _sp=%d; }\n",
                 d-1,                          /* _o=_tsv{d-1} */
-                d-1,                          /* _ti{d-1} = count (fast path) */
+                d-1,                          /* _ti{d-1} = length from prop[0] (fast path) */
                 d, pc,                        /* _sp after fast; goto label */
                 (unsigned)JS_ATOM_length,     /* atom for slow path */
                 d-1,                          /* _sp before _CHK */
@@ -5744,10 +5824,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
                     if ((sr->captured_local_mask >> _cf) & 1)
                         jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
-                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
-                    if ((sr->captured_arg_mask >> _cf) & 1)
-                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
             }
+            { uint64_t _eff_am = sr->captured_arg_mask |
+                                 (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+              for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                if ((_eff_am >> _cf) & 1)
+                    jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf); }
             /* Free remaining stack slots and locals, then return */
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
@@ -5810,10 +5892,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
                     if ((sr->captured_local_mask >> _cf) & 1)
                         jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
-                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
-                    if ((sr->captured_arg_mask >> _cf) & 1)
-                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
             }
+            { uint64_t _eff_am = sr->captured_arg_mask |
+                                 (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+              for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                if ((_eff_am >> _cf) & 1)
+                    jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf); }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
@@ -5874,10 +5958,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
                     if ((sr->captured_local_mask >> _cf) & 1)
                         jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", _cf);
-                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
-                    if ((sr->captured_arg_mask >> _cf) & 1)
-                        jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf);
             }
+            { uint64_t _eff_am = sr->captured_arg_mask |
+                                 (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+              for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                if ((_eff_am >> _cf) & 1)
+                    jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", _cf); }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n",
                                varnames[arg_count+_jf]); }
@@ -5897,10 +5983,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 for (int _cf = 0; _cf < var_count && _cf < 64; _cf++)
                     if ((sr->captured_local_mask >> _cf) & 1)
                         jit_buf_printf(cb, " _FREE(_cap_buf[%d]);", _cf);
-                for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
-                    if ((sr->captured_arg_mask >> _cf) & 1)
-                        jit_buf_printf(cb, " _FREE(_arg_cap_buf[%d]);", _cf);
             }
+            { uint64_t _eff_am = sr->captured_arg_mask |
+                                 (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+              for (int _cf = 0; _cf < arg_count && _cf < 64; _cf++)
+                if ((_eff_am >> _cf) & 1)
+                    jit_buf_printf(cb, " _FREE(_arg_cap_buf[%d]);", _cf); }
             { int _jf; for (_jf=0; _jf<var_count; _jf++)
                 jit_buf_printf(cb, " _FREE(_jsv_%s);",
                                varnames[arg_count+_jf]); }
@@ -6275,12 +6363,12 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 for (j = 0; j < var_count && j < 64; j++)
                     if ((sr->captured_local_mask >> j) & 1)
                         jit_buf_printf(cb, "      _FREE(_cap_buf[%d]);\n", j);
-                if (sr->captured_arg_mask != 0) {
-                    for (j = 0; j < arg_count && j < 64; j++)
-                        if ((sr->captured_arg_mask >> j) & 1)
-                            jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", j);
-                }
             }
+            { uint64_t _eff_am = sr->captured_arg_mask |
+                                 (sr->has_yield ? 0ULL : sr->mutated_arg_mask);
+              for (j = 0; j < arg_count && j < 64; j++)
+                if ((_eff_am >> j) & 1)
+                    jit_buf_printf(cb, "      _FREE(_arg_cap_buf[%d]);\n", j); }
             for (j = 0; j < var_count; j++)
                 jit_buf_printf(cb, "      _FREE(_jsv_%s);\n", LNAME(j));
             jit_buf_str(cb,
@@ -7822,6 +7910,8 @@ static int jit_install_combined_pass(void)
         uint8_t old_tier = js_jit_fb_get_tier(b);
         /* Install with handle=NULL so js_jit_free_bytecode skips it */
         js_jit_fb_set_bc_hash(b, jit_combined_manifest[i].bc_hash);
+        /* P10.3: combined.so is always freshly compiled with current codegen */
+        js_jit_fb_set_p103_safe(b, 1);
         js_jit_fb_set_func(b, jit_combined_manifest[i].func_ptr, NULL, 2);
         /* P36.1: register address for sampling profiler (combined-pass path) */
         jit_registry_add((uintptr_t)jit_combined_manifest[i].func_ptr,

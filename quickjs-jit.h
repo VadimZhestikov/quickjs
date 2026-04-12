@@ -313,6 +313,7 @@ JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b);
 void      js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f,
                               void *handle, int tier);
 void      js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash);
+void      js_jit_fb_set_p103_safe(JSFunctionBytecode *b, int v);
 int       js_jit_fb_inc_count(JSFunctionBytecode *b);
 int       js_jit_fb_get_call_count(JSFunctionBytecode *b);
 /* Bytecode / metadata accessors for the code generator */
@@ -950,6 +951,12 @@ int  js_jit_get_threshold(void);
 #ifndef JIT_MAX_BC_LEN
 #define JIT_MAX_BC_LEN 32768
 #endif
+
+/* P10.3: version marker embedded in every generated .so.
+ * Old .so files (compiled without mutated_arg_mask protection) lack this
+ * symbol and are treated as p103_safe=0, disabling direct JIT-to-JIT calls.
+ * Bump when the generated C calling convention changes. */
+#define JIT_CODEGEN_VERSION 2u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

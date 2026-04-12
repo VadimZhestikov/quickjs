@@ -652,11 +652,13 @@ typedef struct JSFunctionBytecode {
     uint8_t has_debug : 1;
     uint8_t read_only_bytecode : 1;
     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
-    /* XXX: 10 bits available */
+    /* XXX: 7 bits available */
 #ifdef CONFIG_JIT
-    /* JIT state — 2 bits consumed from the 10 available */
+    /* JIT state — 4 bits consumed from the 10 available */
     uint8_t jit_no_compile : 1; /* permanently excluded from JIT */
     uint8_t jit_tier : 2;       /* 0=interp, 1=TCC compiled, 2=GCC compiled */
+    uint8_t jit_p103_safe : 1;  /* P10.3: 1 = .so compiled with mutated_arg_mask
+                                 * protection; safe for direct JIT-to-JIT calls. */
 #endif
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
@@ -6295,7 +6297,12 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                 JS_MarkValue(rt, *var_ref->pvalue, mark_func);
             } else {
                 JSStackFrame *sf = var_ref->stack_frame;
-                if (sf->js_mode & JS_MODE_ASYNC) {
+                if (sf == NULL) {
+                    /* P13: JIT-created open var_ref (is_detached=0, stack_frame=NULL):
+                     * pvalue points to a variable on the JIT C-stack.  There is no
+                     * JSStackFrame GC-root to cover it, so mark *pvalue directly. */
+                    JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+                } else if (sf->js_mode & JS_MODE_ASYNC) {
                     JSAsyncFunctionState *async_func = container_of(sf, JSAsyncFunctionState, frame);
                     mark_func(rt, &async_func->header);
                 }
@@ -15701,6 +15708,10 @@ void     js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash)
 {
     b->jit_bc_hash = hash;
 }
+void     js_jit_fb_set_p103_safe(JSFunctionBytecode *b, int v)
+{
+    b->jit_p103_safe = v ? 1 : 0;
+}
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
 int      js_jit_fb_get_call_count(JSFunctionBytecode *b) { return b->jit_call_count; }
 
@@ -15745,6 +15756,11 @@ int js_jit_check_and_extract(JSValue func, JSJITFunc expected,
     JSObject *p = JS_VALUE_GET_OBJ(func);
     if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) return 0;
     JSFunctionBytecode *b = p->u.func.function_bytecode;
+    /* P10.3 safety: only use direct call if callee was compiled with
+     * mutated_arg_mask protection (jit_p103_safe=1).  Old cached .so
+     * files compiled without that protection write to argv[] directly,
+     * which would double-free the caller's _ca[] values. */
+    if (!b->jit_p103_safe) return 0;
     JSJITFunc jf = __atomic_load_n(&b->jit_func, __ATOMIC_ACQUIRE);
     if (jf != expected) return 0;
     *cpool_out    = b->cpool;
@@ -19620,7 +19636,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->var_refs    = NULL;              /* var_ref_count==0: never accessed */
             rt->current_stack_frame = sf;
             ctx = b->realm;                      /* must switch to callee's realm */
-            JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, b->arg_count,
+            /* Variadic functions (arg_count==0) use arguments object built from
+             * argc/argv; must pass real argc so js_build_arguments creates the
+             * correct number of elements.  Fixed-arity functions pass arg_count
+             * so that GEN_PUT_ARG range checks succeed for all declared slots
+             * (matching the behaviour of the standard JIT hot-path below). */
+            int _argc41 = b->arg_count > 0 ? b->arg_count : argc;
+            JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, _argc41,
                                    argv, b->cpool, p->u.func.var_refs);
             rt->current_stack_frame = sf->prev_frame;
             /* close_var_refs() is a no-op when var_ref_count==0 — skip it. */
