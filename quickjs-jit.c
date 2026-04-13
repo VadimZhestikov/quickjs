@@ -1949,7 +1949,8 @@ void js_jit_schedule_warm_recompile(JSContext *ctx, JSFunctionBytecode *b)
     uint16_t n_gf = js_jit_fb_get_n_gf(b);
     uint8_t  n_ae = js_jit_fb_get_n_ae(b);
     uint16_t n_pf = js_jit_fb_get_n_pf(b); /* P48 */
-    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf;
+    uint16_t n_vr = js_jit_fb_get_n_vr(b); /* P49 */
+    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf + (int)n_vr;
     if (n_hints == 0) return;
 
     /* Look up exported val_tag hints from the cold .so */
@@ -2457,7 +2458,7 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          const JSJITScanResult *sr,
                          int var_ref_count,
                          JSFunctionBytecode *b,
-                         int n_gf, int n_ae, int n_pf)
+                         int n_gf, int n_ae, int n_pf, int n_vr)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -2500,14 +2501,15 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         "const uint32_t __jit_cv_%016llx=%uu;\n",
         (unsigned long long)bc_hash, JIT_CODEGEN_VERSION);
 
-    /* P45b/P46/P48: exported val_tag hints array.
-     * Layout: [0..n_gf-1] = OP_get_field hints,
-     *         [n_gf..n_gf+n_ae-1] = OP_get_array_el hints,
-     *         [n_gf+n_ae..n_gf+n_ae+n_pf-1] = OP_put_field write-value hints (P48).
+    /* P45b/P46/P48/P49: exported val_tag hints array.
+     * Layout: [0..n_gf-1]                      = OP_get_field hints,
+     *         [n_gf..n_gf+n_ae-1]              = OP_get_array_el hints,
+     *         [n_gf+n_ae..n_gf+n_ae+n_pf-1]   = OP_put_field write-value hints (P48),
+     *         [n_gf+n_ae+n_pf..+n_vr-1]        = OP_get_var_ref* cell hints (P49).
      * Updated at runtime; dlsym'd by js_jit_schedule_warm_recompile() after
      * JIT_WARM_THRESHOLD_GCC calls.  BSS-zero; 0 == JS_TAG_INT (default hint).
      * Only emitted when the function has at least one tracked opcode. */
-    int n_hints = n_gf + n_ae + n_pf;
+    int n_hints = n_gf + n_ae + n_pf + n_vr;
     if (n_hints > 0)
         jit_buf_printf(cb,
             "uint8_t __jit_vt_%016llx[%d];\n",
@@ -2917,7 +2919,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     const uint8_t *vt_hints, /* P45b: val_tag hints or NULL */
                     int n_gf,               /* P45b: OP_get_field count */
                     int n_ae,               /* P46: OP_get_array_el count */
-                    int n_pf)               /* P48: OP_put_field count */
+                    int n_pf,               /* P48: OP_put_field count */
+                    int n_vr)               /* P49: OP_get_var_ref* count */
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -2935,6 +2938,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     /* P48: put_field index counter for __jit_vt_HASH[] write-value hints.
      * Indices n_gf+n_ae..n_gf+n_ae+n_pf-1; incremented in secondary gen_st switch. */
     int pf_idx = 0;
+    /* P49: get_var_ref index counter for __jit_vt_HASH[] cell hints.
+     * Indices n_gf+n_ae+n_pf..n_gf+n_ae+n_pf+n_vr-1; incremented in secondary gen_st switch. */
+    int vr_idx = 0;
 
     /* P14: compile-time tracking of catch placeholder stack depths.
      * OP_catch pushes JS_UNDEFINED as a placeholder at slot d and increments
@@ -4018,8 +4024,27 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
  * P40.2: use _vrp{idx} (pvalue pointer cached in preamble) instead of a vtable
  * call.  JSVarRef is an opaque type in generated C; _vrp{idx} was set up in
  * the preamble via JIT_VARREF_PVALUE_OFF so no complete-type access is needed. */
-#define GEN_GET_VR(idx) \
-    jit_buf_printf(cb, "    _tsv%d=_DUP(*_vrp%d); _sp=%d;\n", d, idx, d+1)
+/* P49: warm INT — skip DupValue (INT is immediate), extract INT from var_ref cell.
+ * Cold/JSVAL: observe cell tag for warm recompile, read with DupValue. */
+#define GEN_GET_VR(idx) do { \
+    if (vt_hints \
+        && (n_gf + n_ae + n_pf + vr_idx) < (n_gf + n_ae + n_pf + n_vr) \
+        && vt_hints[n_gf + n_ae + n_pf + vr_idx] == 0 /* JS_TAG_INT */) { \
+        /* Warm INT: speculative — valid when gen_state later tracks this slot as INT. */ \
+        jit_buf_printf(cb, \
+            "    _ti%d=(int64_t)JS_VALUE_GET_INT(*_vrp%d); _sp=%d;\n", \
+            d, (idx), d+1); \
+    } else { \
+        /* Cold/JSVAL: read cell once, record tag, DupValue. */ \
+        jit_buf_printf(cb, \
+            "    { JSValue _rv%d=*_vrp%d;" \
+            " __jit_vt_%016llx[%d]=(uint8_t)JS_VALUE_GET_TAG(_rv%d);" \
+            " _tsv%d=_DUP(_rv%d); _sp=%d; }\n", \
+            pc, (idx), \
+            (unsigned long long)bc_hash, n_gf + n_ae + n_pf + vr_idx, pc, \
+            d, pc, d+1); \
+    } \
+} while(0)
 /* P40.3: when the source slot is a raw int64_t (_ti{d-1}), skip boxing with
  * _P94_ENSURE and store JS_MKVAL(TAG_INT, ...) directly.  The js_unlikely hint
  * on the refcount branch lets GCC eliminate it for integer old values. */
@@ -7880,11 +7905,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 }
                 break;
             }
-            /* get_var_ref* also push JSVAL (never self-func) */
+            /* P49: get_var_ref* — INT hint → gen_st=INT so downstream ops use fast paths. */
             case OP_get_var_ref: case OP_get_var_ref_check:
             case OP_get_var_ref0: case OP_get_var_ref1:
-            case OP_get_var_ref2: case OP_get_var_ref3:
-                _gs_push = JIT_T_JSVAL; break;
+            case OP_get_var_ref2: case OP_get_var_ref3: {
+                int _p49_gst = (vt_hints
+                                && (n_gf + n_ae + n_pf + vr_idx) < (n_gf + n_ae + n_pf + n_vr)
+                                && vt_hints[n_gf + n_ae + n_pf + vr_idx] == 0 /* JS_TAG_INT */)
+                               ? JIT_T_INT : JIT_T_JSVAL;
+                _gs_push = _p49_gst;
+                vr_idx++;
+                break;
+            }
 
             /* --- get_length: P11.8 — always INT (stored in _ti, not _tsv/_tsd) --- */
             case OP_get_length: _gs_drop=1; _gs_push=JIT_T_INT; break;
@@ -8465,13 +8497,18 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    /* P45b/P46/P48: count OP_get_field, OP_get_array_el, OP_put_field for __jit_vt_ array. */
-    int n_gf = 0, n_ae = 0, n_pf = 0;
+    /* P45b/P46/P48/P49: count tracked opcodes for __jit_vt_ array. */
+    int n_gf = 0, n_ae = 0, n_pf = 0, n_vr = 0;
     for (int _pc = 0; _pc < bc_len; ) {
         int _op = bc[_pc];
         if (_op == OP_get_field)   n_gf++;
         if (_op == OP_get_array_el) n_ae++;
         if (_op == OP_put_field)   n_pf++;  /* P48 */
+        /* P49: count all get_var_ref variants */
+        if (_op == OP_get_var_ref || _op == OP_get_var_ref_check ||
+            _op == OP_get_var_ref0 || _op == OP_get_var_ref1 ||
+            _op == OP_get_var_ref2 || _op == OP_get_var_ref3)
+            n_vr++;
         _pc += (_op < op_sz_count) ? op_sz[_op] : 1;
     }
     if (n_gf > 0 && n_gf <= 0xFFFF)
@@ -8480,19 +8517,21 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         js_jit_fb_set_n_ae(b, (uint8_t)n_ae);
     if (n_pf > 0 && n_pf <= 0xFFFF)
         js_jit_fb_set_n_pf(b, (uint16_t)n_pf); /* P48 */
+    if (n_vr > 0 && n_vr <= 0xFFFF)
+        js_jit_fb_set_n_vr(b, (uint16_t)n_vr); /* P49 */
     /* P45b: read val_tag hints set by js_jit_schedule_warm_recompile(). */
     const uint8_t *vt_hints = js_jit_fb_get_vt_hints(b);
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
                  local_type, js_func_name, varnames, &sr, var_ref_count, b,
-                 n_gf, n_ae, n_pf);
+                 n_gf, n_ae, n_pf, n_vr);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
                  bc_hash, varnames, var_jit_hash, var_ref_count,
-                 vt_hints, n_gf, n_ae, n_pf) < 0) {
+                 vt_hints, n_gf, n_ae, n_pf, n_vr) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

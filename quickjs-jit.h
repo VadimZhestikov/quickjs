@@ -325,6 +325,9 @@ void      js_jit_fb_set_n_ae(JSFunctionBytecode *b, uint8_t n);
 /* P48: put_field count */
 uint16_t  js_jit_fb_get_n_pf(JSFunctionBytecode *b);
 void      js_jit_fb_set_n_pf(JSFunctionBytecode *b, uint16_t n);
+/* P49: get_var_ref* count */
+uint16_t  js_jit_fb_get_n_vr(JSFunctionBytecode *b);
+void      js_jit_fb_set_n_vr(JSFunctionBytecode *b, uint16_t n);
 uint8_t   js_jit_fb_get_warm_done(JSFunctionBytecode *b);
 void      js_jit_fb_set_warm_done(JSFunctionBytecode *b);
 uint8_t  *js_jit_fb_get_vt_hints(JSFunctionBytecode *b);
@@ -985,7 +988,7 @@ int  js_jit_get_threshold(void);
  *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result,
  *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field.
  *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints. */
-#define JIT_CODEGEN_VERSION 7u
+#define JIT_CODEGEN_VERSION 8u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 
