@@ -504,7 +504,8 @@ typedef struct {
                          * reallocated for a different layout, the atom at this
                          * slot will differ, preventing false IC hits. */
     uint8_t   kind;     /* 0=general, 1=float64 typed slot (P8.6) */
-    uint8_t   _pad[3];  /* explicit padding to align shape_gen at natural boundary */
+    uint8_t   val_tag;  /* JS_VALUE_GET_TAG(value) at IC fill time; JS_TAG_UNDEFINED=unknown/mixed (P45) */
+    uint8_t   _pad[2];  /* explicit padding to align shape_gen at natural boundary */
     uint32_t  shape_gen;/* JSShape generation counter — within-runtime shape ABA guard:
                          * if a JSShape is freed and a new one is allocated at the same
                          * address, the new shape gets a higher shape_gen (mod 2^32),
@@ -957,8 +958,9 @@ int  js_jit_get_threshold(void);
  * symbol and are treated as p103_safe=0, disabling direct JIT-to-JIT calls.
  * Bump when the generated C calling convention or code-generation changes.
  * History: 1=initial, 2=P10.3 arg-mask, 3=P44 mixed-type arithmetic,
- *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result. */
-#define JIT_CODEGEN_VERSION 4u
+ *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result,
+ *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field. */
+#define JIT_CODEGEN_VERSION 5u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

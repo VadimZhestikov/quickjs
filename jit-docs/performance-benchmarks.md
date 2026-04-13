@@ -214,7 +214,24 @@ Measured improvement (warm JIT cache, `--jit-threshold-gcc=1`):
 | arr\_sum(10000) x1e3 | 55 | 54 | 1.0× (accumulator stays JSVAL) |
 
 See `jit_perf_tests/RESULTS_P44.md` for detailed analysis.
-| Arithmetic loops | 1.1–1.5× | Minimal — nearly at parity | Minor register allocation improvements |
+
+### 4.11 P45 — IC val_tag Groundwork
+
+P45 added a `val_tag` field to `JSJITICEntry` to record `JS_VALUE_GET_TAG(value)`
+at IC fill time. The IC hit path now explicitly skips `JS_DupValue` for INT-tagged
+properties (which already had no refcount to increment, so this is a code-clarity
+improvement rather than a runtime speedup).
+
+The planned `gen_st=INT` propagation for `OP_get_field` — which would allow
+downstream arithmetic on INT properties to use the fully-typed INT fast path —
+requires knowing `val_tag` at codegen time.  Since static IC entries are
+zero-initialized on every `.so` load, `val_tag` is only available after the first
+JIT call.  A **warm-IC recompile pass** (P45b) is needed to leverage this data.
+
+**Net performance impact: ~0%** (val_tag is infrastructure, not yet used by
+downstream codegen).  See `jit_perf_tests/RESULTS_P45.md` for measurements.
+
+`JIT_CODEGEN_VERSION` bumped from 4 to 5.
 
 ---
 
