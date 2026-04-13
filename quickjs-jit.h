@@ -955,8 +955,10 @@ int  js_jit_get_threshold(void);
 /* P10.3: version marker embedded in every generated .so.
  * Old .so files (compiled without mutated_arg_mask protection) lack this
  * symbol and are treated as p103_safe=0, disabling direct JIT-to-JIT calls.
- * Bump when the generated C calling convention changes. */
-#define JIT_CODEGEN_VERSION 2u
+ * Bump when the generated C calling convention or code-generation changes.
+ * History: 1=initial, 2=P10.3 arg-mask, 3=P44 mixed-type arithmetic,
+ *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result. */
+#define JIT_CODEGEN_VERSION 4u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

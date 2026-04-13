@@ -195,6 +195,25 @@ These two modes are **statistically indistinguishable** across all benchmarks (w
 | Recursive calls | 3.0× | Trampoline overhead | Direct JIT-to-JIT call without interpreter |
 | Array reads | 5.3× | `GetPropertyInt64` helper call | Inline dense-array fast path |
 | String ops | 8.4× | Allocating concat | No feasible change without rope strings |
+
+### 4.10 P44 — Mixed-Type Arithmetic Fast Paths
+
+P44 added half-typed code paths for arithmetic and comparisons when one operand
+is statically typed (INT or NUMBER) and the other is JSVAL. The main gain comes
+from **P44.4 comparisons**: loop conditions like `i < n` where the counter `i`
+is INT-typed and `n` is a JSVAL argument now use a direct integer comparison
+instead of boxing `i` as a JSValue and dispatching through the vtable.
+
+Measured improvement (warm JIT cache, `--jit-threshold-gcc=1`):
+
+| Benchmark | P43 (ms) | P44 (ms) | Speedup |
+|---|---|---|---|
+| sum\_loop(1e6) | 41 | 19 | **2.2×** |
+| sum\_sq(1e6) | 40 | 13 | **3.1×** |
+| fib(30) | 35 | 34 | 1.0× (no regression) |
+| arr\_sum(10000) x1e3 | 55 | 54 | 1.0× (accumulator stays JSVAL) |
+
+See `jit_perf_tests/RESULTS_P44.md` for detailed analysis.
 | Arithmetic loops | 1.1–1.5× | Minimal — nearly at parity | Minor register allocation improvements |
 
 ---
