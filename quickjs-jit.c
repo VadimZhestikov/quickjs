@@ -2340,6 +2340,7 @@ do_compile:;
     job->c_src   = cb.buf;   /* transfer buffer ownership to job */
     cb.buf       = NULL;     /* prevent double-free if jit_buf_free is called */
     job->bc_hash = bc_hash;
+    job->is_warm = 0;        /* P45b: must be explicit — malloc does not zero-init */
     memcpy(job->fname, fname, sizeof(job->fname));
     strncpy(job->js_name, js_name ? js_name : "", sizeof(job->js_name) - 1);
     job->js_name[sizeof(job->js_name) - 1] = '\0';
