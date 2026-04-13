@@ -313,9 +313,20 @@ JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b);
 void      js_jit_fb_set_func(JSFunctionBytecode *b, JSJITFunc f,
                               void *handle, int tier);
 void      js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash);
+uint64_t  js_jit_fb_get_bc_hash(JSFunctionBytecode *b);
 void      js_jit_fb_set_p103_safe(JSFunctionBytecode *b, int v);
 int       js_jit_fb_inc_count(JSFunctionBytecode *b);
 int       js_jit_fb_get_call_count(JSFunctionBytecode *b);
+/* P45b: warm-IC recompile accessors */
+uint16_t  js_jit_fb_get_n_gf(JSFunctionBytecode *b);
+void      js_jit_fb_set_n_gf(JSFunctionBytecode *b, uint16_t n);
+uint8_t   js_jit_fb_get_warm_done(JSFunctionBytecode *b);
+void      js_jit_fb_set_warm_done(JSFunctionBytecode *b);
+uint8_t  *js_jit_fb_get_vt_hints(JSFunctionBytecode *b);
+void      js_jit_fb_set_vt_hints(JSFunctionBytecode *b, uint8_t *hints);
+void      js_jit_fb_set_warm_handle(JSFunctionBytecode *b, void *h);
+void     *js_jit_fb_get_warm_handle(JSFunctionBytecode *b);
+void      js_jit_fb_set_warm_func(JSFunctionBytecode *b, JSJITFunc f);
 /* Bytecode / metadata accessors for the code generator */
 const uint8_t *js_jit_fb_get_bytecode(JSFunctionBytecode *b, int *len);
 int            js_jit_fb_get_arg_count(JSFunctionBytecode *b);
@@ -892,6 +903,14 @@ void js_jit_free(void);
 void js_jit_queue_gcc(JSContext *ctx, JSFunctionBytecode *b, JSVarRef **var_refs);
 
 /*
+ * js_jit_schedule_warm_recompile() — P45b warm-IC recompile trigger.
+ * Called from JS_CallInternal after JIT_WARM_THRESHOLD_GCC warm calls.
+ * Reads __jit_vt_HASH from the cold .so, copies INT hints, and queues a
+ * second GCC compilation that uses INT-typed gen_st for INT-hinted get_field.
+ */
+void js_jit_schedule_warm_recompile(JSContext *ctx, JSFunctionBytecode *b);
+
+/*
  * js_jit_free_bytecode() — cleanup hook, called from free_function_bytecode().
  * dlclose()s the compiled .so handle if present.
  */
@@ -959,8 +978,9 @@ int  js_jit_get_threshold(void);
  * Bump when the generated C calling convention or code-generation changes.
  * History: 1=initial, 2=P10.3 arg-mask, 3=P44 mixed-type arithmetic,
  *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result,
- *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field. */
-#define JIT_CODEGEN_VERSION 5u
+ *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field.
+ *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints. */
+#define JIT_CODEGEN_VERSION 6u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

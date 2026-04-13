@@ -689,6 +689,17 @@ typedef struct JSFunctionBytecode {
     uint16_t         *stack_depth_tab; /* [byte_code_len] stack depth before each opcode; P9.0 */
     JSJITCFAnnotation *cf_annotations;  /* loop CF annotations; P9.3 */
     int                cf_annotation_count;
+    /* P45b: warm-IC recompile state.
+     * After the first GCC compile, warm_count accumulates JIT calls.  When it
+     * reaches JIT_WARM_THRESHOLD_GCC, js_jit_schedule_warm_recompile() dlsym's
+     * __jit_vt_HASH from jit_handle, copies hints to jit_vt_hints, and queues
+     * a second GCC compilation with INT-typed get_field for observed INT properties. */
+    uint32_t          jit_warm_count; /* JIT call count after first compile     */
+    uint16_t          jit_n_gf;       /* OP_get_field count in bytecode         */
+    uint8_t           jit_warm_done;  /* 1 = warm recompile scheduled or n_gf==0 */
+    uint8_t           _jit_p45b_pad;  /* explicit padding                       */
+    uint8_t          *jit_vt_hints;   /* val_tag hints array (malloc'd) or NULL */
+    void             *jit_warm_handle; /* warm-recompile .so handle (kept loaded) */
 #endif
     struct {
         /* debug info, move to separate structure to save memory? */
@@ -15708,12 +15719,30 @@ void     js_jit_fb_set_bc_hash(JSFunctionBytecode *b, uint64_t hash)
 {
     b->jit_bc_hash = hash;
 }
+uint64_t js_jit_fb_get_bc_hash(JSFunctionBytecode *b) { return b->jit_bc_hash; }
 void     js_jit_fb_set_p103_safe(JSFunctionBytecode *b, int v)
 {
     b->jit_p103_safe = v ? 1 : 0;
 }
 int      js_jit_fb_inc_count(JSFunctionBytecode *b) { return ++b->jit_call_count; }
 int      js_jit_fb_get_call_count(JSFunctionBytecode *b) { return b->jit_call_count; }
+/* P45b: warm-IC recompile accessors */
+uint16_t js_jit_fb_get_n_gf(JSFunctionBytecode *b)          { return b->jit_n_gf; }
+void     js_jit_fb_set_n_gf(JSFunctionBytecode *b, uint16_t n) { b->jit_n_gf = n; }
+uint8_t  js_jit_fb_get_warm_done(JSFunctionBytecode *b)      { return b->jit_warm_done; }
+void     js_jit_fb_set_warm_done(JSFunctionBytecode *b)      { b->jit_warm_done = 1; }
+uint8_t *js_jit_fb_get_vt_hints(JSFunctionBytecode *b)       { return b->jit_vt_hints; }
+void     js_jit_fb_set_vt_hints(JSFunctionBytecode *b, uint8_t *hints) {
+    b->jit_vt_hints = hints; /* caller is responsible for freeing old value */
+}
+void     js_jit_fb_set_warm_handle(JSFunctionBytecode *b, void *h) { b->jit_warm_handle = h; }
+void    *js_jit_fb_get_warm_handle(JSFunctionBytecode *b)    { return b->jit_warm_handle; }
+void     js_jit_fb_set_warm_func(JSFunctionBytecode *b, JSJITFunc f) {
+    /* Atomically replace jit_func without touching jit_handle/jit_tier.
+     * Used by P45b warm-IC recompile to upgrade jit_func to the warm version
+     * while keeping the cold .so loaded (old call ICs use its function pointers). */
+    __atomic_store_n(&b->jit_func, f, __ATOMIC_RELEASE);
+}
 
 /* Return pointer to the JSValue inside a JSVarRef.  Used by generated C code
  * that cannot see the full JSVarRef definition (defined only in quickjs.c). */
@@ -19554,6 +19583,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                      * any yield (async_func_free_frame asserts cur_sp != NULL). */
                     if (JS_IsException(ret2) && !sf->cur_sp)
                         sf->cur_sp = sf->var_buf + b->var_count;
+                    /* P45b: warm-IC recompile trigger. */
+                    if (unlikely(!b->jit_warm_done && b->jit_n_gf > 0)) {
+                        if (++b->jit_warm_count == 200u)
+                            js_jit_schedule_warm_recompile(ctx, b);
+                    }
                     return ret2;
                 }
             }
@@ -19646,6 +19680,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, _argc41,
                                    argv, b->cpool, p->u.func.var_refs);
             rt->current_stack_frame = sf->prev_frame;
+            /* P45b: warm-IC recompile trigger — count JIT calls after first compile. */
+            if (unlikely(!b->jit_warm_done && b->jit_n_gf > 0)) {
+                if (++b->jit_warm_count == 200u)
+                    js_jit_schedule_warm_recompile(caller_ctx, b);
+            }
             /* close_var_refs() is a no-op when var_ref_count==0 — skip it. */
             return _ret41;
         }
@@ -38370,7 +38409,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     js_free_rt(rt, b->stack_depth_tab);
     js_free_rt(rt, b->cf_annotations);
     b->cf_annotations = NULL;
-    js_jit_free_bytecode(b);
+    /* P45b: js_jit_free_bytecode handles freeing jit_vt_hints and jit_warm_handle. */
+    js_jit_free_bytecode(b);  /* closes jit_handle, jit_warm_handle, frees jit_vt_hints */
 #endif
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
         list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);

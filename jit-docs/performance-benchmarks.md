@@ -235,6 +235,27 @@ downstream codegen).  See `jit_perf_tests/RESULTS_P45.md` for measurements.
 
 ---
 
+### 4.12 P45b — Warm-IC Recompile: gen_st=INT for get_field
+
+P45b implements the two-phase JIT strategy that P45 was groundwork for.  After 200
+warm JIT calls, the `__jit_vt_HASH[N]` val_tag hints are read from the cold `.so`
+via `dlsym`, and a second GCC compilation is queued.  The warm `.so` is generated
+with `gen_st=INT` for `OP_get_field` sites where the val_tag hint is `JS_TAG_INT`,
+allowing downstream arithmetic to use the fully-typed `_ti`/`_bn` fast path
+(no tag checks, no `JS_DupValue`).
+
+The cold `.so` is kept loaded (its function pointers may be cached in call ICs of
+other functions). The warm `.so` handle is stored separately in `jit_warm_handle`
+and closed at bytecode free time.
+
+**Net performance impact: +~5% V8 score** (median 583 vs P45 median 555).
+Greatest gains on Richards and DeltaBlue (INT property reads in tight loops).
+See `jit_perf_tests/RESULTS_P45b.md` for detailed measurements.
+
+`JIT_CODEGEN_VERSION` bumped from 5 to 6.
+
+---
+
 ## 5. Conclusion
 
 The QuickJS GCC-backend JIT delivers **large, consistent speedups on compute-bound workloads**: 16–21× for tight arithmetic loops, 3–5× for recursive and array-access patterns. These gains bring integer-loop performance to within 10–50% of V8 TurboFan. The primary remaining gap is property access, where the absence of type specialization leaves 10–20× performance on the table. The warm link-time and AOT modes are equivalent at steady state; the combined LTO `.so` provides a measurable advantage for IC-heavy code over separate per-function `.so` files.
