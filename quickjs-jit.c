@@ -1948,7 +1948,8 @@ void js_jit_schedule_warm_recompile(JSContext *ctx, JSFunctionBytecode *b)
 
     uint16_t n_gf = js_jit_fb_get_n_gf(b);
     uint8_t  n_ae = js_jit_fb_get_n_ae(b);
-    int n_hints = (int)n_gf + (int)n_ae;
+    uint16_t n_pf = js_jit_fb_get_n_pf(b); /* P48 */
+    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf;
     if (n_hints == 0) return;
 
     /* Look up exported val_tag hints from the cold .so */
@@ -2456,7 +2457,7 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          const JSJITScanResult *sr,
                          int var_ref_count,
                          JSFunctionBytecode *b,
-                         int n_gf, int n_ae)
+                         int n_gf, int n_ae, int n_pf)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -2499,14 +2500,14 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         "const uint32_t __jit_cv_%016llx=%uu;\n",
         (unsigned long long)bc_hash, JIT_CODEGEN_VERSION);
 
-    /* P45b/P46: exported val_tag hints array — one byte per OP_get_field opcode
-     * (indices 0..n_gf-1) followed by one byte per OP_get_array_el opcode
-     * (indices n_gf..n_gf+n_ae-1).
-     * The miss path updates this array at runtime so that after K warm calls
-     * js_jit_schedule_warm_recompile() can dlsym() it and read observed types.
-     * The array is zero-initialised (BSS); 0 == JS_TAG_INT (observed or uninit).
-     * Only emitted when the function has at least one OP_get_field or OP_get_array_el. */
-    int n_hints = n_gf + n_ae;
+    /* P45b/P46/P48: exported val_tag hints array.
+     * Layout: [0..n_gf-1] = OP_get_field hints,
+     *         [n_gf..n_gf+n_ae-1] = OP_get_array_el hints,
+     *         [n_gf+n_ae..n_gf+n_ae+n_pf-1] = OP_put_field write-value hints (P48).
+     * Updated at runtime; dlsym'd by js_jit_schedule_warm_recompile() after
+     * JIT_WARM_THRESHOLD_GCC calls.  BSS-zero; 0 == JS_TAG_INT (default hint).
+     * Only emitted when the function has at least one tracked opcode. */
+    int n_hints = n_gf + n_ae + n_pf;
     if (n_hints > 0)
         jit_buf_printf(cb,
             "uint8_t __jit_vt_%016llx[%d];\n",
@@ -2915,7 +2916,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     int var_ref_count,
                     const uint8_t *vt_hints, /* P45b: val_tag hints or NULL */
                     int n_gf,               /* P45b: OP_get_field count */
-                    int n_ae)               /* P46: OP_get_array_el count */
+                    int n_ae,               /* P46: OP_get_array_el count */
+                    int n_pf)               /* P48: OP_put_field count */
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -2930,6 +2932,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     /* P46: get_array_el index counter for __jit_vt_HASH[] array indexing.
      * Indices n_gf..n_gf+n_ae-1; incremented in secondary gen_st switch. */
     int ae_idx = 0;
+    /* P48: put_field index counter for __jit_vt_HASH[] write-value hints.
+     * Indices n_gf+n_ae..n_gf+n_ae+n_pf-1; incremented in secondary gen_st switch. */
+    int pf_idx = 0;
 
     /* P14: compile-time tracking of catch placeholder stack depths.
      * OP_catch pushes JS_UNDEFINED as a placeholder at slot d and increments
@@ -5974,83 +5979,74 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         case OP_put_field: { /* pop val, pop obj; depth d -> d-2 */
             uint32_t atom = bc_u32(&bc[pc+1]);
-            _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
+            /* P48: warm INT fast path — skip boxing when:
+             *   (a) vt_hint says value has always been JS_TAG_INT at runtime, AND
+             *   (b) gen_state confirms val slot is INT (no overflow occurred).
+             * When gen_state==INT, _ti[d-1] already holds a valid int32 (any overflow
+             * would have already triggered a JIT exit).  Skip _P94_ENSURE + _tsv write. */
+            int _p48_use_int = (vt_hints
+                                && (n_gf + n_ae + pf_idx) < (n_gf + n_ae + n_pf)
+                                && vt_hints[n_gf + n_ae + pf_idx] == 0 /* JS_TAG_INT */
+                                && gen_sp > (d-1) && gen_st[d-1] == JIT_T_INT);
+            if (!_p48_use_int)
+                _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
             /* P11.1: IC write hit path inlined — no call to js_jit_ic_write.
              * P37.4: bimorphic — two shape slots for write IC.
              * P39.2: use cached prop_arr from IC entry instead of obj→prop dereference.
              * P39.3: if obj was borrowed (get_loc skipped DupValue), skip _FREE(_o). */
             int _pf_borrowed = (borrowed_depth_snap == d-2);   /* P39.3 */
-            /* P39.2 fix + P43.2: read prop array from current object, not IC. */
-            if (_pf_borrowed) {
-                /* Object was loaded without DupValue — skip _FREE(_o). */
+
+            /* Emit opening: IC entry decl + _v initialisation.
+             * Warm INT: use _ti[d-1] directly (already valid int32).
+             * Cold: use boxed _tsv[d-1] and record write-value tag for warm recompile. */
+            if (_p48_use_int) {
                 jit_buf_printf(cb,
                     "    { static JSJITICEntry2 _ic%d={{},0};\n"
-                    "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
-                    "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=3&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[2]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[2].slot]; _pp[_ic%d.e[2].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=4&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[3]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[3].slot]; _pp[_ic%d.e[3].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
-                    "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
-                    "      if(_ret<0) goto _ex; }\n",  /* no _FREE(_o) — obj was borrowed */
-                    pc,            /* _ic%d */
-                    d-1, d-2, d-2, /* _v=_tsv%d, _o=_tsv%d, _sp=%d */
-                    pc,            /* JIT_IC_CHECK_FAST e[0] */
-                    pc, pc,        /* e[0].slot (old), e[0].slot (new) */
-                    pc, pc,        /* n>=2 && e[1] */
-                    pc, pc,        /* e[1].slot (old), e[1].slot (new) */
-                    pc, pc,        /* n>=3 && e[2] */
-                    pc, pc,        /* e[2].slot (old), e[2].slot (new) */
-                    pc, pc,        /* n>=4 && e[3] */
-                    pc, pc,        /* e[3].slot (old), e[3].slot (new) */
-                    atom, atom, pc); /* miss path */
+                    "      JSValue _v=JS_MKVAL(JS_TAG_INT,(int32_t)_ti%d), _o=_tsv%d; _sp=%d; int _ret;\n",
+                    pc, d-1, d-2, d-2);
             } else {
                 jit_buf_printf(cb,
                     "    { static JSJITICEntry2 _ic%d={{},0};\n"
                     "      JSValue _v=_tsv%d, _o=_tsv%d; _sp=%d; int _ret;\n"
-                    "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=3&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[2]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[2].slot]; _pp[_ic%d.e[2].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else if (js_likely(_ic%d.n>=4&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[3]))){\n"
-                    "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
-                    "          JSValue _old=_pp[_ic%d.e[3].slot]; _pp[_ic%d.e[3].slot]=_v;\n"
-                    "          JS_FreeValue(ctx,_old); _ret=0;}\n"
-                    "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
-                    "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n"
-                    "      _FREE(_o); if(_ret<0) goto _ex; }\n",
-                    pc,            /* _ic%d */
-                    d-1, d-2, d-2, /* _v=_tsv%d, _o=_tsv%d, _sp=%d */
-                    pc,            /* JIT_IC_CHECK_FAST e[0] */
-                    pc, pc,        /* e[0].slot (old), e[0].slot (new) */
-                    pc, pc,        /* n>=2 && e[1] */
-                    pc, pc,        /* e[1].slot (old), e[1].slot (new) */
-                    pc, pc,        /* n>=3 && e[2] */
-                    pc, pc,        /* e[2].slot (old), e[2].slot (new) */
-                    pc, pc,        /* n>=4 && e[3] */
-                    pc, pc,        /* e[3].slot (old), e[3].slot (new) */
-                    atom, atom, pc); /* miss path */
+                    "      __jit_vt_%016llx[%d]=(uint8_t)JS_VALUE_GET_TAG(_v);\n",
+                    pc, d-1, d-2, d-2,
+                    (unsigned long long)bc_hash, n_gf + n_ae + pf_idx);
             }
+            /* Emit IC body: 4 shape-matching entries + miss path.
+             * P39.2 fix + P43.2: read prop array from current object, not IC. */
+            jit_buf_printf(cb,
+                "      if (js_likely(JIT_IC_CHECK_FAST(_o,&_ic%d.e[0]))){\n"
+                "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue _old=_pp[_ic%d.e[0].slot]; _pp[_ic%d.e[0].slot]=_v;\n"
+                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                "      else if (js_likely(_ic%d.n>=2&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[1]))){\n"
+                "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue _old=_pp[_ic%d.e[1].slot]; _pp[_ic%d.e[1].slot]=_v;\n"
+                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                "      else if (js_likely(_ic%d.n>=3&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[2]))){\n"
+                "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue _old=_pp[_ic%d.e[2].slot]; _pp[_ic%d.e[2].slot]=_v;\n"
+                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                "      else if (js_likely(_ic%d.n>=4&&JIT_IC_CHECK_FAST(_o,&_ic%d.e[3]))){\n"
+                "          JSValue *_pp=(JSValue*)*(void**)((char*)JS_VALUE_GET_PTR(_o)+JIT_OBJ_PROP_OFF);\n"
+                "          JSValue _old=_pp[_ic%d.e[3].slot]; _pp[_ic%d.e[3].slot]=_v;\n"
+                "          JS_FreeValue(ctx,_old); _ret=0;}\n"
+                "      else { _ret=_RT->set_prop(ctx,_o,(JSAtom)%uu,_v);\n"
+                "             js_jit_ic2_fill_put(ctx,_o,(JSAtom)%uu,&_ic%d); }\n",
+                pc,            /* JIT_IC_CHECK_FAST e[0] */
+                pc, pc,        /* e[0].slot (old), e[0].slot (new) */
+                pc, pc,        /* n>=2 && e[1] */
+                pc, pc,        /* e[1].slot (old), e[1].slot (new) */
+                pc, pc,        /* n>=3 && e[2] */
+                pc, pc,        /* e[2].slot (old), e[2].slot (new) */
+                pc, pc,        /* n>=4 && e[3] */
+                pc, pc,        /* e[3].slot (old), e[3].slot (new) */
+                atom, atom, pc); /* miss path */
+            /* Emit closing: obj free (non-borrowed only) + error check. */
+            if (_pf_borrowed)
+                jit_buf_str(cb, "      if(_ret<0) goto _ex; }\n"); /* no _FREE(_o) — borrowed */
+            else
+                jit_buf_str(cb, "      _FREE(_o); if(_ret<0) goto _ex; }\n");
             _borrowed_depth = -1; /* P39.3: borrow consumed by put_field */
             break;
         }
@@ -8218,6 +8214,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 break;
 
             /* --- Property / array access → JSVAL --- */
+            case OP_put_field: {
+                /* P48: drop 2 (obj + val), push nothing.
+                 * Track pf_idx to match __jit_vt_ array indexing in main switch. */
+                _gs_drop = 2;
+                pf_idx++;
+                break;
+            }
             case OP_get_field: {
                 int _p45b_gst = (vt_hints && gf_idx < n_gf && vt_hints[gf_idx] == 0)
                                 ? JIT_T_INT : JIT_T_JSVAL;
@@ -8462,31 +8465,34 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    /* P45b/P46: count OP_get_field and OP_get_array_el for __jit_vt_ array. */
-    int n_gf = 0, n_ae = 0;
+    /* P45b/P46/P48: count OP_get_field, OP_get_array_el, OP_put_field for __jit_vt_ array. */
+    int n_gf = 0, n_ae = 0, n_pf = 0;
     for (int _pc = 0; _pc < bc_len; ) {
         int _op = bc[_pc];
-        if (_op == OP_get_field) n_gf++;
+        if (_op == OP_get_field)   n_gf++;
         if (_op == OP_get_array_el) n_ae++;
+        if (_op == OP_put_field)   n_pf++;  /* P48 */
         _pc += (_op < op_sz_count) ? op_sz[_op] : 1;
     }
     if (n_gf > 0 && n_gf <= 0xFFFF)
         js_jit_fb_set_n_gf(b, (uint16_t)n_gf);
     if (n_ae > 0 && n_ae <= 0xFF)
         js_jit_fb_set_n_ae(b, (uint8_t)n_ae);
+    if (n_pf > 0 && n_pf <= 0xFFFF)
+        js_jit_fb_set_n_pf(b, (uint16_t)n_pf); /* P48 */
     /* P45b: read val_tag hints set by js_jit_schedule_warm_recompile(). */
     const uint8_t *vt_hints = js_jit_fb_get_vt_hints(b);
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
                  local_type, js_func_name, varnames, &sr, var_ref_count, b,
-                 n_gf, n_ae);
+                 n_gf, n_ae, n_pf);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
                  bc_hash, varnames, var_jit_hash, var_ref_count,
-                 vt_hints, n_gf, n_ae) < 0) {
+                 vt_hints, n_gf, n_ae, n_pf) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);
