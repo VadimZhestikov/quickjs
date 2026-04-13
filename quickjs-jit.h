@@ -320,6 +320,8 @@ int       js_jit_fb_get_call_count(JSFunctionBytecode *b);
 /* P45b: warm-IC recompile accessors */
 uint16_t  js_jit_fb_get_n_gf(JSFunctionBytecode *b);
 void      js_jit_fb_set_n_gf(JSFunctionBytecode *b, uint16_t n);
+uint8_t   js_jit_fb_get_n_ae(JSFunctionBytecode *b);
+void      js_jit_fb_set_n_ae(JSFunctionBytecode *b, uint8_t n);
 uint8_t   js_jit_fb_get_warm_done(JSFunctionBytecode *b);
 void      js_jit_fb_set_warm_done(JSFunctionBytecode *b);
 uint8_t  *js_jit_fb_get_vt_hints(JSFunctionBytecode *b);

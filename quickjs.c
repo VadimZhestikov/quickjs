@@ -697,7 +697,7 @@ typedef struct JSFunctionBytecode {
     uint32_t          jit_warm_count; /* JIT call count after first compile     */
     uint16_t          jit_n_gf;       /* OP_get_field count in bytecode         */
     uint8_t           jit_warm_done;  /* 1 = warm recompile scheduled or n_gf==0 */
-    uint8_t           _jit_p45b_pad;  /* explicit padding                       */
+    uint8_t           jit_n_ae;       /* P46: OP_get_array_el count (max 255)   */
     uint8_t          *jit_vt_hints;   /* val_tag hints array (malloc'd) or NULL */
     void             *jit_warm_handle; /* warm-recompile .so handle (kept loaded) */
 #endif
@@ -15729,6 +15729,8 @@ int      js_jit_fb_get_call_count(JSFunctionBytecode *b) { return b->jit_call_co
 /* P45b: warm-IC recompile accessors */
 uint16_t js_jit_fb_get_n_gf(JSFunctionBytecode *b)          { return b->jit_n_gf; }
 void     js_jit_fb_set_n_gf(JSFunctionBytecode *b, uint16_t n) { b->jit_n_gf = n; }
+uint8_t  js_jit_fb_get_n_ae(JSFunctionBytecode *b)          { return b->jit_n_ae; }
+void     js_jit_fb_set_n_ae(JSFunctionBytecode *b, uint8_t n)  { b->jit_n_ae = n; }
 uint8_t  js_jit_fb_get_warm_done(JSFunctionBytecode *b)      { return b->jit_warm_done; }
 void     js_jit_fb_set_warm_done(JSFunctionBytecode *b)      { b->jit_warm_done = 1; }
 uint8_t *js_jit_fb_get_vt_hints(JSFunctionBytecode *b)       { return b->jit_vt_hints; }
@@ -19584,7 +19586,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (JS_IsException(ret2) && !sf->cur_sp)
                         sf->cur_sp = sf->var_buf + b->var_count;
                     /* P45b: warm-IC recompile trigger. */
-                    if (unlikely(!b->jit_warm_done && b->jit_n_gf > 0)) {
+                    if (unlikely(!b->jit_warm_done && (b->jit_n_gf > 0 || b->jit_n_ae > 0))) {
                         if (++b->jit_warm_count == 200u)
                             js_jit_schedule_warm_recompile(ctx, b);
                     }
@@ -19681,7 +19683,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                    argv, b->cpool, p->u.func.var_refs);
             rt->current_stack_frame = sf->prev_frame;
             /* P45b: warm-IC recompile trigger — count JIT calls after first compile. */
-            if (unlikely(!b->jit_warm_done && b->jit_n_gf > 0)) {
+            if (unlikely(!b->jit_warm_done && (b->jit_n_gf > 0 || b->jit_n_ae > 0))) {
                 if (++b->jit_warm_count == 200u)
                     js_jit_schedule_warm_recompile(caller_ctx, b);
             }

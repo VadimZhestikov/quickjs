@@ -254,6 +254,27 @@ See `jit_perf_tests/RESULTS_P45b.md` for detailed measurements.
 
 `JIT_CODEGEN_VERSION` bumped from 5 to 6.
 
+### 4.13 P46 — Warm-IC Recompile: gen_st=INT for get_array_el
+
+P46 extends the P45b warm-IC recompile to cover `OP_get_array_el` (array
+element reads).  The `__jit_vt_HASH[]` BSS array is extended from `n_gf` to
+`n_gf + n_ae` entries; indices `n_gf..n_gf+n_ae-1` record `val_tag` for each
+`OP_get_array_el` site.
+
+The warm `.so` emits INT-hint code for array reads where the hint is
+`JS_TAG_INT`: the fast path checks `JS_VALUE_GET_TAG(_r) == JS_TAG_INT` (added
+to prevent garbage extraction on type changes) then extracts the int without
+DupValue.  Downstream arithmetic uses the `_bn`/`_ti` fully-typed fast path.
+
+**Microbench: arr_sum(10000) x1000** — 5× speedup over interpreter with AOT-precompiled `.so`.
+
+V8 fresh-cache scores (3 runs): 633, 537, 471 (median 537).  High run-to-run
+variance (dominated by Splay GC and GCC compilation time) makes benchmark
+comparison noisy at this scale.  The V8 suite is property-access-dominated;
+P46's array-read optimization is better measured via microbenchmarks.
+
+See `jit_perf_tests/RESULTS_P46.md` for detailed measurements.
+
 ---
 
 ## 5. Conclusion
