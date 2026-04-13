@@ -7907,13 +7907,27 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                            : JIT_T_JSVAL;
                 break;
             }
-            case OP_sub: case OP_mul: case OP_mod: {
+            case OP_sub: case OP_mul: {
                 uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
                 _gs_drop = 2;
                 /* Half-typed (one JSVAL) → JSVAL result (gen_body writes _tsv). */
                 int _t2n=(_t2>=JIT_T_NUMBER&&_t2<=JIT_T_INT), _t1n=(_t1>=JIT_T_NUMBER&&_t1<=JIT_T_INT);
                 if (_t2n && _t1n)
                     _gs_push = (_t2==JIT_T_INT&&_t1==JIT_T_INT) ? JIT_T_INT : JIT_T_NUMBER;
+                else
+                    _gs_push = JIT_T_JSVAL;
+                break;
+            }
+            case OP_mod: {
+                uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
+                _gs_drop = 2;
+                /* OP_mod P44 half-typed paths write result to _tsd (NUMBER), not _tsv.
+                 * So any numeric input → NUMBER result, matching gen_body behaviour. */
+                int _t2n=(_t2>=JIT_T_NUMBER&&_t2<=JIT_T_INT), _t1n=(_t1>=JIT_T_NUMBER&&_t1<=JIT_T_INT);
+                if (_t2==JIT_T_INT && _t1==JIT_T_INT)
+                    _gs_push = JIT_T_INT;
+                else if (_t2n || _t1n)
+                    _gs_push = JIT_T_NUMBER;
                 else
                     _gs_push = JIT_T_JSVAL;
                 break;
@@ -8460,7 +8474,6 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         js_jit_fb_set_n_gf(b, (uint16_t)n_gf);
     if (n_ae > 0 && n_ae <= 0xFF)
         js_jit_fb_set_n_ae(b, (uint8_t)n_ae);
-
     /* P45b: read val_tag hints set by js_jit_schedule_warm_recompile(). */
     const uint8_t *vt_hints = js_jit_fb_get_vt_hints(b);
 
