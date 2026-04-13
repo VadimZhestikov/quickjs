@@ -41,6 +41,7 @@ JS_TESTS := \
     test_jit_p43_bitops.js \
     test_jit_p43_v8bench.js \
     test_jit_p44_mixed_arith.js \
+    test_jit_p50_put_array_el.js \
     test_jit_p103_argmut.js
 
 PASS_COUNT = 0

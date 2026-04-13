@@ -1950,7 +1950,8 @@ void js_jit_schedule_warm_recompile(JSContext *ctx, JSFunctionBytecode *b)
     uint8_t  n_ae = js_jit_fb_get_n_ae(b);
     uint16_t n_pf = js_jit_fb_get_n_pf(b); /* P48 */
     uint16_t n_vr = js_jit_fb_get_n_vr(b); /* P49 */
-    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf + (int)n_vr;
+    uint16_t n_pa = js_jit_fb_get_n_pa(b); /* P50 */
+    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf + (int)n_vr + (int)n_pa;
     if (n_hints == 0) return;
 
     /* Look up exported val_tag hints from the cold .so */
@@ -2458,7 +2459,7 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          const JSJITScanResult *sr,
                          int var_ref_count,
                          JSFunctionBytecode *b,
-                         int n_gf, int n_ae, int n_pf, int n_vr)
+                         int n_gf, int n_ae, int n_pf, int n_vr, int n_pa)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -2501,15 +2502,16 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
         "const uint32_t __jit_cv_%016llx=%uu;\n",
         (unsigned long long)bc_hash, JIT_CODEGEN_VERSION);
 
-    /* P45b/P46/P48/P49: exported val_tag hints array.
-     * Layout: [0..n_gf-1]                      = OP_get_field hints,
-     *         [n_gf..n_gf+n_ae-1]              = OP_get_array_el hints,
-     *         [n_gf+n_ae..n_gf+n_ae+n_pf-1]   = OP_put_field write-value hints (P48),
-     *         [n_gf+n_ae+n_pf..+n_vr-1]        = OP_get_var_ref* cell hints (P49).
+    /* P45b/P46/P48/P49/P50: exported val_tag hints array.
+     * Layout: [0..n_gf-1]                           = OP_get_field hints,
+     *         [n_gf..n_gf+n_ae-1]                   = OP_get_array_el hints,
+     *         [n_gf+n_ae..+n_pf-1]                  = OP_put_field write-value (P48),
+     *         [n_gf+n_ae+n_pf..+n_vr-1]             = OP_get_var_ref* cell (P49),
+     *         [n_gf+n_ae+n_pf+n_vr..+n_pa-1]        = OP_put_array_el write-value (P50).
      * Updated at runtime; dlsym'd by js_jit_schedule_warm_recompile() after
      * JIT_WARM_THRESHOLD_GCC calls.  BSS-zero; 0 == JS_TAG_INT (default hint).
      * Only emitted when the function has at least one tracked opcode. */
-    int n_hints = n_gf + n_ae + n_pf + n_vr;
+    int n_hints = n_gf + n_ae + n_pf + n_vr + n_pa;
     if (n_hints > 0)
         jit_buf_printf(cb,
             "uint8_t __jit_vt_%016llx[%d];\n",
@@ -2920,7 +2922,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     int n_gf,               /* P45b: OP_get_field count */
                     int n_ae,               /* P46: OP_get_array_el count */
                     int n_pf,               /* P48: OP_put_field count */
-                    int n_vr)               /* P49: OP_get_var_ref* count */
+                    int n_vr,               /* P49: OP_get_var_ref* count */
+                    int n_pa)               /* P50: OP_put_array_el count */
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -2941,6 +2944,9 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     /* P49: get_var_ref index counter for __jit_vt_HASH[] cell hints.
      * Indices n_gf+n_ae+n_pf..n_gf+n_ae+n_pf+n_vr-1; incremented in secondary gen_st switch. */
     int vr_idx = 0;
+    /* P50: put_array_el index counter for __jit_vt_HASH[] write-value hints.
+     * Indices n_gf+n_ae+n_pf+n_vr..+n_pa-1; incremented in secondary gen_st switch. */
+    int pa_idx = 0;
 
     /* P14: compile-time tracking of catch placeholder stack depths.
      * OP_catch pushes JS_UNDEFINED as a placeholder at slot d and increments
@@ -6229,56 +6235,121 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         }
         /* P11.4: put_array_el inlined similarly.
          * P38.2: typed index fast path for put_array_el.
+         * P50: warm INT write — skip _P94_ENSURE and use _ti[d-1] directly when
+         *      vt_hint says value is always INT and gen_state confirms it.
          * P9.4/P9.2: box typed slots, pop v(_tsv{d-1}), idx(_tsv{d-2}),
          *   obj(_tsv{d-3}); depth d->d-3 */
         case OP_put_array_el:
         {
             int _pidx_typed = (gen_sp > (d-2) && gen_st[d-2] == JIT_T_INT);
             _borrowed_depth = -1;
+            /* P50: warm INT fast path — skip boxing write value when hint=INT
+             * and gen_state confirms val slot is INT (overflow exits already done). */
+            int _pa_base = n_gf + n_ae + n_pf + n_vr;
+            int _p50_use_int = (vt_hints
+                                && (_pa_base + pa_idx) < (_pa_base + n_pa)
+                                && vt_hints[_pa_base + pa_idx] == 0 /* JS_TAG_INT */
+                                && gen_sp > (d-1) && gen_st[d-1] == JIT_T_INT);
             _P94_ENSURE(d-3); /* P9.4: box typed obj slot (unlikely but safe) */
             /* P38.2: skip _P94_ENSURE(d-2) when index is a typed int */
             if (!_pidx_typed)
                 _P94_ENSURE(d-2); /* P9.4: box typed idx slot before index check */
-            _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
+            if (!_p50_use_int)
+                _P94_ENSURE(d-1); /* P9.4: box typed val slot before use as JSValue */
+
             if (_pidx_typed) {
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d,_o=_tsv%d; _sp=%d;\n"
-                    "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
-                    "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
-                    "        uint32_t _ai=(uint32_t)_ti%d;\n"
-                    "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
-                    "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
-                    "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
-                    "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
-                    "          _FREE(_o); goto _aok%d;}}\n"
-                    "      { int64_t _iv%d=_ti%d;\n"
-                    "        JSValue _idx=((int64_t)(int32_t)_iv%d==_iv%d)\n"
-                    "            ?JS_MKVAL(JS_TAG_INT,(int32_t)_iv%d)\n"
-                    "            :JS_NewFloat64(ctx,(double)_iv%d);\n"
-                    "        int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                    "        _FREE(_o); if(_ret<0) goto _ex; }\n"
-                    "      _aok%d:; }\n",
-                    d-1, d-3, d-3,      /* _v=_tsv{d-1}, _o=_tsv{d-3}, _sp={d-3} */
-                    d-2,                /* _ai=(uint32_t)_ti{d-2} */
-                    pc,                 /* goto _aok */
-                    pc, d-2, pc, pc, pc, pc, /* box _ti{d-2} → _idx */
-                    pc);                /* _aok label */
+                /* Typed index (_ti{d-2}) path: fast array bounds check, no idx boxing. */
+                if (_p50_use_int) {
+                    /* P50 warm INT: write value directly from _ti{d-1}. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=JS_MKVAL(JS_TAG_INT,(int32_t)_ti%d),_o=_tsv%d; _sp=%d;\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)_ti%d;\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                        "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                        "          _FREE(_o); goto _aok%d;}}\n"
+                        "      { int64_t _iv%d=_ti%d;\n"
+                        "        JSValue _idx=((int64_t)(int32_t)_iv%d==_iv%d)\n"
+                        "            ?JS_MKVAL(JS_TAG_INT,(int32_t)_iv%d)\n"
+                        "            :JS_NewFloat64(ctx,(double)_iv%d);\n"
+                        "        int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                        "        _FREE(_o); if(_ret<0) goto _ex; }\n"
+                        "      _aok%d:; }\n",
+                        d-1, d-3, d-3,          /* _v=JS_MKVAL(_ti{d-1}), _o=_tsv{d-3}, _sp */
+                        d-2,                    /* _ai=(uint32_t)_ti{d-2} */
+                        pc,                     /* goto _aok */
+                        pc, d-2, pc, pc, pc, pc, /* slow: box _ti{d-2} → _idx */
+                        pc);                    /* _aok label */
+                } else {
+                    /* Cold/JSVAL: observe write-value tag for warm recompile. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d,_o=_tsv%d; _sp=%d;\n"
+                        "      __jit_vt_%016llx[%d]=(uint8_t)JS_VALUE_GET_TAG(_v);\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)_ti%d;\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                        "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                        "          _FREE(_o); goto _aok%d;}}\n"
+                        "      { int64_t _iv%d=_ti%d;\n"
+                        "        JSValue _idx=((int64_t)(int32_t)_iv%d==_iv%d)\n"
+                        "            ?JS_MKVAL(JS_TAG_INT,(int32_t)_iv%d)\n"
+                        "            :JS_NewFloat64(ctx,(double)_iv%d);\n"
+                        "        int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                        "        _FREE(_o); if(_ret<0) goto _ex; }\n"
+                        "      _aok%d:; }\n",
+                        d-1, d-3, d-3,                              /* _v, _o, _sp */
+                        (unsigned long long)bc_hash, _pa_base+pa_idx, /* vt observe */
+                        d-2,                                        /* _ai */
+                        pc,                                         /* goto _aok */
+                        pc, d-2, pc, pc, pc, pc,                    /* slow: box idx */
+                        pc);                                        /* _aok label */
+                }
             } else {
-                jit_buf_printf(cb,
-                    "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
-                    "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
-                                   "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
-                    "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
-                    "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
-                    "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
-                    "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
-                    "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
-                    "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
-                    "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
-                    "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
-                    "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
-                    "      _aok%d:; }\n",
-                    d-1, d-2, d-3, d-3, pc, pc);
+                /* JSVAL index path: tag-check idx at runtime. */
+                if (_p50_use_int) {
+                    /* P50 warm INT: write value directly from _ti{d-1}. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=JS_MKVAL(JS_TAG_INT,(int32_t)_ti%d),_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                                       "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                        "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                        "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
+                        "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                        "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
+                        "      _aok%d:; }\n",
+                        d-1, d-2, d-3, d-3, pc, pc);
+                } else {
+                    /* Cold/JSVAL: observe write-value tag. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _v=_tsv%d,_idx=_tsv%d,_o=_tsv%d; _sp=%d;\n"
+                        "      __jit_vt_%016llx[%d]=(uint8_t)JS_VALUE_GET_TAG(_v);\n"
+                        "      if(js_likely(JS_VALUE_GET_TAG(_o)==JS_TAG_OBJECT"
+                                       "&&JS_VALUE_GET_TAG(_idx)==JS_TAG_INT)){\n"
+                        "        char *_op=(char*)JS_VALUE_GET_PTR(_o);\n"
+                        "        uint32_t _ai=(uint32_t)JS_VALUE_GET_INT(_idx);\n"
+                        "        if(js_likely(*(uint16_t*)(_op+JIT_OBJ_CLASSID_OFF)==JIT_CLASS_ARRAY\n"
+                        "                   &&_ai<(uint32_t)*(int*)(_op+JIT_ARR_COUNT_OFF))){\n"
+                        "          JSValue *_vp=*(JSValue**)(_op+JIT_ARR_VALUES_OFF);\n"
+                        "          JSValue _old=_vp[_ai]; _vp[_ai]=_v; JS_FreeValue(ctx,_old);\n"
+                        "          _FREE(_o);_FREE(_idx); goto _aok%d;}}\n"
+                        "      { int _ret=_RT->set_array_el(ctx,_o,_idx,_v);\n"
+                        "        _FREE(_o);_FREE(_idx); if(_ret<0) goto _ex; }\n"
+                        "      _aok%d:; }\n",
+                        d-1, d-2, d-3, d-3,
+                        (unsigned long long)bc_hash, _pa_base+pa_idx, /* vt observe */
+                        pc, pc);
+                }
             }
             break;
         }
@@ -8253,6 +8324,13 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 pf_idx++;
                 break;
             }
+            case OP_put_array_el: {
+                /* P50: drop 3 (obj + idx + val), push nothing.
+                 * Track pa_idx to match __jit_vt_ array indexing in main switch. */
+                _gs_drop = 3;
+                pa_idx++;
+                break;
+            }
             case OP_get_field: {
                 int _p45b_gst = (vt_hints && gf_idx < n_gf && vt_hints[gf_idx] == 0)
                                 ? JIT_T_INT : JIT_T_JSVAL;
@@ -8497,18 +8575,19 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    /* P45b/P46/P48/P49: count tracked opcodes for __jit_vt_ array. */
-    int n_gf = 0, n_ae = 0, n_pf = 0, n_vr = 0;
+    /* P45b/P46/P48/P49/P50: count tracked opcodes for __jit_vt_ array. */
+    int n_gf = 0, n_ae = 0, n_pf = 0, n_vr = 0, n_pa = 0;
     for (int _pc = 0; _pc < bc_len; ) {
         int _op = bc[_pc];
-        if (_op == OP_get_field)   n_gf++;
+        if (_op == OP_get_field)    n_gf++;
         if (_op == OP_get_array_el) n_ae++;
-        if (_op == OP_put_field)   n_pf++;  /* P48 */
-        /* P49: count all get_var_ref variants */
+        if (_op == OP_put_field)    n_pf++; /* P48 */
+        /* P49: all get_var_ref variants */
         if (_op == OP_get_var_ref || _op == OP_get_var_ref_check ||
             _op == OP_get_var_ref0 || _op == OP_get_var_ref1 ||
             _op == OP_get_var_ref2 || _op == OP_get_var_ref3)
             n_vr++;
+        if (_op == OP_put_array_el) n_pa++; /* P50 */
         _pc += (_op < op_sz_count) ? op_sz[_op] : 1;
     }
     if (n_gf > 0 && n_gf <= 0xFFFF)
@@ -8519,19 +8598,21 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         js_jit_fb_set_n_pf(b, (uint16_t)n_pf); /* P48 */
     if (n_vr > 0 && n_vr <= 0xFFFF)
         js_jit_fb_set_n_vr(b, (uint16_t)n_vr); /* P49 */
+    if (n_pa > 0 && n_pa <= 0xFFFF)
+        js_jit_fb_set_n_pa(b, (uint16_t)n_pa); /* P50 */
     /* P45b: read val_tag hints set by js_jit_schedule_warm_recompile(). */
     const uint8_t *vt_hints = js_jit_fb_get_vt_hints(b);
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
                  local_type, js_func_name, varnames, &sr, var_ref_count, b,
-                 n_gf, n_ae, n_pf, n_vr);
+                 n_gf, n_ae, n_pf, n_vr, n_pa);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
                  bc_hash, varnames, var_jit_hash, var_ref_count,
-                 vt_hints, n_gf, n_ae, n_pf, n_vr) < 0) {
+                 vt_hints, n_gf, n_ae, n_pf, n_vr, n_pa) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

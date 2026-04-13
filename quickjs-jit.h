@@ -328,6 +328,9 @@ void      js_jit_fb_set_n_pf(JSFunctionBytecode *b, uint16_t n);
 /* P49: get_var_ref* count */
 uint16_t  js_jit_fb_get_n_vr(JSFunctionBytecode *b);
 void      js_jit_fb_set_n_vr(JSFunctionBytecode *b, uint16_t n);
+/* P50: put_array_el count */
+uint16_t  js_jit_fb_get_n_pa(JSFunctionBytecode *b);
+void      js_jit_fb_set_n_pa(JSFunctionBytecode *b, uint16_t n);
 uint8_t   js_jit_fb_get_warm_done(JSFunctionBytecode *b);
 void      js_jit_fb_set_warm_done(JSFunctionBytecode *b);
 uint8_t  *js_jit_fb_get_vt_hints(JSFunctionBytecode *b);
@@ -987,8 +990,9 @@ int  js_jit_get_threshold(void);
  * History: 1=initial, 2=P10.3 arg-mask, 3=P44 mixed-type arithmetic,
  *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result,
  *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field.
- *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints. */
-#define JIT_CODEGEN_VERSION 8u
+ *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints.
+ *          7=P48 put_field INT write; 8=P49 get_var_ref INT cell; 9=P50 put_array_el INT. */
+#define JIT_CODEGEN_VERSION 9u
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 
