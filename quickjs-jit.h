@@ -604,6 +604,7 @@ typedef struct {
  */
 #define JIT_FUNC_BC_OFF            48  /* JSObject.u.func.function_bytecode */
 #define JIT_FUNC_VARREFS_OFF       56  /* JSObject.u.func.var_refs */
+#define JIT_CTX_RT_OFF             24  /* JSContext.rt (JSRuntime*) — verified by _Static_assert */
 #define JIT_CLASS_BYTECODE_FUNCTION 13 /* JS_CLASS_BYTECODE_FUNCTION enum value */
 #define JIT_BC_JIT_FUNC_OFF       112  /* JSFunctionBytecode.jit_func (JSJITFunc) */
 #define JIT_BC_BCHASH_OFF         128  /* JSFunctionBytecode.jit_bc_hash (uint64_t) */
@@ -778,6 +779,12 @@ typedef struct {
      * var_ref_count==0.  Allows the call IC hot path to bypass cur_func/new_target
      * save/restore and call direct_jit() with no SF mutation. */
     uint8_t              callee_is_fast;
+    /* P50: cross-runtime ABA guard — JSRuntime* of the runtime that filled
+     * this IC entry.  The static IC lives in the .so file and persists across
+     * test runtimes in the same process; without this check a new runtime
+     * whose heap malloc-reuses the same function/bytecode addresses would
+     * falsely fire the IC and call direct_jit with a stale cpool pointer. */
+    void                *rt;
 } JSJITCallICEntry;
 
 /*
@@ -992,7 +999,7 @@ int  js_jit_get_threshold(void);
  *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field.
  *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints.
  *          7=P48 put_field INT write; 8=P49 get_var_ref INT cell; 9=P50 put_array_el INT. */
-#define JIT_CODEGEN_VERSION 9u
+#define JIT_CODEGEN_VERSION 10u  /* P50: JSJITCallICEntry gains void *rt field */
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

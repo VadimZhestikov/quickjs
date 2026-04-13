@@ -2119,6 +2119,7 @@ void JS_FreeRuntime(JSRuntime *rt)
             printf("Secondary object leaks: %d\n", count);
     }
 #endif
+    fflush(stdout); fflush(stderr);
     assert(list_empty(&rt->gc_obj_list));
     assert(list_empty(&rt->weakref_list));
 
@@ -6341,6 +6342,25 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                     for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
                         JS_MarkValue(rt, *sp, mark_func);
                 }
+#ifdef CONFIG_JIT
+                /* JIT-compiled generators save live local JSValues in
+                 * jit_gen_frame->saved_lv[] and closure var-refs in
+                 * saved_vrefs[], bypassing sf->var_buf[].  Both must be
+                 * marked here so the GC cycle detector sees all live refs. */
+                if (s->jit_gen_frame) {
+                    JSJITGeneratorFrame *gf = (JSJITGeneratorFrame *)s->jit_gen_frame;
+                    int i;
+                    if (gf->saved_lv) {
+                        for (i = 0; i < gf->n_lv; i++)
+                            JS_MarkValue(rt, gf->saved_lv[i], mark_func);
+                    }
+                    if (gf->saved_vrefs) {
+                        for (i = 0; i < gf->n_vrefs; i++)
+                            if (gf->saved_vrefs[i])
+                                mark_func(rt, &gf->saved_vrefs[i]->header);
+                    }
+                }
+#endif
             }
             JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
@@ -16410,7 +16430,13 @@ JSValue js_jit_ic_fast_call(JSContext *ctx, JSValue this_val,
 
 void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
 {
-    (void)ctx;
+    /* P50: Cross-runtime ABA guard.  Static IC entries in .so files persist
+     * across runtimes in the same process.  If this IC was filled for a
+     * different runtime, reset it to cold so it can be refilled correctly. */
+    if (ic->rt != NULL && ic->rt != (void *)ctx->rt) {
+        ic->expected_func = NULL;
+        ic->rt            = NULL;
+    }
     if (ic->expected_func == JIT_IC_MEGAMORPHIC)
         return; /* already megamorphic — no point filling */
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) {
@@ -16433,6 +16459,7 @@ void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
         ic->callee_arg_count  = b->arg_count;
         ic->callee_bc_hash    = b->jit_bc_hash;
         ic->callee_is_fast    = js_jit_ic_compute_fast(b); /* P41.2 */
+        ic->rt                = (void *)ctx->rt;           /* P50: bind to this runtime */
     } else if (ic->expected_func == fo && ic->expected_bc == b) {
         /* Same callee — refresh jit_func if it was compiled since last fill */
         if (ic->direct_jit == NULL) {
@@ -17261,6 +17288,8 @@ _Static_assert(offsetof(JSVarRef, pvalue) == JIT_VARREF_PVALUE_OFF,
 
 /* P11.3: Verify JSObject bytecode-function layout constants used by the
  * call IC in quickjs-jit.c (OP_call / OP_call_method). */
+_Static_assert(offsetof(JSContext, rt) == JIT_CTX_RT_OFF,
+               "JIT_CTX_RT_OFF mismatch — update JIT_CTX_RT_OFF in quickjs-jit.h");
 _Static_assert(offsetof(JSObject, u.func.function_bytecode) == JIT_FUNC_BC_OFF,
                "JIT_FUNC_BC_OFF mismatch");
 _Static_assert(offsetof(JSObject, u.func.var_refs)          == JIT_FUNC_VARREFS_OFF,

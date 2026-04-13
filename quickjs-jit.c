@@ -6502,11 +6502,15 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "extern JSValue js_jit_ic_fast_call"
                         "(JSContext*,JSValue,JSJITCallICEntry*);\n");
                     jit_buf_printf(cb,
-                        "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0};\n"
+                        /* P50: rt field added — cross-runtime ABA guard (NULL = cold).
+                         * The IC fires only when _cic.rt matches the current runtime. */
+                        "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0,NULL};\n"
                         "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
                               "?JS_VALUE_GET_PTR(_f):NULL;\n"
+                        "      void *_jrt_=*(void**)((char*)ctx+JIT_CTX_RT_OFF);\n"
                         "      JSValue _r;\n"
                         "      if(js_likely(_fo&&_fo==_cic%d.expected_func&&\n"
+                        "                   _cic%d.rt==_jrt_&&\n"
                         "                   *(void**)((char*)_fo+JIT_FUNC_BC_OFF)"
                                             "==(void*)_cic%d.expected_bc)){\n"
                         /* Full ABA guard: check bc_hash to detect both single-ABA
@@ -6519,7 +6523,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "           *(uint64_t*)((char*)_cic%d.expected_bc"
                                                 "+JIT_BC_BCHASH_OFF)==_cic%d.callee_bc_hash){\n"
                         "          if(_RT->poll_interrupts(ctx)) goto _ex;\n",
-                        pc, pc, pc, pc, pc, pc);
+                        pc, pc, pc, pc, pc, pc, pc);
                     /* Use js_jit_ic_direct_call to pad args to callee_arg_count and dup them.
                      * This matches js_jit_call's padding so the callee's put_arg write-backs
                      * operate on a private copy, not the caller's stack slots.
@@ -6547,19 +6551,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                             "        } else _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n"
                             "      } else {\n"
                             "        _r=_RT->call(ctx,_f,JS_UNDEFINED,%d,_ca%d);\n"
-                            "        if(!_cic%d.expected_func)\n"
+                            /* P50: also refill when rt changed (stale IC from prev runtime) */
+                            "        if(!_cic%d.expected_func||_cic%d.rt!=_jrt_)\n"
                             "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
                             "      }\n",
-                            nargs, pc, nargs, pc, pc, pc);
+                            nargs, pc, nargs, pc, pc, pc, pc);
                     else
                         jit_buf_printf(cb,
                             "        } else _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n"
                             "      } else {\n"
                             "        _r=_RT->call(ctx,_f,JS_UNDEFINED,0,NULL);\n"
-                            "        if(!_cic%d.expected_func)\n"
+                            /* P50: also refill when rt changed (stale IC from prev runtime) */
+                            "        if(!_cic%d.expected_func||_cic%d.rt!=_jrt_)\n"
                             "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
                             "      }\n",
-                            pc, pc);
+                            pc, pc, pc);
                 }
                 /* Free args */
                 for (int _aj = 0; _aj < nargs; _aj++)
@@ -6600,11 +6606,14 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "extern JSValue js_jit_ic_fast_call"
                     "(JSContext*,JSValue,JSJITCallICEntry*);\n");
                 jit_buf_printf(cb,
-                    "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0};\n"
+                    /* P50: rt field — cross-runtime ABA guard (NULL = cold). */
+                    "      static JSJITCallICEntry _cic%d={NULL,NULL,NULL,NULL,NULL,0,0,0,NULL};\n"
                     "      void *_fo=(JS_VALUE_GET_TAG(_f)==JS_TAG_OBJECT)"
                           "?JS_VALUE_GET_PTR(_f):NULL;\n"
+                    "      void *_jrt_=*(void**)((char*)ctx+JIT_CTX_RT_OFF);\n"
                     "      JSValue _r;\n"
                     "      if(js_likely(_fo&&_fo==_cic%d.expected_func&&\n"
+                    "                   _cic%d.rt==_jrt_&&\n"
                     "                   *(void**)((char*)_fo+JIT_FUNC_BC_OFF)"
                                         "==(void*)_cic%d.expected_bc)){\n"
                     /* Full ABA guard: same as OP_call — bc_hash check */
@@ -6612,7 +6621,7 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     "           *(uint64_t*)((char*)_cic%d.expected_bc"
                                             "+JIT_BC_BCHASH_OFF)==_cic%d.callee_bc_hash){\n"
                     "          if(_RT->poll_interrupts(ctx)) goto _ex;\n",
-                    pc, pc, pc, pc, pc, pc);
+                    pc, pc, pc, pc, pc, pc, pc);
                 /* Use js_jit_ic_direct_call for arg padding (same reason as OP_call).
                  * P41.2: for zero-arg method calls, use fast path when callee_is_fast. */
                 if (nargs > 0)
@@ -6635,19 +6644,21 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "        } else _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n"
                         "      } else {\n"
                         "        _r=_RT->call(ctx,_f,_t,%d,_ca%d);\n"
-                        "        if(!_cic%d.expected_func)\n"
+                        /* P50: also refill when rt changed (stale IC from prev runtime) */
+                        "        if(!_cic%d.expected_func||_cic%d.rt!=_jrt_)\n"
                         "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
                         "      }\n",
-                        nargs, pc, nargs, pc, pc, pc);
+                        nargs, pc, nargs, pc, pc, pc, pc);
                 else
                     jit_buf_printf(cb,
                         "        } else _r=_RT->call(ctx,_f,_t,0,NULL);\n"
                         "      } else {\n"
                         "        _r=_RT->call(ctx,_f,_t,0,NULL);\n"
-                        "        if(!_cic%d.expected_func)\n"
+                        /* P50: also refill when rt changed (stale IC from prev runtime) */
+                        "        if(!_cic%d.expected_func||_cic%d.rt!=_jrt_)\n"
                         "          js_jit_callIC_fill(ctx,_f,&_cic%d);\n"
                         "      }\n",
-                        pc, pc);
+                        pc, pc, pc);
                 for (int _aj = 0; _aj < nargs; _aj++)
                     jit_buf_printf(cb, "      _FREE(_tsv%d);\n", d-nargs+_aj);
                 jit_buf_printf(cb,
