@@ -713,6 +713,7 @@ typedef struct JSFunctionBytecode {
     uint16_t          jit_n_vr;       /* P49: OP_get_var_ref* count in bytecode */
     uint16_t          jit_n_pa;       /* P50: OP_put_array_el count in bytecode */
     uint16_t          jit_n_ad;       /* P51: OP_add count in bytecode          */
+    uint16_t          jit_n_pv;       /* P52: OP_put/set_var_ref* count         */
     uint8_t           jit_warm_done;  /* 1 = warm recompile scheduled or n_gf==0 */
     uint8_t           jit_n_ae;       /* P46: OP_get_array_el count (max 255)   */
     uint8_t          *jit_vt_hints;   /* val_tag hints array (malloc'd) or NULL */
@@ -15783,6 +15784,9 @@ void     js_jit_fb_set_n_pa(JSFunctionBytecode *b, uint16_t n) { b->jit_n_pa = n
 /* P51: add count accessor */
 uint16_t js_jit_fb_get_n_ad(JSFunctionBytecode *b)          { return b->jit_n_ad; }
 void     js_jit_fb_set_n_ad(JSFunctionBytecode *b, uint16_t n) { b->jit_n_ad = n; }
+/* P52: put/set_var_ref* count accessor */
+uint16_t js_jit_fb_get_n_pv(JSFunctionBytecode *b)          { return b->jit_n_pv; }
+void     js_jit_fb_set_n_pv(JSFunctionBytecode *b, uint16_t n) { b->jit_n_pv = n; }
 uint8_t  js_jit_fb_get_warm_done(JSFunctionBytecode *b)      { return b->jit_warm_done; }
 void     js_jit_fb_set_warm_done(JSFunctionBytecode *b)      { b->jit_warm_done = 1; }
 uint8_t *js_jit_fb_get_vt_hints(JSFunctionBytecode *b)       { return b->jit_vt_hints; }
