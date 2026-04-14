@@ -44,7 +44,8 @@ JS_TESTS := \
     test_jit_p50_put_array_el.js \
     test_jit_p51_add_warm_int.js \
     test_jit_p52_put_var_ref_int.js \
-    test_jit_p103_argmut.js
+    test_jit_p103_argmut.js \
+    test_jit_p54_mono_ic.js
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
