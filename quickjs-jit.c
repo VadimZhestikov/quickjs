@@ -1951,7 +1951,8 @@ void js_jit_schedule_warm_recompile(JSContext *ctx, JSFunctionBytecode *b)
     uint16_t n_pf = js_jit_fb_get_n_pf(b); /* P48 */
     uint16_t n_vr = js_jit_fb_get_n_vr(b); /* P49 */
     uint16_t n_pa = js_jit_fb_get_n_pa(b); /* P50 */
-    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf + (int)n_vr + (int)n_pa;
+    uint16_t n_ad = js_jit_fb_get_n_ad(b); /* P51 */
+    int n_hints = (int)n_gf + (int)n_ae + (int)n_pf + (int)n_vr + (int)n_pa + (int)n_ad * 2;
     if (n_hints == 0) return;
 
     /* Look up exported val_tag hints from the cold .so */
@@ -2459,7 +2460,7 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
                          const JSJITScanResult *sr,
                          int var_ref_count,
                          JSFunctionBytecode *b,
-                         int n_gf, int n_ae, int n_pf, int n_vr, int n_pa)
+                         int n_gf, int n_ae, int n_pf, int n_vr, int n_pa, int n_ad)
 {
     /* Stable symbol name derived from bytecode hash */
     snprintf(fname_out, fname_sz, "__jit_f_%016llx",
@@ -2507,11 +2508,12 @@ static void gen_preamble(JSJITCodeBuf *cb, uint64_t bc_hash,
      *         [n_gf..n_gf+n_ae-1]                   = OP_get_array_el hints,
      *         [n_gf+n_ae..+n_pf-1]                  = OP_put_field write-value (P48),
      *         [n_gf+n_ae+n_pf..+n_vr-1]             = OP_get_var_ref* cell (P49),
-     *         [n_gf+n_ae+n_pf+n_vr..+n_pa-1]        = OP_put_array_el write-value (P50).
+     *         [n_gf+n_ae+n_pf+n_vr..+n_pa-1]        = OP_put_array_el write-value (P50),
+     *         [n_gf+n_ae+n_pf+n_vr+n_pa..+n_ad*2-1] = OP_add operand tags, 2 per site (P51).
      * Updated at runtime; dlsym'd by js_jit_schedule_warm_recompile() after
      * JIT_WARM_THRESHOLD_GCC calls.  BSS-zero; 0 == JS_TAG_INT (default hint).
      * Only emitted when the function has at least one tracked opcode. */
-    int n_hints = n_gf + n_ae + n_pf + n_vr + n_pa;
+    int n_hints = n_gf + n_ae + n_pf + n_vr + n_pa + n_ad * 2;
     if (n_hints > 0)
         jit_buf_printf(cb,
             "uint8_t __jit_vt_%016llx[%d];\n",
@@ -2923,7 +2925,8 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                     int n_ae,               /* P46: OP_get_array_el count */
                     int n_pf,               /* P48: OP_put_field count */
                     int n_vr,               /* P49: OP_get_var_ref* count */
-                    int n_pa)               /* P50: OP_put_array_el count */
+                    int n_pa,               /* P50: OP_put_array_el count */
+                    int n_ad)               /* P51: OP_add count */
 {
     *unsupported_out = 0;
     int pc = 0;
@@ -2947,6 +2950,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     /* P50: put_array_el index counter for __jit_vt_HASH[] write-value hints.
      * Indices n_gf+n_ae+n_pf+n_vr..+n_pa-1; incremented in secondary gen_st switch. */
     int pa_idx = 0;
+    /* P51: add index counter for __jit_vt_HASH[] operand-tag hints.
+     * 2 slots per OP_add: [base + ad_idx*2] = left tag, [base + ad_idx*2+1] = right tag.
+     * Indices n_gf+n_ae+n_pf+n_vr+n_pa..+n_ad*2-1; incremented in secondary gen_st switch. */
+    int ad_idx = 0;
 
     /* P14: compile-time tracking of catch placeholder stack depths.
      * OP_catch pushes JS_UNDEFINED as a placeholder at slot d and increments
@@ -4276,23 +4283,44 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 }
             } else {
                 _P94_ENSURE(d-2); _P94_ENSURE(d-1);
-                jit_buf_printf(cb,
-                    "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
-                    "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
-                    "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
-                    "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
-                    "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
-                    "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
-                    "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
-                             "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
-                    "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
-                    "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
-                    "        _tsv%d=JS_NewFloat64(ctx,_da+_db); _sp=%d;\n"
-                    "      } else {\n"
-                    "        _sp=%d; JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r);\n"
-                    "        _tsv%d=_r; _sp=%d;\n"
-                    "      } }\n",
-                    d-1, d-2, d-2, d-1, d-2, d-1, d-2, d-2, d-1);
+                /* P51: base index into __jit_vt_ for this OP_add's hint slots. */
+                int _ad_base = n_gf + n_ae + n_pf + n_vr + n_pa + ad_idx * 2;
+                int _p51_warm = (vt_hints
+                                 && _ad_base + 1 < n_gf + n_ae + n_pf + n_vr + n_pa + n_ad * 2
+                                 && vt_hints[_ad_base]   == 0 /* JS_TAG_INT */
+                                 && vt_hints[_ad_base+1] == 0 /* JS_TAG_INT */);
+                if (_p51_warm) {
+                    /* Warm speculative INT+INT: both hints = INT.
+                     * Skip tag checks; result in _ti (gen_st emits INT for downstream ops). */
+                    jit_buf_printf(cb,
+                        "    _ti%d=(int64_t)JS_VALUE_GET_INT(_tsv%d)"
+                              "+(int64_t)JS_VALUE_GET_INT(_tsv%d); _sp=%d;\n",
+                        d-2, d-2, d-1, d-1);
+                } else {
+                    /* Cold: observe both operand tags, emit full runtime path. */
+                    jit_buf_printf(cb,
+                        "    { JSValue _b=_tsv%d,_a=_tsv%d;\n"
+                        "      int _ta=JS_VALUE_GET_TAG(_a),_tb=JS_VALUE_GET_TAG(_b);\n"
+                        "      __jit_vt_%016llx[%d]=(uint8_t)_ta;"
+                        " __jit_vt_%016llx[%d]=(uint8_t)_tb;\n"
+                        "      if(_ta==JS_TAG_INT&&_tb==JS_TAG_INT){\n"
+                        "        int64_t _r64=(int64_t)JS_VALUE_GET_INT(_a)+JS_VALUE_GET_INT(_b);\n"
+                        "        _tsv%d=((int32_t)_r64==_r64)?JS_NewInt32(ctx,(int32_t)_r64)\n"
+                        "                                    :JS_NewFloat64(ctx,(double)_r64); _sp=%d;\n"
+                        "      } else if((_ta==JS_TAG_INT||_ta==JS_TAG_FLOAT64)&&"
+                                 "(_tb==JS_TAG_INT||_tb==JS_TAG_FLOAT64)){\n"
+                        "        double _da=_ta==JS_TAG_INT?(double)JS_VALUE_GET_INT(_a):JS_VALUE_GET_FLOAT64(_a);\n"
+                        "        double _db=_tb==JS_TAG_INT?(double)JS_VALUE_GET_INT(_b):JS_VALUE_GET_FLOAT64(_b);\n"
+                        "        _tsv%d=JS_NewFloat64(ctx,_da+_db); _sp=%d;\n"
+                        "      } else {\n"
+                        "        _sp=%d; JSValue _r=_RT->add(ctx,_a,_b); _CHK(_r);\n"
+                        "        _tsv%d=_r; _sp=%d;\n"
+                        "      } }\n",
+                        d-1, d-2,
+                        (unsigned long long)bc_hash, _ad_base,
+                        (unsigned long long)bc_hash, _ad_base + 1,
+                        d-2, d-1, d-2, d-1, d-2, d-2, d-1);
+                }
             }
             break;
         }
@@ -8035,13 +8063,25 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
 
             /* --- Arithmetic: INT if both INT (except div), NUMBER if both >=NUMBER, else JSVAL.
              * P44: sub/mul/div/mod half-typed (one NUMBER/INT, one JSVAL) → NUMBER (_tsd).
-             * add stays JSVAL when not both numeric (add can produce strings). */
+             * add stays JSVAL when not both numeric (add can produce strings).
+             * P51: when both JSVAL but warm hints say both INT → speculative INT result. */
             case OP_add: {
                 uint8_t _t2=_GS_TOP2(), _t1=_GS_TOP();
                 _gs_drop = 2;
-                _gs_push = (_t2>=JIT_T_NUMBER&&_t1>=JIT_T_NUMBER)
-                           ? ((_t2==JIT_T_INT&&_t1==JIT_T_INT)?JIT_T_INT:JIT_T_NUMBER)
-                           : JIT_T_JSVAL;
+                if (_t2>=JIT_T_NUMBER && _t1>=JIT_T_NUMBER) {
+                    _gs_push = (_t2==JIT_T_INT&&_t1==JIT_T_INT) ? JIT_T_INT : JIT_T_NUMBER;
+                } else if (_t2==JIT_T_JSVAL && _t1==JIT_T_JSVAL) {
+                    /* P51: check warm hints for this OP_add site (2 slots each). */
+                    int _ad_base = n_gf + n_ae + n_pf + n_vr + n_pa + ad_idx * 2;
+                    int _p51_int = (vt_hints
+                                    && _ad_base + 1 < n_gf + n_ae + n_pf + n_vr + n_pa + n_ad * 2
+                                    && vt_hints[_ad_base]   == 0 /* JS_TAG_INT */
+                                    && vt_hints[_ad_base+1] == 0 /* JS_TAG_INT */);
+                    _gs_push = _p51_int ? JIT_T_INT : JIT_T_JSVAL;
+                } else {
+                    _gs_push = JIT_T_JSVAL;
+                }
+                ad_idx++;
                 break;
             }
             case OP_sub: case OP_mul: {
@@ -8613,8 +8653,8 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         return -1;
     }
 
-    /* P45b/P46/P48/P49/P50: count tracked opcodes for __jit_vt_ array. */
-    int n_gf = 0, n_ae = 0, n_pf = 0, n_vr = 0, n_pa = 0;
+    /* P45b/P46/P48/P49/P50/P51: count tracked opcodes for __jit_vt_ array. */
+    int n_gf = 0, n_ae = 0, n_pf = 0, n_vr = 0, n_pa = 0, n_ad = 0;
     for (int _pc = 0; _pc < bc_len; ) {
         int _op = bc[_pc];
         if (_op == OP_get_field)    n_gf++;
@@ -8626,6 +8666,7 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
             _op == OP_get_var_ref2 || _op == OP_get_var_ref3)
             n_vr++;
         if (_op == OP_put_array_el) n_pa++; /* P50 */
+        if (_op == OP_add)          n_ad++; /* P51 */
         _pc += (_op < op_sz_count) ? op_sz[_op] : 1;
     }
     if (n_gf > 0 && n_gf <= 0xFFFF)
@@ -8638,19 +8679,21 @@ static int js_jit_gen_c(JSFunctionBytecode *b, JSJITCodeBuf *cb,
         js_jit_fb_set_n_vr(b, (uint16_t)n_vr); /* P49 */
     if (n_pa > 0 && n_pa <= 0xFFFF)
         js_jit_fb_set_n_pa(b, (uint16_t)n_pa); /* P50 */
+    if (n_ad > 0 && n_ad <= 0xFFFF)
+        js_jit_fb_set_n_ad(b, (uint16_t)n_ad); /* P51 */
     /* P45b: read val_tag hints set by js_jit_schedule_warm_recompile(). */
     const uint8_t *vt_hints = js_jit_fb_get_vt_hints(b);
 
     gen_preamble(cb, bc_hash, var_count, arg_count, stack_size,
                  closure_var_count, cpool_count, fname_out, fname_sz,
                  local_type, js_func_name, varnames, &sr, var_ref_count, b,
-                 n_gf, n_ae, n_pf, n_vr, n_pa);
+                 n_gf, n_ae, n_pf, n_vr, n_pa, n_ad);
 
     int unsup = 0;
     if (gen_body(cb, bc, bc_len, &sr, op_sz, op_sz_count,
                  var_count, arg_count, stack_size, &unsup, local_type, b,
                  bc_hash, varnames, var_jit_hash, var_ref_count,
-                 vt_hints, n_gf, n_ae, n_pf, n_vr, n_pa) < 0) {
+                 vt_hints, n_gf, n_ae, n_pf, n_vr, n_pa, n_ad) < 0) {
         *unsupported = unsup;
         jit_buf_free(cb);
         scan_result_free(&sr);

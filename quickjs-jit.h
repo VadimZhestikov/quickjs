@@ -331,6 +331,9 @@ void      js_jit_fb_set_n_vr(JSFunctionBytecode *b, uint16_t n);
 /* P50: put_array_el count */
 uint16_t  js_jit_fb_get_n_pa(JSFunctionBytecode *b);
 void      js_jit_fb_set_n_pa(JSFunctionBytecode *b, uint16_t n);
+/* P51: add count */
+uint16_t  js_jit_fb_get_n_ad(JSFunctionBytecode *b);
+void      js_jit_fb_set_n_ad(JSFunctionBytecode *b, uint16_t n);
 uint8_t   js_jit_fb_get_warm_done(JSFunctionBytecode *b);
 void      js_jit_fb_set_warm_done(JSFunctionBytecode *b);
 uint8_t  *js_jit_fb_get_vt_hints(JSFunctionBytecode *b);
@@ -1000,8 +1003,9 @@ int  js_jit_get_threshold(void);
  *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints.
  *          7=P48 put_field INT write; 8=P49 get_var_ref INT cell; 9=P50 put_array_el INT.
  *         10=P50.2 jit_callee_func (runtime ABI change, no generated-C change).
- *         11=get_var_ref_check TDZ fix: emits UNINITIALIZED check (generated C changes). */
-#define JIT_CODEGEN_VERSION 11u  /* get_var_ref_check TDZ fix */
+ *         11=get_var_ref_check TDZ fix: emits UNINITIALIZED check (generated C changes).
+ *         12=P51: OP_add warm vt_hints + speculative INT add (array layout change). */
+#define JIT_CODEGEN_VERSION 12u  /* P51: OP_add warm speculative INT */
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 
