@@ -998,8 +998,10 @@ int  js_jit_get_threshold(void);
  *          4=P44 fix: HALF_L int fast path, sub/mul JSVAL result,
  *          5=P45 val_tag in JSJITICEntry for INT fast path on get_field.
  *          6=P45b warm-IC recompile: __jit_vt_HASH[] export + gen_st=INT for INT hints.
- *          7=P48 put_field INT write; 8=P49 get_var_ref INT cell; 9=P50 put_array_el INT. */
-#define JIT_CODEGEN_VERSION 10u  /* P50: JSJITCallICEntry gains void *rt field */
+ *          7=P48 put_field INT write; 8=P49 get_var_ref INT cell; 9=P50 put_array_el INT.
+ *         10=P50.2 jit_callee_func (runtime ABI change, no generated-C change).
+ *         11=get_var_ref_check TDZ fix: emits UNINITIALIZED check (generated C changes). */
+#define JIT_CODEGEN_VERSION 11u  /* get_var_ref_check TDZ fix */
 void js_jit_set_max_bc_len(int n);
 int  js_jit_get_max_bc_len(void);
 

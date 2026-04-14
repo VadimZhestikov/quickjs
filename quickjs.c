@@ -326,6 +326,10 @@ struct JSRuntime {
      * callee captured outer locals via js_closure2. */
     JSValue jit_callee_func;
     JSValue jit_new_target;
+    /* Actual argument count from the call site, set by every JIT call path.
+     * The JIT function receives argc=max(actual,arg_count) for GEN_PUT_ARG safety,
+     * but js_jit_special_object(ARGUMENTS) reads this field for the correct .length. */
+    int jit_actual_argc;
 #endif
 };
 
@@ -1749,8 +1753,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     /* Assign a unique generation to this runtime so JIT ICs can detect ABA
      * (a new runtime allocated at the same address as a freed one). */
     rt->jit_ic_gen = ++js_jit_rt_gen_counter;
-    rt->jit_callee_func = JS_UNDEFINED;
-    rt->jit_new_target  = JS_UNDEFINED;
+    rt->jit_callee_func   = JS_UNDEFINED;
+    rt->jit_new_target    = JS_UNDEFINED;
+    rt->jit_actual_argc   = 0;
 #endif
 
     init_list_head(&rt->context_list);
@@ -16240,8 +16245,10 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                 JSRuntime *rt = ctx->rt;
                 JSValue saved_jit_callee    = rt->jit_callee_func;
                 JSValue saved_jit_new_target = rt->jit_new_target;
-                rt->jit_callee_func = func;
-                rt->jit_new_target  = JS_UNDEFINED;
+                int saved_jit_actual_argc   = rt->jit_actual_argc;
+                rt->jit_callee_func   = func;
+                rt->jit_new_target    = JS_UNDEFINED;
+                rt->jit_actual_argc   = argc;
 
                 /* Always pad argv to arg_count and DUP each element.
                  *
@@ -16306,8 +16313,9 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                             JS_FreeValue(ctx, padded[i]);
                     }
                 }
-                rt->jit_callee_func = saved_jit_callee;
-                rt->jit_new_target  = saved_jit_new_target;
+                rt->jit_callee_func  = saved_jit_callee;
+                rt->jit_new_target   = saved_jit_new_target;
+                rt->jit_actual_argc  = saved_jit_actual_argc;
                 return ret;
             }
         }
@@ -16352,8 +16360,10 @@ JSValue js_jit_ic_direct_call(
     JSRuntime *rt = ctx->rt;
     JSValue saved_jit_callee    = rt->jit_callee_func;
     JSValue saved_jit_new_target = rt->jit_new_target;
-    rt->jit_callee_func = JS_MKPTR(JS_TAG_OBJECT, ic->expected_func);
-    rt->jit_new_target  = JS_UNDEFINED;
+    int saved_jit_actual_argc   = rt->jit_actual_argc;
+    rt->jit_callee_func   = JS_MKPTR(JS_TAG_OBJECT, ic->expected_func);
+    rt->jit_new_target    = JS_UNDEFINED;
+    rt->jit_actual_argc   = nargs;
 
     /* P50b: Always derive cpool from the live bytecode object (ic->expected_bc
      * was verified in the hot path to equal the current func's bytecode).
@@ -16394,8 +16404,9 @@ JSValue js_jit_ic_direct_call(
         for (i = 0; i < n; i++)
             JS_FreeValue(ctx, padded[i]);
     }
-    rt->jit_callee_func = saved_jit_callee;
-    rt->jit_new_target  = saved_jit_new_target;
+    rt->jit_callee_func  = saved_jit_callee;
+    rt->jit_new_target   = saved_jit_new_target;
+    rt->jit_actual_argc  = saved_jit_actual_argc;
     return ret;
 }
 
@@ -19544,12 +19555,17 @@ JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv)
 
     switch ((OPSpecialObjectEnum)kind) {
     case OP_SPECIAL_OBJECT_ARGUMENTS:
-        return js_build_arguments(ctx, argc, (JSValueConst *)argv);
+        /* Use rt->jit_actual_argc (the real call-site count) rather than the
+         * JIT function's argc parameter, which is padded to b->arg_count for
+         * simple-param functions so that GEN_PUT_ARG range checks always pass.
+         * Without this, arguments.length returns the declared param count even
+         * when fewer args are supplied. */
+        return js_build_arguments(ctx, rt->jit_actual_argc, (JSValueConst *)argv);
     case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
         /* Non-strict mapped arguments: ideally would alias parameters, but the
          * JIT copies captured args into shadow buffers, breaking the aliasing
          * invariant.  Use the simple (unmapped) builder — a known JIT limitation. */
-        return js_build_arguments(ctx, argc, (JSValueConst *)argv);
+        return js_build_arguments(ctx, rt->jit_actual_argc, (JSValueConst *)argv);
     case OP_SPECIAL_OBJECT_THIS_FUNC:
         return JS_DupValue(ctx, rt->jit_callee_func);
     case OP_SPECIAL_OBJECT_NEW_TARGET:
@@ -19637,12 +19653,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->cur_sp = NULL; /* mark as running */
                     JSValue _sv_as_callee = rt->jit_callee_func;
                     JSValue _sv_as_nt     = rt->jit_new_target;
-                    rt->jit_callee_func = sf->cur_func;
-                    rt->jit_new_target  = JS_UNDEFINED;
+                    int _sv_as_aargc      = rt->jit_actual_argc;
+                    rt->jit_callee_func  = sf->cur_func;
+                    rt->jit_new_target   = JS_UNDEFINED;
+                    rt->jit_actual_argc  = s->argc;
                     ret2 = jf(ctx, s->this_val, s->argc, sf->arg_buf,
                               b->cpool, var_refs);
                     rt->jit_callee_func = _sv_as_callee;
                     rt->jit_new_target  = _sv_as_nt;
+                    rt->jit_actual_argc = _sv_as_aargc;
                     rt->current_stack_frame = sf->prev_frame;
                     /* Restore cur_sp to a safe value if exception fired before
                      * any yield (async_func_free_frame asserts cur_sp != NULL). */
@@ -19744,12 +19763,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int _argc41 = b->arg_count > 0 ? b->arg_count : argc;
             JSValue _sv41_callee = rt->jit_callee_func;
             JSValue _sv41_nt     = rt->jit_new_target;
-            rt->jit_callee_func = (JSValue)func_obj;
-            rt->jit_new_target  = (JSValue)new_target;
+            int _sv41_aargc      = rt->jit_actual_argc;
+            rt->jit_callee_func  = (JSValue)func_obj;
+            rt->jit_new_target   = (JSValue)new_target;
+            rt->jit_actual_argc  = argc; /* actual call-site argc for arguments.length */
             JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, _argc41,
                                    argv, b->cpool, p->u.func.var_refs);
             rt->jit_callee_func = _sv41_callee;
             rt->jit_new_target  = _sv41_nt;
+            rt->jit_actual_argc = _sv41_aargc;
             rt->current_stack_frame = sf->prev_frame;
             /* P45b: warm-IC recompile trigger — count JIT calls after first compile. */
             if (unlikely(!b->jit_warm_done && (b->jit_n_gf > 0 || b->jit_n_ae > 0 || b->jit_n_pf > 0 || b->jit_n_vr > 0 || b->jit_n_pa > 0))) {
@@ -19869,12 +19891,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             int jit_argc = b->has_simple_parameter_list ? sf->arg_count : argc;
             JSValue _sv_hot_callee = rt->jit_callee_func;
             JSValue _sv_hot_nt     = rt->jit_new_target;
-            rt->jit_callee_func = (JSValue)func_obj;
-            rt->jit_new_target  = (JSValue)new_target;
+            int _sv_hot_aargc      = rt->jit_actual_argc;
+            rt->jit_callee_func  = (JSValue)func_obj;
+            rt->jit_new_target   = (JSValue)new_target;
+            rt->jit_actual_argc  = argc; /* actual call-site argc for arguments.length */
             JSValue jit_ret = jf(ctx, (JSValue)this_obj, jit_argc,
                                  arg_buf, b->cpool, var_refs);
             rt->jit_callee_func = _sv_hot_callee;
             rt->jit_new_target  = _sv_hot_nt;
+            rt->jit_actual_argc = _sv_hot_aargc;
             rt->current_stack_frame = sf->prev_frame;
             /* Close any JSVarRefs created by the interpreter inside this JIT
              * call (e.g. js_closure2 called from js_jit_op_define_class sets
