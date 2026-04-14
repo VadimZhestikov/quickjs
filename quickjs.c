@@ -317,6 +317,15 @@ struct JSRuntime {
      * problem: if a new runtime is allocated at the same address as a freed
      * one, the generation counter will differ, forcing an IC miss. */
     uint32_t jit_ic_gen;
+    /* Current JIT callee function object and new.target.
+     * Set in every JIT call path (JS_CallInternal and js_jit_call/ic_direct).
+     * Read by js_jit_special_object for HOME_OBJECT/THIS_FUNC/NEW_TARGET.
+     * Decouples these reads from sf->cur_func so that JIT-to-JIT calls via
+     * js_jit_call do not corrupt the outer frame's cur_func — which was
+     * causing get_var_ref assertion failures when define_class in a JIT
+     * callee captured outer locals via js_closure2. */
+    JSValue jit_callee_func;
+    JSValue jit_new_target;
 #endif
 };
 
@@ -1740,6 +1749,8 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     /* Assign a unique generation to this runtime so JIT ICs can detect ABA
      * (a new runtime allocated at the same address as a freed one). */
     rt->jit_ic_gen = ++js_jit_rt_gen_counter;
+    rt->jit_callee_func = JS_UNDEFINED;
+    rt->jit_new_target  = JS_UNDEFINED;
 #endif
 
     init_list_head(&rt->context_list);
@@ -16227,15 +16238,10 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                  * (used by js_closure2 when define_class captures outer locals).
                  * The saved values are restored before this function returns. */
                 JSRuntime *rt = ctx->rt;
-                JSStackFrame *caller_sf = rt->current_stack_frame;
-                JSValue saved_cur_func = JS_UNDEFINED;
-                JSValue saved_new_target = JS_UNDEFINED;
-                if (caller_sf) {
-                    saved_cur_func   = caller_sf->cur_func;
-                    saved_new_target = caller_sf->new_target;
-                    caller_sf->cur_func   = func;
-                    caller_sf->new_target = JS_UNDEFINED;
-                }
+                JSValue saved_jit_callee    = rt->jit_callee_func;
+                JSValue saved_jit_new_target = rt->jit_new_target;
+                rt->jit_callee_func = func;
+                rt->jit_new_target  = JS_UNDEFINED;
 
                 /* Always pad argv to arg_count and DUP each element.
                  *
@@ -16300,10 +16306,8 @@ JSValue js_jit_call(JSContext *ctx, JSValue func, JSValue this_val,
                             JS_FreeValue(ctx, padded[i]);
                     }
                 }
-                if (caller_sf) {
-                    caller_sf->cur_func   = saved_cur_func;
-                    caller_sf->new_target = saved_new_target;
-                }
+                rt->jit_callee_func = saved_jit_callee;
+                rt->jit_new_target  = saved_jit_new_target;
                 return ret;
             }
         }
@@ -16340,26 +16344,30 @@ JSValue js_jit_ic_direct_call(
     int nargs, JSValue *argv,
     JSJITCallICEntry *ic, JSVarRef **var_refs)
 {
-    /* Temporarily update cur_func / new_target in the existing stack frame
-     * (same rationale as js_jit_call) so that HOME_OBJECT/THIS_FUNC/NEW_TARGET
-     * reads in the callee see the correct function object. */
+    /* Set jit_callee_func / jit_new_target so that js_jit_special_object
+     * (HOME_OBJECT, THIS_FUNC, NEW_TARGET) sees the callee's function object.
+     * We do NOT touch sf->cur_func because that belongs to the outer frame
+     * and is used by get_var_ref to look up var_ref_idx from the outer
+     * function's bytecode when js_closure2 captures outer locals. */
     JSRuntime *rt = ctx->rt;
-    JSStackFrame *caller_sf = rt->current_stack_frame;
-    JSValue saved_cur_func = JS_UNDEFINED;
-    JSValue saved_new_target = JS_UNDEFINED;
-    if (caller_sf) {
-        saved_cur_func   = caller_sf->cur_func;
-        saved_new_target = caller_sf->new_target;
-        caller_sf->cur_func   = JS_MKPTR(JS_TAG_OBJECT, ic->expected_func);
-        caller_sf->new_target = JS_UNDEFINED;
-    }
+    JSValue saved_jit_callee    = rt->jit_callee_func;
+    JSValue saved_jit_new_target = rt->jit_new_target;
+    rt->jit_callee_func = JS_MKPTR(JS_TAG_OBJECT, ic->expected_func);
+    rt->jit_new_target  = JS_UNDEFINED;
+
+    /* P50b: Always derive cpool from the live bytecode object (ic->expected_bc
+     * was verified in the hot path to equal the current func's bytecode).
+     * ic->callee_cpool is stale under malloc ABA (same bc address in a new
+     * runtime), so never pass it to the JIT function — use the live cpool
+     * to avoid UAF. */
+    JSValue *live_cpool = ic->expected_bc->cpool;
 
     int n = ic->callee_arg_count;
     JSValue ret;
     if (n == 0) {
         /* Variadic callee (arg_count == 0): pass actual args directly. */
         ret = ic->direct_jit(ctx, this_val, nargs, argv,
-                             ic->callee_cpool, var_refs);
+                             live_cpool, var_refs);
     } else if (!ic->expected_bc->has_simple_parameter_list) {
         /* P33: complex params — pass real nargs and all args. */
         int total = nargs > n ? nargs : n;
@@ -16370,7 +16378,7 @@ JSValue js_jit_ic_direct_call(
         for (; i < total; i++)
             padded[i] = JS_UNDEFINED;
         ret = ic->direct_jit(ctx, this_val, nargs, padded,
-                             ic->callee_cpool, var_refs);
+                             live_cpool, var_refs);
         for (i = 0; i < total; i++)
             JS_FreeValue(ctx, padded[i]);
     } else {
@@ -16382,14 +16390,12 @@ JSValue js_jit_ic_direct_call(
         for (; i < n; i++)
             padded[i] = JS_UNDEFINED;
         ret = ic->direct_jit(ctx, this_val, n, padded,
-                             ic->callee_cpool, var_refs);
+                             live_cpool, var_refs);
         for (i = 0; i < n; i++)
             JS_FreeValue(ctx, padded[i]);
     }
-    if (caller_sf) {
-        caller_sf->cur_func   = saved_cur_func;
-        caller_sf->new_target = saved_new_target;
-    }
+    rt->jit_callee_func = saved_jit_callee;
+    rt->jit_new_target  = saved_jit_new_target;
     return ret;
 }
 
@@ -16420,12 +16426,17 @@ static uint8_t js_jit_ic_compute_fast(JSFunctionBytecode *b)
 
 /* P41.2: slim direct call — only for callees where callee_is_fast == 1.
  * Calls the JIT function directly with no cur_func / new_target mutation.
- * The caller must check callee_is_fast before using this path. */
+ * The caller must check callee_is_fast before using this path.
+ * callee_is_fast => need_home_object==0 so js_jit_special_object is never
+ * called for HOME_OBJECT/THIS_FUNC, and rt->jit_callee_func need not be set.
+ * P50b: read cpool from the live bytecode (ic->expected_bc verified in hot
+ * path) to avoid UAF from ABA address reuse; callee_is_fast ⇒ var_refs==0
+ * so callee_var_refs is unused and NULL is safe. */
 JSValue js_jit_ic_fast_call(JSContext *ctx, JSValue this_val,
                              JSJITCallICEntry *ic)
 {
     return ic->direct_jit(ctx, this_val, 0, NULL,
-                          ic->callee_cpool, ic->callee_var_refs);
+                          ic->expected_bc->cpool, NULL);
 }
 
 void js_jit_callIC_fill(JSContext *ctx, JSValue func, JSJITCallICEntry *ic)
@@ -19521,11 +19532,14 @@ typedef enum {
 
 #ifdef CONFIG_JIT
 /* js_jit_special_object — JIT handler for OP_special_object.
- * Uses ctx->rt->current_stack_frame (set by JS_CallInternal before the JIT call).
- * new_target is stored in sf->new_target by JS_CallInternal. */
+ * For HOME_OBJECT, THIS_FUNC, and NEW_TARGET reads rt->jit_callee_func /
+ * rt->jit_new_target (set by every JIT call path — both JS_CallInternal
+ * and js_jit_call / js_jit_ic_direct_call).  This avoids reading sf->cur_func,
+ * which belongs to the OUTER interpreter frame in JIT-to-JIT calls and would
+ * give the wrong function object when define_class captures outer locals. */
 JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv)
 {
-    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSRuntime *rt = ctx->rt;
     JSObject *p;
 
     switch ((OPSpecialObjectEnum)kind) {
@@ -19537,11 +19551,13 @@ JSValue js_jit_special_object(JSContext *ctx, int kind, int argc, JSValue *argv)
          * invariant.  Use the simple (unmapped) builder — a known JIT limitation. */
         return js_build_arguments(ctx, argc, (JSValueConst *)argv);
     case OP_SPECIAL_OBJECT_THIS_FUNC:
-        return JS_DupValue(ctx, sf->cur_func);
+        return JS_DupValue(ctx, rt->jit_callee_func);
     case OP_SPECIAL_OBJECT_NEW_TARGET:
-        return JS_DupValue(ctx, sf->new_target);
+        return JS_DupValue(ctx, rt->jit_new_target);
     case OP_SPECIAL_OBJECT_HOME_OBJECT:
-        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (JS_VALUE_GET_TAG(rt->jit_callee_func) != JS_TAG_OBJECT)
+            return JS_UNDEFINED;
+        p = JS_VALUE_GET_OBJ(rt->jit_callee_func);
         if (p->u.func.home_object)
             return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.func.home_object));
         return JS_UNDEFINED;
@@ -19619,8 +19635,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->prev_frame = rt->current_stack_frame;
                     rt->current_stack_frame = sf;
                     sf->cur_sp = NULL; /* mark as running */
+                    JSValue _sv_as_callee = rt->jit_callee_func;
+                    JSValue _sv_as_nt     = rt->jit_new_target;
+                    rt->jit_callee_func = sf->cur_func;
+                    rt->jit_new_target  = JS_UNDEFINED;
                     ret2 = jf(ctx, s->this_val, s->argc, sf->arg_buf,
                               b->cpool, var_refs);
+                    rt->jit_callee_func = _sv_as_callee;
+                    rt->jit_new_target  = _sv_as_nt;
                     rt->current_stack_frame = sf->prev_frame;
                     /* Restore cur_sp to a safe value if exception fired before
                      * any yield (async_func_free_frame asserts cur_sp != NULL). */
@@ -19720,8 +19742,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * so that GEN_PUT_ARG range checks succeed for all declared slots
              * (matching the behaviour of the standard JIT hot-path below). */
             int _argc41 = b->arg_count > 0 ? b->arg_count : argc;
+            JSValue _sv41_callee = rt->jit_callee_func;
+            JSValue _sv41_nt     = rt->jit_new_target;
+            rt->jit_callee_func = (JSValue)func_obj;
+            rt->jit_new_target  = (JSValue)new_target;
             JSValue _ret41 = _jf41(ctx, (JSValue)this_obj, _argc41,
                                    argv, b->cpool, p->u.func.var_refs);
+            rt->jit_callee_func = _sv41_callee;
+            rt->jit_new_target  = _sv41_nt;
             rt->current_stack_frame = sf->prev_frame;
             /* P45b: warm-IC recompile trigger — count JIT calls after first compile. */
             if (unlikely(!b->jit_warm_done && (b->jit_n_gf > 0 || b->jit_n_ae > 0 || b->jit_n_pf > 0 || b->jit_n_vr > 0 || b->jit_n_pa > 0))) {
@@ -19839,8 +19867,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * when argc was padded) so the argc-gated GEN_PUT_ARG checks in
              * the JIT succeed for all named parameter slots. */
             int jit_argc = b->has_simple_parameter_list ? sf->arg_count : argc;
+            JSValue _sv_hot_callee = rt->jit_callee_func;
+            JSValue _sv_hot_nt     = rt->jit_new_target;
+            rt->jit_callee_func = (JSValue)func_obj;
+            rt->jit_new_target  = (JSValue)new_target;
             JSValue jit_ret = jf(ctx, (JSValue)this_obj, jit_argc,
                                  arg_buf, b->cpool, var_refs);
+            rt->jit_callee_func = _sv_hot_callee;
+            rt->jit_new_target  = _sv_hot_nt;
             rt->current_stack_frame = sf->prev_frame;
             /* Close any JSVarRefs created by the interpreter inside this JIT
              * call (e.g. js_closure2 called from js_jit_op_define_class sets
