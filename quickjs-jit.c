@@ -4081,8 +4081,28 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
     } \
 } while(0)
 
-        case OP_get_var_ref:
-        case OP_get_var_ref_check: GEN_GET_VR((int)bc_u16(&bc[pc+1])); break;
+        case OP_get_var_ref: GEN_GET_VR((int)bc_u16(&bc[pc+1])); break;
+        case OP_get_var_ref_check: {
+            /* OP_get_var_ref_check reads a lexical var that may legitimately be
+             * JS_TAG_UNINITIALIZED (e.g. 'this' before super() in a derived ctor).
+             * Cannot skip the TDZ check unlike OP_get_var_ref. */
+            int idx = (int)bc_u16(&bc[pc+1]);
+            JSAtom cv_atom = js_jit_fb_get_closure_var_atom(b, idx);
+            jit_buf_printf(cb,
+                "    { JSValue _rv%d=*_vrp%d;\n"
+                "      if(js_unlikely(JS_VALUE_GET_TAG(_rv%d)==JS_TAG_UNINITIALIZED)){\n"
+                "        _RT->throw_error(ctx,(JSAtom)%uu,2); goto _ex;\n"
+                "      }\n"
+                "      __jit_vt_%016llx[%d]=(uint8_t)JS_VALUE_GET_TAG(_rv%d);\n"
+                "      _tsv%d=_DUP(_rv%d); _sp=%d;\n"
+                "    }\n",
+                pc, idx,
+                pc,
+                (unsigned)cv_atom,
+                (unsigned long long)bc_hash, n_gf + n_ae + n_pf + vr_idx, pc,
+                d, pc, d+1);
+            break;
+        }
         case OP_put_var_ref:
         case OP_put_var_ref_check:
         case OP_put_var_ref_check_init: GEN_PUT_VR((int)bc_u16(&bc[pc+1])); break;
@@ -7987,8 +8007,10 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 }
                 break;
             }
-            /* P49: get_var_ref* — INT hint → gen_st=INT so downstream ops use fast paths. */
-            case OP_get_var_ref: case OP_get_var_ref_check:
+            /* P49: get_var_ref* — INT hint → gen_st=INT so downstream ops use fast paths.
+             * get_var_ref_check is excluded: its main-switch code always writes _tsv (not _ti),
+             * so gen_st must be JSVAL regardless of the hint. */
+            case OP_get_var_ref:
             case OP_get_var_ref0: case OP_get_var_ref1:
             case OP_get_var_ref2: case OP_get_var_ref3: {
                 int _p49_gst = (vt_hints
@@ -7999,6 +8021,11 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                 vr_idx++;
                 break;
             }
+            case OP_get_var_ref_check:
+                /* Always JSVAL: main switch emits TDZ check + _DUP into _tsv, never _ti. */
+                _gs_push = JIT_T_JSVAL;
+                vr_idx++;
+                break;
 
             /* --- get_length: P11.8 — always INT (stored in _ti, not _tsv/_tsd) --- */
             case OP_get_length: _gs_drop=1; _gs_push=JIT_T_INT; break;
