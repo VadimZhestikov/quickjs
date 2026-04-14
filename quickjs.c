@@ -16433,6 +16433,10 @@ JSValue js_jit_ic_direct_call(
  *   - arg_count == 0: no argument padding or duplication needed at call site
  *   - does not use super (need_home_object == 0): cur_func update not needed
  *   - var_ref_count == 0: does not create var_refs for child closures
+ *   - closure_var_count == 0: does not capture variables from outer scope.
+ *     When closure_var_count > 0, fo->u.func.var_refs is non-NULL and the JIT
+ *     function reads var_refs[i] for captured variables.  js_jit_ic_fast_call
+ *     passes var_refs=NULL, which would crash on the first captured-var access.
  * For such callees the call IC hot path can call direct_jit() directly —
  * no alloca, no arg dup/free, no cur_func/new_target save/restore. */
 static uint8_t js_jit_ic_compute_fast(JSFunctionBytecode *b)
@@ -16440,7 +16444,8 @@ static uint8_t js_jit_ic_compute_fast(JSFunctionBytecode *b)
     return (b->arg_count == 0 &&
             b->func_kind == JS_FUNC_NORMAL &&
             !b->need_home_object &&
-            b->var_ref_count == 0) ? 1 : 0;
+            b->var_ref_count == 0 &&
+            b->closure_var_count == 0) ? 1 : 0;
 }
 
 /* P41.2: slim direct call — only for callees where callee_is_fast == 1.
