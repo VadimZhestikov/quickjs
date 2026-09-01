@@ -16110,16 +16110,33 @@ JSVarRef *js_jit_make_var_ref(JSContext *ctx, JSValue *slot) {
     return vr;
 }
 
-/* P13: heap-promote all live var_refs before the JIT frame exits.
- * For each non-NULL vrefs[i]: copy *pvalue → var_ref->value, redirect pvalue.
- * MUST be called on ALL exit paths before _cap_buf/_arg_cap_buf go out of scope. */
+/* P13: heap-promote all live var_refs before the JIT frame exits, then release
+ * the FRAME's owning reference on each.
+ *
+ * Each _sf_vrefs[i] is created (js_jit_make_var_ref) or reused holding one
+ * reference owned by the FRAME; every closure built from it takes its OWN
+ * reference (js_jit_var_ref_dup at closure creation). So the var_ref survives
+ * for the whole frame body even if all the closures that captured it are freed
+ * first (e.g. a callback passed to Array/TypedArray.prototype.map, released when
+ * the builtin returns). At true frame exit (return/exception — the only sites
+ * this is emitted) we heap-promote the value (so escaped closures keep working)
+ * and drop the frame's reference: if a closure still holds it, it stays alive;
+ * if the frame held the last reference, it is freed here (no leak). The slot is
+ * NULLed so the call is idempotent.
+ *
+ * MUST NOT be used at yield/await (the frame resumes and still needs its
+ * var_refs); it is emitted only on return/exception exit paths. */
 void js_jit_close_caps(JSContext *ctx, JSVarRef **vrefs, int n) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     for (int i = 0; i < n; i++) {
-        if (vrefs[i] && !vrefs[i]->is_detached) {
-            vrefs[i]->value  = JS_DupValueRT(rt, *vrefs[i]->pvalue);
-            vrefs[i]->pvalue = &vrefs[i]->value;
-            vrefs[i]->is_detached = TRUE;
+        if (vrefs[i]) {
+            if (!vrefs[i]->is_detached) {
+                vrefs[i]->value  = JS_DupValueRT(rt, *vrefs[i]->pvalue);
+                vrefs[i]->pvalue = &vrefs[i]->value;
+                vrefs[i]->is_detached = TRUE;
+            }
+            free_var_ref(rt, vrefs[i]);
+            vrefs[i] = NULL;
         }
     }
 }

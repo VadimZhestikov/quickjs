@@ -3473,18 +3473,18 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
                         "      if(!_sf_vrefs[%d]){\n"
                         "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_cap_buf[%d]);\n"
                         "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
-                        "      } else { js_jit_var_ref_dup(_sf_vrefs[%d]); }\n"
-                        "      _vr_%d[%d]=_sf_vrefs[%d];\n",
-                        vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
+                        "      }\n"
+                        "      _vr_%d[%d]=js_jit_var_ref_dup(_sf_vrefs[%d]);\n",
+                        vri, vri, cv_vidx, vri, d, pc, ci, vri);
                 } else if (cv_type == JIT_CLOSURE_ARG) {
                     int vri = js_jit_fb_get_arg_var_ref_idx(b, cv_vidx);
                     jit_buf_printf(cb,
                         "      if(!_sf_vrefs[%d]){\n"
                         "        _sf_vrefs[%d]=js_jit_make_var_ref(ctx,&_arg_cap_buf[%d]);\n"
                         "        if(!_sf_vrefs[%d]){_sp=%d; goto _ex;}\n"
-                        "      } else { js_jit_var_ref_dup(_sf_vrefs[%d]); }\n"
-                        "      _vr_%d[%d]=_sf_vrefs[%d];\n",
-                        vri, vri, cv_vidx, vri, d, vri, pc, ci, vri);
+                        "      }\n"
+                        "      _vr_%d[%d]=js_jit_var_ref_dup(_sf_vrefs[%d]);\n",
+                        vri, vri, cv_vidx, vri, d, pc, ci, vri);
                 } else if (cv_type == JIT_CLOSURE_REF || cv_type == JIT_CLOSURE_GLOBAL_REF) {
                     /* Pass-through: increment ref on the existing var_ref */
                     jit_buf_printf(cb,
