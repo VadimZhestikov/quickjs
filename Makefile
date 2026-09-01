@@ -521,6 +521,12 @@ test2-default: run-test262
 test2: run-test262
 	time ./run-test262 -t -m -c test262.conf -a
 
+# T0: measure JIT-introduced test262 failures (delta vs the 72 interpreter
+# baseline) over the COMCON-relevant + previously-crashing families. Build the
+# JIT harness first: make CONFIG_JIT=y run-test262. Pass DIRS="a b" to scope.
+test262-jit-delta:
+	bash ./t0-measure-jit.sh $(DIRS)
+
 test2-update: run-test262
 	./run-test262 -t -u -c test262.conf -a
 

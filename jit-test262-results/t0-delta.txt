@@ -1,0 +1,31 @@
+# T0 JIT delta measurement — 2026-09-01T21:01:11Z
+# binary: b07ca5d ; baseline: test262_errors.txt (72 known)
+# columns: NEW  (control)  DIR
+  CRASH/rc=139 (skip)     built-ins/TypedArray/prototype/map
+  0      (skip)     built-ins/TypedArray/prototype/set
+  0      (skip)     built-ins/TypedArray/prototype/fill
+  1      (skip)     built-ins/TypedArray/prototype/forEach
+      test262/test/built-ins/TypedArray/prototype/forEach/callbackfn-this.js:33: unexpected error: Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (Testing with Float64Array.)
+  CRASH/rc=134 (skip)     built-ins/TypedArray/prototype/filter
+      test262/test/built-ins/TypedArray/prototype/filter/BigInt/callbackfn-set-value-during-iteration.js:23: unexpected error: TypeError: cannot convert bigint to number (Testing with BigInt64Array.)
+      test262/test/built-ins/TypedArray/prototype/filter/BigInt/callbackfn-this.js:24: unexpected error: Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (Testing with BigInt64Array.)
+      test262/test/built-ins/TypedArray/prototype/filter/BigInt/speciesctor-destination-resizable.js:30: unexpected error: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all (Testing with BigUint64Array.)
+  3      (skip)     built-ins/TypedArray/prototype/some
+      test262/test/built-ins/TypedArray/prototype/some/BigInt/callbackfn-set-value-during-interaction.js:32: unexpected error: TypeError: cannot convert bigint to number (Testing with BigInt64Array.)
+      test262/test/built-ins/TypedArray/prototype/some/BigInt/callbackfn-this.js:33: unexpected error: Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (Testing with BigInt64Array.)
+      test262/test/built-ins/TypedArray/prototype/some/callbackfn-this.js:33: unexpected error: Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: without thisArg - [1] Expected SameValue(«undefined», «[object global]») to be true (Testing with Float64Array.)
+  1      (skip)     built-ins/Array/from
+      test262/test/built-ins/Array/from/iter-map-fn-this-non-strict.js:58: unexpected error: Test262Error: The value of thisVals[1] is expected to equal the value of global Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: The value of thisVals[1] is expected to equal the value of global Expected SameValue(«undefined», «[object global]») to be true
+  0      (skip)     built-ins/Array/prototype/some
+  0      (skip)     built-ins/Array/prototype/map
+  0      (skip)     built-ins/Array/prototype/reduce
+  0      (skip)     built-ins/Array/prototype/filter
+  0      (skip)     built-ins/Array/prototype/sort
+  1      (skip)     built-ins/Map/prototype
+      test262/test/built-ins/Map/prototype/forEach/callback-this-non-strict.js:22: unexpected error: Test262Error: Expected SameValue(«undefined», «[object global]») to be true (_isSameValue operation threw) Test262Error: Expected SameValue(«undefined», «[object global]») to be true
+  CRASH/rc=124 (skip)     built-ins/DataView/prototype
+  0      (skip)     built-ins/Promise/all
+  0      (skip)     built-ins/Atomics
+  0      (skip)     language/expressions/arrow-function
+  0      (skip)     language/statements/for-of
+# TOTAL JIT-new (numeric dirs only): 6
