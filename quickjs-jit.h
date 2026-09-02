@@ -307,6 +307,9 @@ uint8_t   js_jit_fb_has_simple_params(JSFunctionBytecode *b);
 uint8_t   js_jit_fb_need_home_object(JSFunctionBytecode *b);
 uint8_t   js_jit_fb_is_derived_ctor(JSFunctionBytecode *b);
 uint8_t   js_jit_fb_is_eval(JSFunctionBytecode *b);
+uint8_t   js_jit_fb_is_strict(JSFunctionBytecode *b);
+/* Sloppy-mode `this` coercion for the generated code's non-strict OP_push_this. */
+JSValue   js_jit_this_sloppy(JSContext *ctx, JSValueConst this_val);
 uint8_t   js_jit_fb_jit_no_compile(JSFunctionBytecode *b);
 void      js_jit_fb_set_no_compile(JSFunctionBytecode *b);
 JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b);

@@ -15747,6 +15747,23 @@ uint8_t  js_jit_fb_has_simple_params(JSFunctionBytecode *b) { return b->has_simp
 uint8_t  js_jit_fb_need_home_object(JSFunctionBytecode *b) { return b->need_home_object; }
 uint8_t  js_jit_fb_is_derived_ctor(JSFunctionBytecode *b) { return b->is_derived_class_constructor; }
 uint8_t  js_jit_fb_is_eval(JSFunctionBytecode *b) { return b->is_direct_or_indirect_eval; }
+uint8_t  js_jit_fb_is_strict(JSFunctionBytecode *b) { return (b->js_mode & JS_MODE_STRICT) != 0; }
+
+/* Runtime helper for the JIT's OP_push_this in a NON-strict function: replicate
+ * the interpreter's sloppy-mode `this` coercion (see OP_push_this above) — an
+ * object stays as-is, null/undefined becomes the global object, and any other
+ * primitive is boxed via JS_ToObject. Returns a new reference (or an exception,
+ * which the generated code checks with _CHK). Strict functions never call this
+ * (the JIT emits a plain dup, which is correct for strict `this`). */
+JSValue  js_jit_this_sloppy(JSContext *ctx, JSValueConst this_val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(this_val);
+    if (tag == JS_TAG_OBJECT)
+        return JS_DupValue(ctx, this_val);
+    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
+        return JS_DupValue(ctx, ctx->global_obj);
+    return JS_ToObject(ctx, this_val);
+}
 uint8_t  js_jit_fb_jit_no_compile(JSFunctionBytecode *b) { return b->jit_no_compile; }
 void     js_jit_fb_set_no_compile(JSFunctionBytecode *b) { b->jit_no_compile = 1; }
 JSJITFunc js_jit_fb_get_func(JSFunctionBytecode *b) { return b->jit_func; }

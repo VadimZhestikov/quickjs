@@ -1385,6 +1385,14 @@ static uint64_t jit_hash_function(JSFunctionBytecode *b)
         }
         pc += op_sz[op];
     }
+
+    /* Fold in the strict-mode bit. OP_push_this codegen depends on it (a
+     * non-strict function coerces `this` undefined/null -> global), but
+     * js_mode is a flag on the function, not part of the bytecode stream —
+     * so without this a strict/sloppy twin with identical bytecode would
+     * alias to the same cache entry and get the wrong `this` handling. */
+    uint8_t strict = js_jit_fb_is_strict(b);
+    h = jit_fnv1a_64(&strict, sizeof(strict), h);
     return h;
 }
 
@@ -3446,7 +3454,19 @@ static int gen_body(JSJITCodeBuf *cb, const uint8_t *bc, int bc_len,
         case OP_null:
             jit_buf_printf(cb, "    _tsv%d=JS_NULL; _sp=%d;\n", d, d+1); break;
         case OP_push_this:
-            jit_buf_printf(cb, "    _tsv%d=_DUP(this_val); _sp=%d;\n", d, d+1); break;
+            /* Strict `this` is passed through as-is; a non-strict function must
+             * apply the interpreter's sloppy coercion (null/undefined -> global,
+             * primitive -> ToObject). b==NULL (unknown mode) keeps the strict
+             * fast path. */
+            if (!b || js_jit_fb_is_strict(b)) {
+                jit_buf_printf(cb, "    _tsv%d=_DUP(this_val); _sp=%d;\n", d, d+1);
+            } else {
+                jit_buf_printf(cb,
+                    "    { JSValue _v=js_jit_this_sloppy(ctx,this_val);"
+                    " _sp=%d; _CHK(_v); _tsv%d=_v; _sp=%d; }\n",
+                    d, d, d+1);
+            }
+            break;
         case OP_push_empty_string:
             /* Has _CHK: set _sp before call (so _ex sees correct depth), then push */
             jit_buf_printf(cb,
