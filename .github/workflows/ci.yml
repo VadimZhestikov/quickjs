@@ -187,7 +187,9 @@ jobs:
         with:
           usesh: true
           copyback: false
-          mem: 16384
+          # ubuntu-latest runners have ~16 GB total; a 16384 MB guest leaves
+          # nothing for the host and QEMU dies at boot. Build+self-test is light.
+          mem: 6144
           prepare: |
             pkg install -y gmake
           run: |
