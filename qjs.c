@@ -51,14 +51,18 @@ extern const uint32_t qjsc_repl_size;
 
 static int jit_aot_mode         = 0; /* set by --jit-aot     */
 static int jit_warmup_mode      = 0; /* set by --jit-warmup  */
-static int jit_link_mode        = 0; /* set by --jit-link    */
 static int jit_threshold_mode   = 0; /* set by --jit-threshold-gcc=N (N=0: AOT pre-pass) */
 static int jit_compile_all_mode = 0; /* set by --jit-compile-all (P35.3) */
+#ifdef CONFIG_JIT
+/* These are read only under CONFIG_JIT; leaving them unconditional trips
+ * -Werror=unused-variable in the default (non-JIT) build (the CI matrix). */
+static int jit_link_mode        = 0; /* set by --jit-link    */
 static int jit_exit_mode        = 0; /* set by --jit-exit (P35.3-D): skip execution */
 static const char *jit_profile_path      = NULL; /* set by --jit-profile=<file> (P35.5-B) */
 static const char *jit_profile_time_path = NULL; /* set by --jit-profile-time=<file>[,Hz] (P36.4) */
 static int         jit_profile_time_hz   = 1000; /* sampler Hz for --jit-profile-time */
 static char        jit_profile_time_path_buf[512]; /* backing store for path copy */
+#endif
 
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
