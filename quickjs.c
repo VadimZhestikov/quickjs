@@ -12256,7 +12256,10 @@ static JSBigInt *js_bigint_from_string(JSContext *ctx,
 }
 
 /* 2 <= base <= 36 */
-static char const digits[36] = "0123456789abcdefghijklmnopqrstuvwxyz";
+/* size left implicit (37, null-terminated) so newer clang's
+ * -Wunterminated-string-initialization is not tripped under -Werror; the
+ * table is only ever indexed (digits[0..35]), so the trailing NUL is inert. */
+static char const digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 /* special version going backwards */
 /* XXX: use dtoa.c */
