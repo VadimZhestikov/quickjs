@@ -192,7 +192,7 @@ char *skip_prefix(const char *str, const char *prefix)
 
 char *get_basename(const char *filename)
 {
-    char *p;
+    const char *p;
 
     p = strrchr(filename, '/');
     if (!p)
@@ -1704,7 +1704,7 @@ int run_test(const char *filename, int index)
 
     if (new_style) {
         if (!harness) {
-            p = strstr(filename, "test/");
+            p = (char *)strstr(filename, "test/");
             if (p) {
                 snprintf(harnessbuf, sizeof(harnessbuf), "%.*s%s",
                          (int)(p - filename), filename, "harness");
@@ -1796,7 +1796,7 @@ int run_test(const char *filename, int index)
         char *ifile;
 
         if (!harness) {
-            p = strstr(filename, "test/");
+            p = (char *)strstr(filename, "test/");
             if (p) {
                 snprintf(harnessbuf, sizeof(harnessbuf), "%.*s%s",
                          (int)(p - filename), filename, "test/harness");
